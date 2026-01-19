@@ -1,0 +1,43 @@
+### 1) `page_size=16` 时，`chunk_size` 只能是 16 吗？
+按我们在 roadmap/impl todo 里冻结的 contract：**是的，必须 `chunk_size == page_size`**。
+
+原因很直接：在 SGLang 里“页（page）”是 KV cache 的**最小可复用/可回收的物理单位**（`page_id = loc // page_size`）。如果 HSA 的 chunk 跟 page 不一致，你会遇到两类麻烦：
+
+- **chunk 跨 page**：chunk 的 KV 分布在多个物理页里，选择/复用/回收都变复杂（radix cache 也很难用 page 粒度管理 chunk）。
+- **page 内多 chunk**：你需要在同一 page 上维护多个 \(E_i\)，而 page 的生命周期是统一的（更容易错读/浪费）。
+
+所以我们先把它钉死：**chunk 就是 page**，HSA 的 landmark/representation 就按 page_id 存。
+
+---
+
+### 2) `page_size=16` 物理空间只够 16 个 token，那 chunk repr 放哪？
+**chunk repr 不占用那 16 个 token 的 KV 空间**，它是**单独开一块 tensor**存的。
+
+在 `MHATokenToKVPool` 里我们现在有两类东西：
+
+- **KV cache**（本来就有）：`k_buffer[layer]` / `v_buffer[layer]`  
+  - shape 类似：`[(size + page_size), head_num, head_dim]`（按 token slot 存）
+- **chunk repr cache（新增）**：`chunk_repr_buffer[layer]`  
+  - shape：`[num_pages, head_num, head_dim]`（按 **page_id** 存）
+
+也就是说：当一个 page 装满 16 个 token 后，KV 仍然在 `k_buffer/v_buffer` 里；**repr 是额外的一条“按页索引的 side buffer”**，不挤占 page 的 token slot。
+
+---
+
+### 3) 这个 repr tensor 有没有大小上限？
+有，上限由 **KV cache 的总容量**决定，严格来说就是：
+
+- `num_pages = size // page_size + 1`（`+1` 是 dummy page 0）
+- 所以 `chunk_repr_buffer[layer]` 的容量就是 **最多存 `num_pages` 个 page 的 repr**，每层一份。
+
+它不会无限增长：你给 KV cache 配多大（`size`），repr 的 page 表就多大；KV cache 不够会 OOM/allocator 分配失败，repr 也一样（它在初始化时就一次性分配出来）。
+
+额外开销大概是：
+
+\[
+\text{repr\_bytes} \approx \text{num\_layers} \times \text{num\_pages} \times \text{head\_num} \times \text{head\_dim} \times \text{dtype\_bytes}
+\]
+
+举个直观例子（只是数量级感受）：如果 `size=1,048,576 tokens`, `page_size=16`，那 `num_pages≈65,536`。假设 `head_num=32, head_dim=128, fp16(2B)`，则每层 repr 约 \(65536×32×128×2 ≈ 512MB\)，层数多就很大——这也是为什么后面我们可能会把 repr 设计成更小的维度（`repr_dim`），而不是直接用 `head_dim`。
+
+如果你认可这个方向，我下一步会在实现里把 repr 的 shape 从当前的 `[num_pages, head_num, head_dim]` 调整为更合理的 `[num_pages, repr_dim]` 或 `[num_pages, head_num, repr_dim]`，并把 `repr_dim` 作为 HSA 超参（更贴近原 repo 的 “landmark embedding” 思路）。
