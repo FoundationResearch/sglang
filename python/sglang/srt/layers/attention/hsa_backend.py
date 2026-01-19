@@ -95,6 +95,87 @@ class HSAAttnBackend(AttentionBackend):
             window_kv_indices=window_kv_indices,
         )
 
+    def _maybe_save_chunk_repr_for_completed_pages(
+        self,
+        *,
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+        save_kv_cache: bool,
+    ) -> None:
+        """Phase-1 hook: write a placeholder per-page chunk repr on page completion.
+
+        Contract: only write repr for pages that are fully completed, i.e.
+        a token that makes (seq_len % page_size == 0).
+
+        Implementation (placeholder): use the K vector of the boundary token
+        as the chunk representation. This will be replaced by the real HSA
+        landmark/chunk repr computation later.
+        """
+        if not save_kv_cache:
+            return
+
+        pool = getattr(forward_batch, "token_to_kv_pool", None)
+        if pool is None or not hasattr(pool, "save_chunk_repr"):
+            return
+
+        if getattr(pool, "page_size", self.page_size) != self.page_size:
+            raise ValueError(
+                f"HSA contract violated: token_to_kv_pool.page_size != model_runner.page_size "
+                f"({getattr(pool, 'page_size', None)} vs {self.page_size})"
+            )
+
+        # Decode: one new token per sequence.
+        if forward_batch.extend_seq_lens is None or forward_batch.extend_start_loc is None:
+            seq_lens = forward_batch.seq_lens[: forward_batch.batch_size].to(torch.int64)
+            completed = (seq_lens % self.page_size) == 0
+            if not bool(completed.any()):
+                return
+
+            token_locs = forward_batch.out_cache_loc[: forward_batch.batch_size].to(
+                torch.int64
+            )
+            token_locs = token_locs[completed]
+            page_ids = token_locs // self.page_size
+
+            k_cache = pool.get_key_buffer(layer.layer_id)
+            repr = k_cache[token_locs]
+            pool.save_chunk_repr(layer.layer_id, page_ids=page_ids, repr=repr)
+            return
+
+        # Extend: potentially multiple new tokens per sequence.
+        # Identify boundary tokens inside the extend segment: positions where (prefix_len + t) % page_size == 0.
+        extend_prefix_lens = forward_batch.extend_prefix_lens
+        extend_seq_lens = forward_batch.extend_seq_lens
+        extend_start_loc = forward_batch.extend_start_loc
+        if extend_prefix_lens is None or extend_seq_lens is None or extend_start_loc is None:
+            return
+
+        token_locs_list = []
+        for i in range(int(forward_batch.batch_size)):
+            pre = int(extend_prefix_lens[i].item())
+            ext = int(extend_seq_lens[i].item())
+            if ext <= 0:
+                continue
+            # t in [1..ext] where pre+t hits a multiple of page_size.
+            first_t = self.page_size - (pre % self.page_size)
+            if first_t == 0:
+                first_t = self.page_size
+            if first_t > ext:
+                continue
+            for t in range(first_t, ext + 1, self.page_size):
+                idx = int(extend_start_loc[i].item()) + (t - 1)
+                token_locs_list.append(forward_batch.out_cache_loc[idx].to(torch.int64))
+
+        if not token_locs_list:
+            return
+
+        token_locs = torch.stack(token_locs_list, dim=0).to(torch.int64)
+        page_ids = token_locs // self.page_size
+
+        k_cache = pool.get_key_buffer(layer.layer_id)
+        repr = k_cache[token_locs]
+        pool.save_chunk_repr(layer.layer_id, page_ids=page_ids, repr=repr)
+
     # ---- CUDA graph plumbing: delegate to dense backend for now ----
 
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
@@ -167,9 +248,13 @@ class HSAAttnBackend(AttentionBackend):
     ):
         # Phase 1: delegate to dense attention backend for correctness/runability.
         # Phase 2+: replace with HSA selection + paged HSA kernel.
-        return self._dense_backend.forward_decode(
+        out = self._dense_backend.forward_decode(
             q, k, v, layer, forward_batch, save_kv_cache=save_kv_cache, **kwargs
         )
+        self._maybe_save_chunk_repr_for_completed_pages(
+            layer=layer, forward_batch=forward_batch, save_kv_cache=save_kv_cache
+        )
+        return out
 
     def forward_extend(
         self,
@@ -181,8 +266,12 @@ class HSAAttnBackend(AttentionBackend):
         save_kv_cache: bool = True,
         **kwargs,
     ):
-        return self._dense_backend.forward_extend(
+        out = self._dense_backend.forward_extend(
             q, k, v, layer, forward_batch, save_kv_cache=save_kv_cache, **kwargs
         )
+        self._maybe_save_chunk_repr_for_completed_pages(
+            layer=layer, forward_batch=forward_batch, save_kv_cache=save_kv_cache
+        )
+        return out
 
 
