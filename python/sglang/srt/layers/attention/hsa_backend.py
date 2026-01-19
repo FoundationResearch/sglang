@@ -1,36 +1,158 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Optional
 
 import torch
 
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
+from sglang.srt.layers.attention.hsa.metadata import HSAMetadata
+from sglang.srt.layers.attention.hsa.utils import transform_page_table_1_to_real
+from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
+    from sglang.srt.model_executor.forward_batch_info import ForwardMode
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
     from sglang.srt.model_executor.model_runner import ModelRunner
+    from sglang.srt.speculative.spec_info import SpecInput
 
 
 class HSAAttnBackend(AttentionBackend):
     """
     HSA (Hierarchical Sparse Attention) backend entrypoint.
 
-    This is currently a stub to enable CLI/registry wiring:
-      --attention-backend hsa
+    Phase 1 (this file): implement the "core scheduling point" so we can select the backend
+    via CLI and have it run end-to-end. We build HSA-style metadata (page_table_1/real_page_table)
+    and delegate dense attention compute + CUDA-graph plumbing to `TritonAttnBackend`.
 
-    The actual implementation will follow `dev/hsa_sglang_impl_todo.md` and
-    `dev/hsa_dev_roadmap.md` (paged-KV-first, AttentionBackend + metadata).
+    Phase 2+: replace delegation with real HSA selection + paged HSA kernels.
+
+    Docs:
+    - dev/hsa_dev_roadmap.md
+    - dev/hsa_sglang_impl_todo.md
     """
 
-    def __init__(self, model_runner: ModelRunner, **_kwargs):
+    def __init__(self, model_runner: ModelRunner, **kwargs):
         super().__init__()
         self.model_runner = model_runner
+        self.device = model_runner.device
+        self.page_size = model_runner.page_size
+
+        # Minimal config from CLI (stored for future HSA logic)
+        self.hsa_topk = getattr(model_runner.server_args, "hsa_topk", 64)
+        self.hsa_selection_strategy = getattr(
+            model_runner.server_args, "hsa_selection_strategy", "head"
+        )
+        self.hsa_layers = getattr(model_runner.server_args, "hsa_layers", None)
+        self.hsa_window_size = getattr(model_runner.server_args, "hsa_window_size", None)
+        self.hsa_enable_swa_fusion = getattr(
+            model_runner.server_args, "hsa_enable_swa_fusion", False
+        )
+
+        # Delegate dense attention implementation for now.
+        # NOTE: For encoder-decoder models, triton backend is not supported.
+        if model_runner.model_config.is_encoder_decoder:
+            raise ValueError(
+                "HSAAttnBackend currently delegates to TritonAttnBackend, which does not support "
+                "encoder-decoder (cross attention). Please use --attention-backend flashinfer for "
+                "encoder-decoder models, or wait for HSA cross-attention support."
+            )
+
+        self._dense_backend = TritonAttnBackend(model_runner, **kwargs)
+        self.forward_metadata: Optional[HSAMetadata] = None
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
-        raise NotImplementedError(
-            "HSAAttnBackend is not implemented yet. "
-            "See dev/hsa_sglang_impl_todo.md and dev/hsa_dev_roadmap.md."
+        # First, initialize dense backend metadata so decode/extend remains runnable.
+        self._dense_backend.init_forward_metadata(forward_batch)
+
+        # Build HSA metadata scaffold (paged-KV-first).
+        # We intentionally mirror the "page_table_1 -> real_page_table" idea used by NSA.
+        if forward_batch.seq_lens_cpu is not None:
+            max_seqlen_k = int(forward_batch.seq_lens_cpu.max().item())
+        else:
+            max_seqlen_k = int(forward_batch.seq_lens.max().item())
+
+        page_table_1 = forward_batch.req_to_token_pool.req_to_token[
+            forward_batch.req_pool_indices, :max_seqlen_k
+        ]
+        real_page_table = transform_page_table_1_to_real(page_table_1, self.page_size)
+
+        dense_md = getattr(self._dense_backend, "forward_metadata", None)
+        kv_indptr = getattr(dense_md, "kv_indptr", None)
+        kv_indices = getattr(dense_md, "kv_indices", None)
+        window_kv_indptr = getattr(dense_md, "window_kv_indptr", None)
+        window_kv_indices = getattr(dense_md, "window_kv_indices", None)
+
+        self.forward_metadata = HSAMetadata(
+            page_size=self.page_size,
+            cache_seqlens_int32=forward_batch.seq_lens.to(torch.int32),
+            max_seqlen_k=max_seqlen_k,
+            page_table_1=page_table_1,
+            real_page_table=real_page_table,
+            kv_indptr=kv_indptr,
+            kv_indices=kv_indices,
+            window_kv_indptr=window_kv_indptr,
+            window_kv_indices=window_kv_indices,
+        )
+
+    # ---- CUDA graph plumbing: delegate to dense backend for now ----
+
+    def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
+        return self._dense_backend.init_cuda_graph_state(max_bs, max_num_tokens)
+
+    def init_forward_metadata_capture_cuda_graph(
+        self,
+        bs: int,
+        num_tokens: int,
+        req_pool_indices: torch.Tensor,
+        seq_lens: torch.Tensor,
+        encoder_lens: Optional[torch.Tensor],
+        forward_mode: ForwardMode,
+        spec_info: Optional[SpecInput],
+    ):
+        return self._dense_backend.init_forward_metadata_capture_cuda_graph(
+            bs,
+            num_tokens,
+            req_pool_indices,
+            seq_lens,
+            encoder_lens,
+            forward_mode,
+            spec_info,
+        )
+
+    def init_forward_metadata_replay_cuda_graph(
+        self,
+        bs: int,
+        req_pool_indices: torch.Tensor,
+        seq_lens: torch.Tensor,
+        seq_lens_sum: int,
+        encoder_lens: Optional[torch.Tensor],
+        forward_mode: ForwardMode,
+        spec_info: Optional[SpecInput],
+        seq_lens_cpu: Optional[torch.Tensor],
+    ):
+        return self._dense_backend.init_forward_metadata_replay_cuda_graph(
+            bs,
+            req_pool_indices,
+            seq_lens,
+            seq_lens_sum,
+            encoder_lens,
+            forward_mode,
+            spec_info,
+            seq_lens_cpu,
+        )
+
+    def get_cuda_graph_seq_len_fill_value(self):
+        return self._dense_backend.get_cuda_graph_seq_len_fill_value()
+
+    def get_verify_buffers_to_fill_after_draft(self):
+        return self._dense_backend.get_verify_buffers_to_fill_after_draft()
+
+    def update_verify_buffers_to_fill_after_draft(
+        self, spec_info: SpecInput, cuda_graph_bs: Optional[int]
+    ):
+        return self._dense_backend.update_verify_buffers_to_fill_after_draft(
+            spec_info, cuda_graph_bs
         )
 
     def forward_decode(
@@ -41,11 +163,12 @@ class HSAAttnBackend(AttentionBackend):
         layer: RadixAttention,
         forward_batch: ForwardBatch,
         save_kv_cache: bool = True,
-        **_kwargs,
+        **kwargs,
     ):
-        raise NotImplementedError(
-            "HSAAttnBackend.forward_decode is not implemented yet. "
-            "See dev/hsa_sglang_impl_todo.md."
+        # Phase 1: delegate to dense attention backend for correctness/runability.
+        # Phase 2+: replace with HSA selection + paged HSA kernel.
+        return self._dense_backend.forward_decode(
+            q, k, v, layer, forward_batch, save_kv_cache=save_kv_cache, **kwargs
         )
 
     def forward_extend(
@@ -56,11 +179,10 @@ class HSAAttnBackend(AttentionBackend):
         layer: RadixAttention,
         forward_batch: ForwardBatch,
         save_kv_cache: bool = True,
-        **_kwargs,
+        **kwargs,
     ):
-        raise NotImplementedError(
-            "HSAAttnBackend.forward_extend is not implemented yet. "
-            "See dev/hsa_sglang_impl_todo.md."
+        return self._dense_backend.forward_extend(
+            q, k, v, layer, forward_batch, save_kv_cache=save_kv_cache, **kwargs
         )
 
 
