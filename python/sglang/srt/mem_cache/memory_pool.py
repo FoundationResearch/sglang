@@ -685,8 +685,12 @@ class MHATokenToKVPool(KVCache):
             if swa_v_head_dim is not None
             else v_head_dim if v_head_dim is not None else head_dim
         )
+        # Page indices are derived by: page_id = loc // page_size.
+        # Allocators reserve page_id=0 as a padded/dummy page.
+        self.num_pages = self.size // self.page_size + 1
 
         self._create_buffers()
+        self._create_hsa_chunk_repr_buffers()
 
         self.device_module = torch.get_device_module(self.device)
         self.alt_stream = (
@@ -703,6 +707,116 @@ class MHATokenToKVPool(KVCache):
         # for store_cache JIT kernel
         self.row_dim = self.head_num * self.head_dim
         self.same_kv_dim = self.head_dim == self.v_head_dim
+
+    def _get_hsa_repr_dtype(self) -> torch.dtype:
+        # Prefer fp16/bf16 for chunk repr even if KV is stored in fp8 bytes.
+        if self.dtype in (torch.float8_e5m2, torch.float8_e4m3fn):
+            return torch.float16
+        return self.dtype
+
+    def _create_hsa_chunk_repr_buffers(self) -> None:
+        """Allocate per-page chunk representation buffers for HSA.
+
+        Contract:
+        - Indexed by physical page_id (page_id == loc // page_size).
+        - page_id=0 is reserved as dummy.
+        - Versioning is used to avoid reading stale repr after page reuse.
+        """
+        repr_dtype = self._get_hsa_repr_dtype()
+        with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
+            with (
+                torch.cuda.use_mem_pool(self.custom_mem_pool)
+                if self.enable_custom_mem_pool
+                else nullcontext()
+            ):
+                self.chunk_repr_buffer = [
+                    torch.zeros(
+                        (self.num_pages, self.head_num, self.head_dim),
+                        dtype=repr_dtype,
+                        device=self.device,
+                    )
+                    for _ in range(self.layer_num)
+                ]
+                # Per-layer version stored with repr; compared against requested page_version.
+                self.chunk_repr_version = [
+                    torch.zeros(
+                        (self.num_pages,), dtype=torch.int32, device=self.device
+                    )
+                    for _ in range(self.layer_num)
+                ]
+                # Global page version for convenience; intended to be bumped on page allocation/reuse.
+                self.page_version = torch.zeros(
+                    (self.num_pages,), dtype=torch.int32, device=self.device
+                )
+
+    def bump_page_version(self, page_ids: torch.Tensor) -> torch.Tensor:
+        """Bump global page versions for the given page_ids and return new versions.
+
+        This is a lightweight building block for page-reuse safety. In production,
+        we expect the allocator to drive version bumps; tests and early integration
+        can call this method directly.
+        """
+        if page_ids.numel() == 0:
+            return self.page_version[:0]
+        page_ids = torch.unique(page_ids.to(torch.int64))
+        self.page_version[page_ids] += 1
+        return self.page_version[page_ids]
+
+    def get_page_version(self, page_ids: torch.Tensor) -> torch.Tensor:
+        if page_ids.numel() == 0:
+            return self.page_version[:0]
+        return self.page_version[page_ids.to(torch.int64)]
+
+    def save_chunk_repr(
+        self,
+        layer_id: int,
+        page_ids: torch.Tensor,
+        repr: torch.Tensor,
+        page_version: Optional[torch.Tensor] = None,
+    ) -> None:
+        """Save per-page chunk repr for a layer.
+
+        Args:
+            layer_id: global layer id (same semantics as get_kv_buffer).
+            page_ids: int tensor of physical page ids.
+            repr: [N, head_num, head_dim] tensor.
+            page_version: optional int tensor [N] to record alongside repr.
+        """
+        if page_ids.numel() == 0:
+            return
+        local_layer_id = layer_id - self.start_layer
+        page_ids_i64 = page_ids.to(torch.int64)
+        if repr.dtype != self.chunk_repr_buffer[local_layer_id].dtype:
+            repr = repr.to(self.chunk_repr_buffer[local_layer_id].dtype)
+        self.chunk_repr_buffer[local_layer_id][page_ids_i64] = repr
+
+        if page_version is None:
+            version = self.page_version[page_ids_i64]
+        else:
+            version = page_version.to(torch.int32)
+        self.chunk_repr_version[local_layer_id][page_ids_i64] = version
+
+    def get_chunk_repr(
+        self,
+        layer_id: int,
+        page_ids: torch.Tensor,
+        page_version: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Get per-page chunk repr for a layer, optionally guarded by versions."""
+        local_layer_id = layer_id - self.start_layer
+        page_ids_i64 = page_ids.to(torch.int64)
+        out = self.chunk_repr_buffer[local_layer_id][page_ids_i64]
+
+        if page_version is None:
+            return out
+
+        stored_ver = self.chunk_repr_version[local_layer_id][page_ids_i64]
+        req_ver = page_version.to(torch.int32)
+        mismatch = stored_ver != req_ver
+        if mismatch.any():
+            out = out.clone()
+            out[mismatch] = 0
+        return out
 
     def _init_kv_copy_and_warmup(self):
         # Heuristics for KV copy tiling
