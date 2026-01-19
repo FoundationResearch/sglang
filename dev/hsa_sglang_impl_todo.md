@@ -38,6 +38,8 @@
       - `@register_attention_backend("hsa")`
       - `def create_hsa_backend(runner): return HSAAttnBackend(runner)`
 
+**状态**：✅ 已完成（CLI/Registry 已接入，可用 `--attention-backend hsa` 选择）
+
 ---
 
 ## 2. Backend：新增 `HSAAttnBackend`（核心调度点）
@@ -71,6 +73,12 @@
       - 可选：`token_to_batch_idx` / `indexer_k_start_end`（若 selection 需要 ragged 访问）
     - `@dataclass class HSAForwardMetadata:`（如需把 selection / kernel 输入缓存下来）
 
+**状态**：🟡 已部分完成
+- ✅ `HSAAttnBackend` 已存在，并且当前阶段 **delegate 到 dense（`TritonAttnBackend`）**，可跑通 end-to-end plumbing
+- ✅ 已实现并缓存最小 `HSAMetadata`（包含 `page_table_1` / `real_page_table` 以及 `kv_indptr/kv_indices` 指针透传）
+- ✅ 已加入 GPU-only smoke test：`python/sglang/test/attention/test_hsa_backend_gpu.py`（验证 `init_forward_metadata` 能跑、`forward_decode/extend` 能 delegate）
+- ⏳ 未实现：真正的 HSA selection/top‑k/weights，未实现 paged HSA kernel
+
 ---
 
 ## 3. KV Pool：为 \(E_i\) 增加 per-page buffer（并与页回收安全协作）
@@ -95,6 +103,8 @@
 
 - **文件**：`python/sglang/srt/mem_cache/swa_memory_pool.py`
   - **任务**：若 HSA 需要 SWA pool 参与（混层/窗口），明确 repr buffer 在 full/swa 的放置与映射策略（参考 `SWAKVPool.translate_loc_from_full_to_swa`）。
+
+**状态**：⏭️ 下一步建议优先做这里（Milestone 1 的实质）
 
 ---
 
@@ -146,6 +156,18 @@
     - 构造离散 `kv_indices`，验证 kernel 读取正确
   - `python/sglang/test/attention/test_hsa_backend_decode.py`
     - 与 dense decode 对照（或 reference）验证 correctness
+
+**当前已有测试**
+- ✅ `python/sglang/test/attention/test_hsa_backend_gpu.py`（GPU-only，smoke：可跑 + delegate）
+
+**仍缺的测试（建议按优先级）**
+- **P0（下一步）**：`test_hsa_kvpool_repr.py`（GPU-only）
+  - page_id keyed 的 repr buffer：写入/读取
+  - “只在 completed page 写入”的规则（partial page 不写）
+  - page reuse/version 机制：避免误读旧 repr
+- **P1**：`test_hsa_backend_dense_integration.py`（GPU-only）
+  - 不 monkeypatch dummy backend，走真实 `TritonAttnBackend` 路径，至少跑一次 decode forward（验证 wiring 在真实依赖栈下可跑）
+- **P2**：CUDA graph / speculative / sliding window 的支持矩阵测试（先写 skip/xfail 也可以）
 
 ---
 
