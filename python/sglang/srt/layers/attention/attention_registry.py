@@ -84,6 +84,13 @@ def create_nsa_backend(runner):
     return NativeSparseAttnBackend(runner)
 
 
+@register_attention_backend("hsa")
+def create_hsa_backend(runner):
+    from sglang.srt.layers.attention.hsa_backend import HSAAttnBackend
+
+    return HSAAttnBackend(runner)
+
+
 @register_attention_backend("triton")
 def create_triton_backend(runner):
     assert not runner.model_config.is_encoder_decoder, (
