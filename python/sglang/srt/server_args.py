@@ -122,6 +122,7 @@ ATTENTION_BACKEND_CHOICES = [
     "torch_native",
     "flex_attention",
     "nsa",
+    "hsa",
     # NVIDIA specific
     "cutlass_mla",
     "fa3",
@@ -437,6 +438,13 @@ class ServerArgs:
     fp4_gemm_runner_backend: str = "auto"
     nsa_prefill_backend: str = "flashmla_sparse"
     nsa_decode_backend: str = "fa3"
+    # HSA (Hierarchical Sparse Attention)
+    # NOTE: HSA requires page_size == chunk_size (see dev/hsa_dev_roadmap.md).
+    hsa_topk: int = 64
+    hsa_selection_strategy: str = "head"
+    hsa_layers: Optional[str] = None
+    hsa_window_size: Optional[int] = None
+    hsa_enable_swa_fusion: bool = False
     disable_flashinfer_autotune: bool = False
 
     # Speculative decoding
@@ -3533,6 +3541,38 @@ class ServerArgs:
             default=ServerArgs.nsa_decode_backend,
             type=str,
             choices=NSA_CHOICES,
+        )
+        parser.add_argument(
+            "--hsa-topk",
+            type=int,
+            default=ServerArgs.hsa_topk,
+            help="Top-k pages/chunks to attend for HSA. Only used when --attention-backend hsa.",
+        )
+        parser.add_argument(
+            "--hsa-selection-strategy",
+            type=str,
+            default=ServerArgs.hsa_selection_strategy,
+            choices=["group", "head", "softmax_head"],
+            help="HSA selection strategy. Only used when --attention-backend hsa.",
+        )
+        parser.add_argument(
+            "--hsa-layers",
+            type=str,
+            default=ServerArgs.hsa_layers,
+            help="Comma-separated layer ids or ranges to enable HSA (e.g. '0,2,4-7'). "
+            "If unset, backend decides default behavior. Only used when --attention-backend hsa.",
+        )
+        parser.add_argument(
+            "--hsa-window-size",
+            type=int,
+            default=ServerArgs.hsa_window_size,
+            help="Optional sliding window size for HSA masking/fusion. Only used when --attention-backend hsa.",
+        )
+        parser.add_argument(
+            "--hsa-enable-swa-fusion",
+            action="store_true",
+            default=ServerArgs.hsa_enable_swa_fusion,
+            help="If set, enable SWA/dense fusion path for HSA (planned). Only used when --attention-backend hsa.",
         )
         parser.add_argument(
             "--fp8-gemm-backend",
