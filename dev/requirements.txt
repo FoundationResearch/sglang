@@ -1,0 +1,39 @@
+#
+# Dev dependencies for HSA bring-up (alexsg env)
+# - Needed to import SGLang SRT stack with eager Triton backend imports
+# - Needed to run GPU-only unit tests:
+#   python/sglang/test/attention/test_hsa_backend_gpu.py
+#
+
+# Test runner
+pytest
+
+# SGLang / SRT import-time deps encountered in alexsg
+pybase64
+ipython
+pydantic>=2
+aiohttp
+openai
+partial-json-parser
+huggingface_hub
+transformers
+dill
+sentencepiece
+
+# Serialization / performance / system utils
+safetensors
+packaging
+orjson
+psutil
+pyzmq
+starlette
+msgspec
+
+# Quantization / model format extras pulled in transitively
+compressed-tensors
+gguf
+
+# Kernel package (module: sgl_kernel). If you install from source, you can do:
+#   pip install -e sgl-kernel
+sgl-kernel
+
