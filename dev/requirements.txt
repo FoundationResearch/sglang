@@ -28,6 +28,7 @@ psutil
 pyzmq
 starlette
 msgspec
+einops
 
 # Quantization / model format extras pulled in transitively
 compressed-tensors

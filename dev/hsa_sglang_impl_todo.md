@@ -77,7 +77,11 @@
 - ✅ `HSAAttnBackend` 已存在，并且当前阶段 **delegate 到 dense（`TritonAttnBackend`）**，可跑通 end-to-end plumbing
 - ✅ 已实现并缓存最小 `HSAMetadata`（包含 `page_table_1` / `real_page_table` 以及 `kv_indptr/kv_indices` 指针透传）
 - ✅ 已加入 GPU-only smoke test：`python/sglang/test/attention/test_hsa_backend_gpu.py`（验证 `init_forward_metadata` 能跑、`forward_decode/extend` 能 delegate）
-- ⏳ 未实现：真正的 HSA selection/top‑k/weights，未实现 paged HSA kernel
+- ✅ 已实现 Phase‑1 的 “completed page 写入 repr” hook（占位实现：用 boundary token 的 K 作为 repr）：
+  - decode：`seq_len % page_size == 0` 时写入
+  - extend：扫描 extend 片段内所有 page boundary 命中点并写入
+- ✅ 已加入 GPU-only 行为测试：`python/sglang/test/attention/test_hsa_backend_chunk_repr_gpu.py`
+- ⏳ 未实现：真正的 HSA selection/top‑k/weights，未实现 paged HSA kernel（仍然走 dense attention）
 
 ---
 
@@ -104,7 +108,13 @@
 - **文件**：`python/sglang/srt/mem_cache/swa_memory_pool.py`
   - **任务**：若 HSA 需要 SWA pool 参与（混层/窗口），明确 repr buffer 在 full/swa 的放置与映射策略（参考 `SWAKVPool.translate_loc_from_full_to_swa`）。
 
-**状态**：⏭️ 下一步建议优先做这里（Milestone 1 的实质）
+**状态**：✅ 已完成（Milestone 1 的 storage + 安全机制闭环）
+- ✅ `MHATokenToKVPool` 新增 per‑page repr buffer（按 `page_id = loc // page_size` 索引）：
+  - `chunk_repr_buffer[layer]`：`[num_pages, head_num, head_dim]`
+  - `chunk_repr_version[layer]`：`[num_pages]`
+  - `page_version`：`[num_pages]`
+- ✅ 提供接口：`save_chunk_repr()` / `get_chunk_repr()` / `get_page_version()` / `bump_page_version()`
+- ✅ GPU-only 单测：`python/sglang/test/attention/test_hsa_kvpool_repr.py`（写/读 + version guard）
 
 ---
 
@@ -159,12 +169,10 @@
 
 **当前已有测试**
 - ✅ `python/sglang/test/attention/test_hsa_backend_gpu.py`（GPU-only，smoke：可跑 + delegate）
+- ✅ `python/sglang/test/attention/test_hsa_kvpool_repr.py`（GPU-only：repr 写/读 + version guard）
+- ✅ `python/sglang/test/attention/test_hsa_backend_chunk_repr_gpu.py`（GPU-only：completed vs partial page 的 repr 写入规则）
 
 **仍缺的测试（建议按优先级）**
-- **P0（下一步）**：`test_hsa_kvpool_repr.py`（GPU-only）
-  - page_id keyed 的 repr buffer：写入/读取
-  - “只在 completed page 写入”的规则（partial page 不写）
-  - page reuse/version 机制：避免误读旧 repr
 - **P1**：`test_hsa_backend_dense_integration.py`（GPU-only）
   - 不 monkeypatch dummy backend，走真实 `TritonAttnBackend` 路径，至少跑一次 decode forward（验证 wiring 在真实依赖栈下可跑）
 - **P2**：CUDA graph / speculative / sliding window 的支持矩阵测试（先写 skip/xfail 也可以）
