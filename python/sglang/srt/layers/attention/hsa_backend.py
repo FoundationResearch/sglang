@@ -6,6 +6,10 @@ import torch
 
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.hsa.metadata import HSAMetadata
+from sglang.srt.layers.attention.hsa.selector import (
+    build_active_page_candidates,
+    select_topk_pages_decode,
+)
 from sglang.srt.layers.attention.hsa.utils import transform_page_table_1_to_real
 from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
 
@@ -60,6 +64,115 @@ class HSAAttnBackend(AttentionBackend):
 
         self._dense_backend = TritonAttnBackend(model_runner, **kwargs)
         self.forward_metadata: Optional[HSAMetadata] = None
+
+    def _is_hsa_layer(self, layer_id: int) -> bool:
+        layers = self.hsa_layers
+        if layers is None:
+            return True
+        try:
+            return int(layer_id) in set(int(x) for x in layers)
+        except Exception:
+            return True
+
+    def _get_effective_window_size(self) -> Optional[int]:
+        if self.hsa_window_size is not None:
+            return int(self.hsa_window_size)
+        if getattr(self.model_runner, "sliding_window_size", None) is not None:
+            return int(self.model_runner.sliding_window_size)
+        return None
+
+    def _run_selection_decode(
+        self,
+        *,
+        q: torch.Tensor,
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+    ) -> None:
+        """Step 4 (Torch reference): SWA→HSA selection for decode.
+
+        For now this populates debug fields on HSAMetadata; compute is still delegated
+        to dense backend. This keeps future kernel integration straightforward.
+        """
+        md = self.forward_metadata
+        if md is None:
+            return
+        if not self._is_hsa_layer(layer.layer_id):
+            return
+
+        pool = getattr(forward_batch, "token_to_kv_pool", None)
+        if pool is None or not hasattr(pool, "get_chunk_repr"):
+            return
+
+        window = self._get_effective_window_size()
+        # SWA→HSA mode: exclude SWA window pages from candidate set.
+        # (If fusion is enabled later, we'd switch to softmax_head logic.)
+        # Robustness: in decode, some codepaths/tests may not have updated req_to_token yet.
+        # Overlay out_cache_loc into a temporary token->slot table at position (seq_len - 1).
+        page_table_1 = md.page_table_1
+        if getattr(forward_batch, "out_cache_loc", None) is not None:
+            seq_lens_i64 = md.cache_seqlens_int32.to(torch.int64)
+            B = int(forward_batch.batch_size)
+            if B > 0:
+                page_table_1 = page_table_1.clone()
+                out_locs = forward_batch.out_cache_loc[:B].to(torch.int32)
+                for b in range(B):
+                    seqlen = int(seq_lens_i64[b].item())
+                    if seqlen > 0 and seqlen <= page_table_1.shape[1]:
+                        page_table_1[b, seqlen - 1] = out_locs[b]
+
+        cand_page_ids, cand_mask = build_active_page_candidates(
+            page_table_1=page_table_1,
+            seq_lens=md.cache_seqlens_int32,
+            page_size=md.page_size,
+            window_size=window,
+        )
+
+        # Flatten candidates for repr lookup.
+        B, C = cand_page_ids.shape
+        if C == 0:
+            # Still populate for observability.
+            md.hsa_cand_page_ids = cand_page_ids
+            md.hsa_cand_mask = cand_mask
+            md.hsa_selected_page_ids = cand_page_ids.new_full(
+                (B, layer.tp_k_head_num, self.hsa_topk), -1, dtype=torch.int32
+            )
+            md.hsa_selected_scores = q.new_full(
+                (B, layer.tp_k_head_num, self.hsa_topk), float("-inf"), dtype=torch.float32
+            )
+            return
+
+        flat_page_ids = cand_page_ids.reshape(-1)
+        flat_mask = cand_mask.reshape(-1)
+        # Replace -1 with 0 for safe indexing (we will mask them out anyway).
+        safe_flat_page_ids = flat_page_ids.clamp_min(0).to(torch.int32)
+
+        # Version + validity.
+        flat_versions = pool.get_page_version(safe_flat_page_ids)
+        flat_valid = pool.get_chunk_repr_valid_mask(
+            layer.layer_id, safe_flat_page_ids, flat_versions
+        )
+        flat_valid = flat_valid & flat_mask
+
+        flat_repr = pool.get_chunk_repr(layer.layer_id, safe_flat_page_ids, flat_versions)
+        # [B*C, H, D] -> [B, C, H, D]
+        cand_repr = flat_repr.view(B, C, flat_repr.shape[1], flat_repr.shape[2])
+        cand_repr_valid = flat_valid.view(B, C)
+
+        sel = select_topk_pages_decode(
+            q=q,
+            cand_page_ids=cand_page_ids,
+            cand_mask=cand_mask,
+            cand_chunk_repr=cand_repr,
+            cand_chunk_repr_valid=cand_repr_valid,
+            topk=int(self.hsa_topk),
+            selection_strategy=str(self.hsa_selection_strategy),
+            sm_scale=getattr(layer, "scaling", None),
+        )
+
+        md.hsa_cand_page_ids = sel.cand_page_ids
+        md.hsa_cand_mask = sel.cand_mask
+        md.hsa_selected_page_ids = sel.selected_page_ids
+        md.hsa_selected_scores = sel.selected_scores
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         # First, initialize dense backend metadata so decode/extend remains runnable.
@@ -246,6 +359,8 @@ class HSAAttnBackend(AttentionBackend):
         save_kv_cache: bool = True,
         **kwargs,
     ):
+        # Step 4: run selection (SWA→HSA) to populate metadata; compute still uses dense backend.
+        self._run_selection_decode(q=q, layer=layer, forward_batch=forward_batch)
         # Phase 1: delegate to dense attention backend for correctness/runability.
         # Phase 2+: replace with HSA selection + paged HSA kernel.
         out = self._dense_backend.forward_decode(

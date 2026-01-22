@@ -818,6 +818,31 @@ class MHATokenToKVPool(KVCache):
             out[mismatch] = 0
         return out
 
+    def get_chunk_repr_valid_mask(
+        self,
+        layer_id: int,
+        page_ids: torch.Tensor,
+        page_version: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Return a boolean mask indicating whether per-page repr is valid.
+
+        A repr is considered valid iff the stored repr version equals the requested
+        page_version (or current self.page_version if page_version is None).
+
+        This is useful for selection: invalid pages should be masked out (score = -inf)
+        rather than competing with an all-zero repr.
+        """
+        local_layer_id = layer_id - self.start_layer
+        if page_ids.numel() == 0:
+            return page_ids.new_empty((0,), dtype=torch.bool)
+        page_ids_i64 = page_ids.to(torch.int64)
+        stored_ver = self.chunk_repr_version[local_layer_id][page_ids_i64]
+        if page_version is None:
+            req_ver = self.page_version[page_ids_i64]
+        else:
+            req_ver = page_version.to(torch.int32)
+        return stored_ver == req_ver
+
     def _init_kv_copy_and_warmup(self):
         # Heuristics for KV copy tiling
         _KV_COPY_STRIDE_THRESHOLD_LARGE = 8192
