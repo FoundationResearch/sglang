@@ -36,4 +36,11 @@ class HSAMetadata:
     window_kv_indptr: Optional[torch.Tensor] = None
     window_kv_indices: Optional[torch.Tensor] = None
 
+    # ---- Step 4+ (selection) optional debug fields (decode path) ----
+    # These are populated by HSAAttnBackend for observability and unit tests.
+    hsa_cand_page_ids: Optional[torch.Tensor] = None  # [B, C] int32 padded -1
+    hsa_cand_mask: Optional[torch.Tensor] = None  # [B, C] bool
+    hsa_selected_page_ids: Optional[torch.Tensor] = None  # [B, H, K] int32 padded -1
+    hsa_selected_scores: Optional[torch.Tensor] = None  # [B, H, K] float32
+
 

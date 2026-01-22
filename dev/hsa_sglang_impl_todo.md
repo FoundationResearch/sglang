@@ -122,6 +122,13 @@
 
 > 目标：selection 必须是 “paged-friendly” 的输出，避免在 Python 侧做大量 gather/transform。
 
+- **本阶段实现策略（先 SWA→HSA，非融合；但保留未来融合的灵活性）**
+  - **固定 K**：`--hsa-topk` 固定，输出不足时用 `-1` padding，并配套 mask / `-inf` score。
+  - **候选集 = 本次 query 的活跃 pages**：仅对 `req_to_token[:seq_len]` 中出现过的 `page_id` 计算 \(q \cdot E_i\)。
+  - **SWA→HSA 模式的 SWA 排除**：先用 SWA 覆盖“近邻窗口”，selection 只在窗口之外的 pages 上做 top‑k（等价于原 repo 的 “causal block mask” 思路）。
+  - **repr 有效性**：selection 必须利用 `page_version`/`chunk_repr_version` 将无效 page 直接 mask 成 `-inf`，避免 all‑zero repr 参与竞争导致错误选择。
+  - **策略支持**：先实现 `group`/`head`（命名对齐 `dev/hsa-kernel-main`），未来再加 `softmax_head`（SWA/HSA 融合需要 `lse_swa`）。
+
 - **新增目录（建议）**：`python/sglang/srt/layers/attention/hsa/`
   - **新增文件**：`selector.py`
     - `class HSASelector:`（或函数集）
@@ -136,6 +143,14 @@
   - 将 `dev/hsa-kernel-main/ops/topk_*.py` 中可复用的 kernel 迁移/重写到：
     - `python/sglang/srt/layers/attention/hsa/kernels/topk_*.py`
   - 关键改造点：输入必须支持 `page_id`/paged 表，而不是假设 landmarks 连续。
+
+**状态**：🟡 实现中（已闭环 decode 的 Torch reference selection + CUDA 单测）
+- ✅ 新增：`python/sglang/srt/layers/attention/hsa/selector.py`
+  - `build_active_page_candidates(...)`：活跃 pages + SWA window pages 排除
+  - `select_topk_pages_decode(...)`：decode top‑k（固定 K；`group/head`）
+- ✅ KV pool 新增：`MHATokenToKVPool.get_chunk_repr_valid_mask(...)`（selection 用于 `-inf` mask）
+- ✅ `HSAAttnBackend.forward_decode` 已运行 selection，并把结果写到 `HSAMetadata` 的 debug 字段（compute 仍 delegate dense）
+- ✅ GPU-only 单测：`python/sglang/test/attention/test_hsa_selector_decode_gpu.py`
 
 ---
 

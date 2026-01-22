@@ -1,7 +1,7 @@
 ## HSA in SGLang：阶段性成果（截至目前）
 
 ### 目标进度概览
-- **HSA 已作为 `AttentionBackend` 接入**：可用 `--attention-backend hsa` 选择（当前仍 delegate 到 dense attention，HSA kernel/selection 尚未落地）。
+- **HSA 已作为 `AttentionBackend` 接入**：可用 `--attention-backend hsa` 选择（当前 attention compute 仍 delegate 到 dense，HSA kernel 尚未落地；但 selection 已实现并写入 metadata）。
 - **Paged-KV-first 的关键 plumbing 已打通**：metadata（page table/kv indices）、KV 写入链路、per-page chunk repr 存取、GPU-only 测试。
 
 ### 1) 文档与路线（对齐 SGLang 架构）
@@ -44,11 +44,21 @@
   - **真实集成测试（不 monkeypatch）**：真实 `TritonAttnBackend` decode 路径可跑，且 completed-page repr hook 会写入 `chunk_repr_buffer`
   - 注：为单测环境 patch `dp_attention.get_attention_tp_size()` 为 1，避免 “dp attention not initialized” 断言
 
-### 6) 环境与依赖
+### 6) Selection（Step 4：Torch reference，先用于 metadata/可观测，不影响 compute）
+- ✅ `python/sglang/srt/layers/attention/hsa/selector.py`
+  - active pages candidates（仅本请求活跃 pages）
+  - SWA→HSA：排除 window pages
+  - fixed‑K top‑k（`group/head`），无效候选 mask 为 `-inf`，输出 `-1` padding
+- ✅ `python/sglang/srt/mem_cache/memory_pool.py`
+  - `MHATokenToKVPool.get_chunk_repr_valid_mask(...)`：用于 selection 的 version-guard 有效性 mask
+- ✅ `python/sglang/srt/layers/attention/hsa_backend.py`
+  - decode path 计算 selection，并写入 `HSAMetadata.hsa_*` debug 字段（attention 计算仍 delegate）
+- ✅ `python/sglang/test/attention/test_hsa_selector_decode_gpu.py`（CUDA）
+
+### 7) 环境与依赖
 - ✅ `dev/requirements.txt` 已补齐 bring-up 阶段遇到的 import/test 依赖（包含 `sgl-kernel` 等）
 - ✅ 新增依赖 `einops`（由 KV 写路径触发的 transitive import 需要，用于测试场景）
 
 ### 下一阶段（尚未完成）
-- ⏳ Step 4：真正的 HSA selection/top‑k/weights（paged-friendly 输出）
 - ⏳ Step 5：paged HSA decode kernel（先闭环 decode correctness，再优化/融合）
 - ⏳ 将 `page_version` 与 allocator/radix 的 page reuse 生命周期强绑定（生产级安全）
