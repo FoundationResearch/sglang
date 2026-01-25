@@ -24,16 +24,16 @@
 **目标**：先把最关键的“契约”写死，避免后续 kernel/缓存/调度返工。
 
 ### 任务列表
-- [ ] **M0.1：确定 HSA 的 Chunk/Page 语义**  
+- [x] **M0.1：确定 HSA 的 Chunk/Page 语义**  
   - **约束**：`chunk_size == page_size`（与 SGLang paged allocator 对齐，且包含 LMK slot）。  
   - **新增硬约束（LMK）**：每个 page 最后一个 slot 固定为 LMK，故每页真实 token 数为 `page_size-1`。  
   - **注意**：SGLang 默认 `page_size=1`（见 `python/sglang/srt/server_args.py`），HSA/LMK 必须显式要求 `page_size >= 2`（例如 32/64）。
-- [ ] **M0.2：定义 \(E_i\) 的产生时机与一致性规则**  
+- [x] **M0.2：定义 \(E_i\) 的产生时机与一致性规则**  
   - **FlashHSA 语义**：当一个 chunk 填满 `page_size-1` 个真实 token 时，插入 1 个 LMK token 并写入 KV；该 LMK token 在每一层的 K（可选加 `lmk_norm`）即 \(E_i\)。
   - **推理输出规则**：LMK token 只用于 KV/selection，不应被用户看到（不做采样、不输出）。  
   - **Radix/prefix 规则**：Radix prefix cache 必须在 “包含 LMK 的 token 序列坐标系” 下工作：prefix 对齐与复用时，LMK 也应被视为序列的一部分（否则 prefix 对齐会错位）。
   - 说明：Radix cache 在 `page_size>1` 时按页对齐缓存 keys；尾部 partial page 不进入 tree（对照 `python/sglang/srt/mem_cache/radix_cache.py` 的 `cache_protected_len` 注释）。
-- [ ] **M0.3：定义 HSA Selection API（输出必须可直接驱动 paged kernel）**  
+- [x] **M0.3：定义 HSA Selection API（输出必须可直接驱动 paged kernel）**  
   - 输入：`Q`（per-token/per-request）、历史 \(E_i\)（按 page_id 索引）、窗口/SWA 相关辅助（可选）。
   - 输出（至少固定一种主线）：`selected_page_ids`（或等价的“可映射到 page_id 的 table”）+ `weights`。
   - 要求：输出语义与 SGLang 的 paged indices 链路一致（参考 NSA 的 `TopkTransformMethod.PAGED` 与 `page_table_1 -> real_page_table` 变换逻辑，见 `python/sglang/srt/layers/attention/nsa_backend.py`）。
@@ -80,12 +80,12 @@
 **目标**：实现可 batch 化、可与 paged 索引语义对齐的 selection，并为 kernel 提供 page_id + weights。
 
 ### 任务列表
-- [ ] **M2.1：实现 HSA 的 indexer/selector 逻辑**
+- [x] **M2.1：实现 HSA 的 indexer/selector 逻辑（Torch reference）**
   - 参考：`python/sglang/srt/layers/attention/nsa_backend.py` 的 metadata 组织、以及 `topk_transform()` 的 fused transform 思路。
   - 要求：支持 continuous batching（按 batch 的 `seq_lens`/`req_pool_indices` 组织）。
 - [ ] **M2.2：实现 fused transform（强烈建议）**
   - 目标：把 top‑k + “token index -> page_id/page_table index”尽量融合，避免额外 gather/transform 开销。
-- [ ] **M2.3：定义 selection 输出与 attention kernel 输入的精确 shape 契约**  
+- [x] **M2.3：定义 selection 输出与 attention kernel 输入的精确 shape 契约（decode 侧）**  
   - 明确 group/head/softmax_head 三种策略中至少选一种作为主线，其他作为扩展。
   - **新增（LMK）**：明确 selection logits 计算使用的 \(E_i\) 是 “LMK-K”，需要从 KV cache gather（或从 LMK-K cache 读取）。
 
