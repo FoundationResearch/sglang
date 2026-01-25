@@ -79,15 +79,13 @@
       - 可选：`token_to_batch_idx` / `indexer_k_start_end`（若 selection 需要 ragged 访问）
     - `@dataclass class HSAForwardMetadata:`（如需把 selection / kernel 输入缓存下来）
 
-**状态**：🟡 已部分完成
+**状态**：🟡 已部分完成（Phase‑1 调度点已闭环；kernel 未落地）
 - ✅ `HSAAttnBackend` 已存在，并且当前阶段 **delegate 到 dense（`TritonAttnBackend`）**，可跑通 end-to-end plumbing
 - ✅ 已实现并缓存最小 `HSAMetadata`（包含 `page_table_1` / `real_page_table` 以及 `kv_indptr/kv_indices` 指针透传）
-- ✅ 已加入 GPU-only smoke test：`python/sglang/test/attention/test_hsa_backend_gpu.py`（验证 `init_forward_metadata` 能跑、`forward_decode/extend` 能 delegate）
-- ✅ 已实现 Phase‑1 的 “completed page 写入 repr” hook（占位实现：用 boundary token 的 K 作为 repr）：
-  - decode：`seq_len % page_size == 0` 时写入
-  - extend：扫描 extend 片段内所有 page boundary 命中点并写入
-- ✅ 已加入 GPU-only 行为测试：`python/sglang/test/attention/test_hsa_backend_chunk_repr_gpu.py`
-- ⏳ 未实现：真正的 HSA selection/top‑k/weights，未实现 paged HSA kernel（仍然走 dense attention）
+- ✅ 已实现 decode selection（Torch reference），并把结果写入 `HSAMetadata.hsa_*` debug 字段（compute 仍 delegate）
+- ✅ 已加入 GPU-only smoke test：`python/sglang/test/attention/test_hsa_backend_gpu.py`
+- ✅ 已加入 GPU-only 真实集成测试（不 monkeypatch）：`python/sglang/test/attention/test_hsa_backend_dense_integration_gpu.py`
+- ⏳ 未实现：paged HSA kernel（仍然走 dense attention 输出）
 
 ---
 
@@ -101,16 +99,14 @@
   - **安全性**：通过 “completed-page gating”（只允许 `page_id < floor(seq_len / page_size)`）避免读到未定义 KV。
 
 - **文件**：`python/sglang/srt/mem_cache/allocator.py`
-  - **任务（可选，但推荐）**：提供 “页版本”维护位置（两种方案择一）
-    - **方案 A（allocator 持有页版本）**：每次 `alloc/alloc_extend/alloc_decode` 分配新页时递增版本并返回（需要扩展返回值或额外查询接口）。
-    - **方案 B（KV pool 持有页版本）**：由 backend 在写 KV 或写 repr 时检测“本页是否首次写入/新分配”，并更新版本。
+  - **任务（后续安全工作）**：把 allocator/radix 的 page reuse 生命周期与 HSA 的 completed-page 语义强绑定（生产级安全）。
 
 - **文件**：`python/sglang/srt/mem_cache/swa_memory_pool.py`
-  - **任务**：若 HSA 需要 SWA pool 参与（混层/窗口），明确 repr buffer 在 full/swa 的放置与映射策略（参考 `SWAKVPool.translate_loc_from_full_to_swa`）。
+  - **任务**：若 HSA 需要 SWA pool 参与（混层/窗口），明确 LMK 在 full/swa 的映射策略。
 
-**状态**：🟡 需要重做（已确认：不使用任何 per-page repr buffer）
-- 我们将完全遵循 FlashHSA：\(E_i\) 来自 KV cache 中 LMK token 的 K（按 layer 分别 gather）。
-- 因此不再新增/维护任何额外的 per-page 状态，避免与 Radix/prefix 生命周期打架。
+**状态**：✅ 已完成（遵循 FlashHSA；无 repr buffer）
+- ✅ \(E_i\) 来自 KV cache 中 LMK token 的 K（按 layer 分别 gather）
+- ✅ 通过 completed-page gating 避免读到未定义 KV
 
 ---
 
@@ -168,30 +164,6 @@
 
 **状态**：✅ 已完成
 
-### **4.x（新增主线）：LMK token 注入 + 从 KV gather \(E_i\)**
-
-> 这一块是进入 paged kernel 前必须先定死的 runtime contract（否则 kernel 的正确性无法闭环）。
-
-- **目标**
-  - 把 “\(E_i\) = LMK-K” 变成系统真实语义：LMK 走完整网络、写 KV、但不对外吐 token。
-  - selection 从 KV cache gather LMK-K（或从 LMK-K cache 读取），不再依赖 Phase‑1 的占位 repr 写入。
-
-- **需要确认/对齐的点（来自 FlashHSA 官方实现）**
-  - LMK id：`lmk_id = vocab_size`，embedding/lm_head 需要支持 `vocab_size+1`（模型权重/训练侧配合）。
-  - 插入规则：每 `page_size-1` 个真实 token 后插入 1 个 LMK，形成 page 长度 `page_size`。
-  - labels 规则：LMK 的 label 必须是 `-100`（训练时忽略 loss）；推理时 LMK 不应采样/输出。
-
-- **实现 TODO（SGLang）**
-  - [ ] **插入点（decode）**：当某请求“下一步将触发 LMK”时，调度一次 “LMK step”（写 KV，不输出 token）。
-  - [ ] **插入点（extend/prefill）**：在 ragged 输入里按 `(page_size-1)` 自动插入 LMK，并保证 `seq_lens/out_cache_loc` 对齐。
-  - [ ] **prefix cache / radix 对齐**：Radix prefix cache 必须在 “包含 LMK 的 token 序列” 上对齐（LMK 作为真实 token 参与 prefix）。
-  - [ ] **selection 输入改造**：`page_id -> lmk_token_loc -> gather(K_lmk)` 形成 `cand_chunk_repr`（paged-friendly）。
-  - [ ] **候选集约束**：只允许 completed pages（LMK 已写入）进入候选；partial page 必须排除/mask。
-  - [ ] **GPU-only tests**：
-    - [ ] decode：每 `page_size-1` 个真实 token 插入 1 个 LMK 且不对外吐 token
-    - [ ] selection：LMK gather 的 \(E_i\) 与 “从 repr buffer 读”一致（若 buffer 仍保留）
-    - [ ] prefix 场景：prefix 命中时 LMK 对齐不乱
-
 ---
 
 ## 5. Kernel：Paged HSA（decode 先闭环）
@@ -215,8 +187,6 @@
 - **新增测试文件（建议最小集）**
   - `python/sglang/test/attention/test_hsa_contract.py`
     - page_size/chunk_size 契约、partial page 规则、page_id 映射一致性
-  - `python/sglang/test/attention/test_hsa_kvpool_repr.py`
-    - repr 写入/读取、prefix hit 复用、page reuse 不误读（version/valid）
   - `python/sglang/test/attention/test_hsa_paged_kernel.py`
     - 构造离散 `kv_indices`，验证 kernel 读取正确
   - `python/sglang/test/attention/test_hsa_backend_decode.py`
@@ -224,13 +194,14 @@
 
 **当前已有测试**
 - ✅ `python/sglang/test/attention/test_hsa_backend_gpu.py`（GPU-only，smoke：可跑 + delegate）
-- ✅ `python/sglang/test/attention/test_hsa_kvpool_repr.py`（GPU-only：repr 写/读 + version guard）
-- ✅ `python/sglang/test/attention/test_hsa_backend_chunk_repr_gpu.py`（GPU-only：completed vs partial page 的 repr 写入规则）
+- ✅ `python/sglang/test/attention/test_hsa_backend_dense_integration_gpu.py`（GPU-only：真实 Triton 集成 + selection 可跑）
+- ✅ `python/sglang/test/attention/test_hsa_lmk_runtime_injection_gpu.py`（GPU-only：LMK prompt 插入 + decode 强制 LMK 且不可见）
+- ✅ `python/sglang/test/attention/test_hsa_selector_decode_gpu.py`（GPU-only：selection correctness）
 
 **仍缺的测试（建议按优先级）**
-- **P1**：`test_hsa_backend_dense_integration.py`（GPU-only）
-  - 不 monkeypatch dummy backend，走真实 `TritonAttnBackend` 路径，至少跑一次 decode forward（验证 wiring 在真实依赖栈下可跑）
-- **P2**：CUDA graph / speculative / sliding window 的支持矩阵测试（先写 skip/xfail 也可以）
+- **P1**：真正的端到端：scheduler 跑几轮 decode，验证输出 token 序列中不出现 LMK，但内部 seqlen/kv/cache 持续增长（含 radix prefix 命中场景）
+- **P2**：extend/prefill 的 LMK 自动插入（ragged）与 prefix/radix 对齐测试
+- **P3**：CUDA graph / speculative / overlap / sliding window 的支持矩阵测试（先写 skip/xfail 也可以）
 
 ---
 
