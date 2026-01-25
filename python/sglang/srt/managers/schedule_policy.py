@@ -186,7 +186,8 @@ class SchedulePolicy:
         self.waiting_queue_radix_tree.reset()
 
         for r in waiting_queue:
-            prefix_ids = r.origin_input_ids + r.output_ids
+            # Use engine-visible tokens (including HSA LMK) for radix prefix matching when available.
+            prefix_ids = r.fill_ids if getattr(r, "fill_ids", None) else (r.origin_input_ids + r.output_ids)
             extra_key = r.extra_key
             # NOTE: the prefix_indices must always be aligned with last_node
             match_result = self.tree_cache.match_prefix(

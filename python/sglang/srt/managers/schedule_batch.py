@@ -537,6 +537,10 @@ class Req:
         self.output_ids = []
         # fill_ids = origin_input_ids + output_ids. Updated if chunked.
         self.fill_ids = []
+        # HSA (FlashHSA semantics): LMK is inserted into fill_ids but never emitted to user.
+        self.hsa_lmk_enabled: bool = False
+        self.hsa_page_size: Optional[int] = None
+        self.hsa_lmk_id: Optional[int] = None
         self.session_id = session_id
         self.input_embeds = input_embeds
 
@@ -777,7 +781,55 @@ class Req:
     @property
     def seqlen(self) -> int:
         """Get the current sequence length of the request."""
+        if self.fill_ids:
+            return len(self.fill_ids)
         return len(self.origin_input_ids) + len(self.output_ids)
+
+    def enable_hsa_lmk(self, *, page_size: int, lmk_id: int) -> None:
+        """Enable HSA LMK runtime semantics for this request.
+
+        LMK is inserted into `fill_ids` but never appended to `output_ids`.
+        """
+        if page_size <= 1:
+            raise ValueError(f"HSA LMK requires page_size >= 2, got {page_size}")
+        self.hsa_lmk_enabled = True
+        self.hsa_page_size = int(page_size)
+        self.hsa_lmk_id = int(lmk_id)
+
+    def hsa_append_next_token_or_lmk(self, next_token_id: int) -> bool:
+        """Append the next token under HSA LMK semantics.
+
+        Returns:
+            True if a user-visible token was appended (output_ids + fill_ids updated).
+            False if an internal LMK was appended (fill_ids updated only).
+        """
+        if not self.hsa_lmk_enabled:
+            self.output_ids.append(next_token_id)
+            return True
+        assert self.hsa_page_size is not None and self.hsa_lmk_id is not None
+        page_size = int(self.hsa_page_size)
+        # If the next position is the LMK slot (last slot in the page), force LMK.
+        if (len(self.fill_ids) % page_size) == (page_size - 1):
+            self.fill_ids.append(int(self.hsa_lmk_id))
+            return False
+        self.output_ids.append(next_token_id)
+        self.fill_ids.append(next_token_id)
+        return True
+
+    @staticmethod
+    def _hsa_insert_lmk_prompt(token_ids: List[int], *, page_size: int, lmk_id: int) -> List[int]:
+        """Insert LMK after every (page_size-1) tokens (FlashHSA-style), leaving the tail partial page unchanged."""
+        chunk = int(page_size) - 1
+        if chunk <= 0:
+            return list(token_ids)
+        out: List[int] = []
+        n_full = len(token_ids) // chunk
+        for i in range(n_full):
+            start = i * chunk
+            out.extend(token_ids[start : start + chunk])
+            out.append(int(lmk_id))
+        out.extend(token_ids[n_full * chunk :])
+        return out
 
     @property
     def is_prefill_only(self) -> bool:
@@ -852,7 +904,18 @@ class Req:
         if self.is_dllm():
             self._init_fill_ids_for_dllm()
         else:
-            self.fill_ids = self.origin_input_ids + self.output_ids
+            if self.hsa_lmk_enabled:
+                # For HSA, `fill_ids` is the engine-visible token sequence including LMK.
+                # It is maintained incrementally during decode; only initialize it once here.
+                if not self.fill_ids:
+                    assert self.hsa_page_size is not None and self.hsa_lmk_id is not None
+                    self.fill_ids = self._hsa_insert_lmk_prompt(
+                        self.origin_input_ids,
+                        page_size=self.hsa_page_size,
+                        lmk_id=self.hsa_lmk_id,
+                    )
+            else:
+                self.fill_ids = self.origin_input_ids + self.output_ids
 
         input_len = len(self.fill_ids)
         # NOTE: the matched length is at most 1 less than the input length to enable logprob computation
@@ -1765,7 +1828,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         running_bs = running_batch.batch_size()
 
         for req in running_batch.reqs:
-            req.fill_ids = req.origin_input_ids + req.output_ids
+            if not getattr(req, "hsa_lmk_enabled", False):
+                req.fill_ids = req.origin_input_ids + req.output_ids
             req.set_extend_input_len(1)
 
         input_ids = torch.cat([self.input_ids, running_batch.input_ids])
@@ -1781,7 +1845,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         # NOTE: prefix_indices is what has been cached, but we don't cache each decode step
         self.prefix_lens.extend(
             [
-                len(r.origin_input_ids) + len(r.output_ids) + delta
+                (len(r.fill_ids) if getattr(r, "fill_ids", None) else len(r.origin_input_ids) + len(r.output_ids))
+                + delta
                 for r in running_batch.reqs
             ]
         )
@@ -1965,9 +2030,13 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 delayed_output_ids = torch.tensor(
                     [
                         (
-                            req.output_ids[-1]
-                            if len(req.output_ids)
-                            else req.origin_input_ids[-1]
+                            req.fill_ids[-1]
+                            if getattr(req, "fill_ids", None) and len(req.fill_ids)
+                            else (
+                                req.output_ids[-1]
+                                if len(req.output_ids)
+                                else req.origin_input_ids[-1]
+                            )
                         )
                         for req in self.reqs
                     ],

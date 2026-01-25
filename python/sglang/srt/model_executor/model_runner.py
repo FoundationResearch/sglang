@@ -2337,6 +2337,17 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         sampling_info.update_regex_vocab_mask()
         sampling_info.apply_logits_bias(logits_output.next_token_logits)
 
+        # HSA LMK runtime contract:
+        # LMK must never be sampled as a user-visible token. We always mask it out during sampling;
+        # decode-time insertion forces LMK explicitly at page boundaries.
+        if self.server_args.attention_backend == "hsa":
+            lmk_id = int(getattr(self.server_args, "hsa_lmk_id", -1))
+            if lmk_id < 0:
+                lmk_id = int(self.model_config.vocab_size)
+            vocab_dim = int(logits_output.next_token_logits.shape[-1])
+            if 0 <= lmk_id < vocab_dim:
+                logits_output.next_token_logits[:, lmk_id] = -float("inf")
+
     def sample(
         self,
         logits_output: LogitsProcessorOutput,

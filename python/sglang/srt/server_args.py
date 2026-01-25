@@ -445,6 +445,9 @@ class ServerArgs:
     hsa_layers: Optional[str] = None
     hsa_window_size: Optional[int] = None
     hsa_enable_swa_fusion: bool = False
+    # Landmark token id (LMK). By default we follow FlashHSA: lmk_id == vocab_size.
+    # This id must be valid for the loaded model weights (embedding/lm_head).
+    hsa_lmk_id: int = -1
     disable_flashinfer_autotune: bool = False
 
     # Speculative decoding
@@ -3573,6 +3576,13 @@ class ServerArgs:
             action="store_true",
             default=ServerArgs.hsa_enable_swa_fusion,
             help="If set, enable SWA/dense fusion path for HSA (planned). Only used when --attention-backend hsa.",
+        )
+        parser.add_argument(
+            "--hsa-lmk-id",
+            type=int,
+            default=ServerArgs.hsa_lmk_id,
+            help="Landmark (LMK) token id for HSA runtime injection. If set to -1, defaults to vocab_size "
+            "(FlashHSA convention). Only used when --attention-backend hsa.",
         )
         parser.add_argument(
             "--fp8-gemm-backend",
