@@ -40,7 +40,7 @@
   - **新增（LMK gather）**：明确 \(E_i\) 的获取方式：
     - `lmk_token_loc = page_id * page_size + (page_size-1)`；
     - selection 需要从 KV cache gather LMK 的 K（paged-friendly），并且只能对 “completed pages” 做。
-- [ ] **M0.4：集成形态选择**  
+- [x] **M0.4：集成形态选择**  
   - 选择 `AttentionBackend` 路径：新增 `hsa` backend（对齐 `python/sglang/srt/layers/attention/attention_registry.py` 的注册方式）。
   - 明确：混层策略（哪些层 HSA / 哪些层 dense/SWA），以及如何在 backend 内 dispatch。
   - **新增（运行时注入点）**：确定 LMK token 的插入由谁负责（推荐：SGLang runtime / scheduler 层做，不侵入模型权重逻辑）。
@@ -62,7 +62,7 @@
 **目标**：让 \(E_i\) 成为“与 KV 同生命周期的缓存对象”，并且能被 radix prefix 复用。
 
 ### 任务列表
-- [ ] **M1.1（LMK 主线）：确保 KV cache 中存在 LMK slot，并可用于 selection**  
+- [x] **M1.1（LMK 主线）：确保 KV cache 中存在 LMK slot，并可用于 selection**  
   - 修改：运行时 token 组织逻辑，使每页最后一个 token 为 LMK（并写 KV）。
   - 约束：只有 completed pages（LMK 已写入）才进入 selection 候选集。
 - [ ] **M1.3：SWA/双池语义（如启用 sliding window）**

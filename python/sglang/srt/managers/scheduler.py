@@ -1451,6 +1451,17 @@ class Scheduler(
             )
             req.tokenizer = self.tokenizer
 
+            # HSA runtime contract (FlashHSA semantics):
+            # - LMK is a real token id that participates in KV/cache/prefix.
+            # - LMK must be inserted every (page_size-1) real tokens, occupying the last slot of each page.
+            # - LMK is never emitted to the user.
+            if self.server_args.attention_backend == "hsa":
+                page_size = int(self.server_args.page_size)
+                lmk_id = int(getattr(self.server_args, "hsa_lmk_id", -1))
+                if lmk_id < 0:
+                    lmk_id = int(self.model_config.vocab_size)
+                req.enable_hsa_lmk(page_size=page_size, lmk_id=lmk_id)
+
             if self.disaggregation_mode != DisaggregationMode.NULL:
                 # Invalid request for disaggregated mode
                 if recv_req.bootstrap_room is None:

@@ -377,7 +377,10 @@ class SchedulerOutputProcessorMixin:
         elif batch.is_spec_v2:
             next_token_ids = self._resolve_spec_overlap_token_ids(result, batch)
 
-        self.num_generated_tokens += len(batch.reqs)
+        # HSA LMK steps are internal and should not count as user-visible generated tokens.
+        # We conservatively count visible tokens later per request.
+        if self.server_args.attention_backend != "hsa":
+            self.num_generated_tokens += len(batch.reqs)
         if not batch.spec_algorithm.is_none():
             self.update_spec_metrics(batch.batch_size(), result.num_accepted_tokens)
         if self.enable_metrics:
@@ -400,7 +403,21 @@ class SchedulerOutputProcessorMixin:
 
             new_accepted_len = 1
             if batch.spec_algorithm.is_none():
-                req.output_ids.append(next_token_id)
+                # HSA LMK runtime injection:
+                # if the next position is the LMK slot (last slot in a page), force LMK token id,
+                # append it to fill_ids (engine-visible), but do NOT emit it to the user.
+                if getattr(req, "hsa_lmk_enabled", False):
+                    # `fill_ids` must already represent the engine-visible sequence.
+                    if not req.fill_ids:
+                        # Ensure initialized (should happen in req.init_next_round_input).
+                        req.fill_ids = req.origin_input_ids + req.output_ids
+                    is_visible = req.hsa_append_next_token_or_lmk(next_token_id)
+                    if not is_visible:
+                        # Internal token: skip output_ids/logprobs/grammar/finish checks.
+                        continue
+                    self.num_generated_tokens += 1
+                else:
+                    req.output_ids.append(next_token_id)
             elif batch.is_spec_v2:
                 # Only spec v2's output_ids are updated here.
                 req.output_ids.extend(next_token_id)
@@ -482,7 +499,7 @@ class SchedulerOutputProcessorMixin:
     def _mamba_prefix_cache_update(
         self, req: Req, batch: ScheduleBatch, result: GenerationBatchResult, i: int
     ) -> None:
-        seq_len = len(req.origin_input_ids) + len(req.output_ids) - 1
+        seq_len = (len(req.fill_ids) - 1) if getattr(req, "fill_ids", None) else (len(req.origin_input_ids) + len(req.output_ids) - 1)
         if req.mamba_ping_pong_track_buffer is not None:
             mamba_track_interval = get_global_server_args().mamba_track_interval
             if batch.spec_algorithm.is_none() and seq_len % mamba_track_interval == 0:

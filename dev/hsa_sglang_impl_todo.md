@@ -36,6 +36,7 @@
       - `--hsa-selection-strategy {group,head,softmax_head}`
       - `--hsa-layers`（例如 `0,2,4,...` 或 range 语法；也可先做 “all layers”）
       - 可选：`--hsa-window-size` / `--hsa-enable-swa-fusion`
+      - `--hsa-lmk-id`：LMK token id（默认 -1 表示用 vocab_size；对齐 FlashHSA）
 
 - **文件**：`python/sglang/srt/layers/attention/attention_registry.py`
   - **任务**：
@@ -145,6 +146,27 @@
   - `select_topk_pages_decode(...)`：decode top‑k（固定 K；`group/head`）
 - ✅ `HSAAttnBackend.forward_decode` 已运行 selection，并把结果写到 `HSAMetadata` 的 debug 字段（compute 仍 delegate dense）
 - ✅ GPU-only 单测：`python/sglang/test/attention/test_hsa_selector_decode_gpu.py`
+
+---
+
+## 4.x LMK runtime 注入（不可见输出闭环）
+
+- **目标**：让 LMK 成为 engine-visible token（写 KV、进 prefix/radix），但对用户不可见。
+- **落地文件**
+  - `python/sglang/srt/managers/scheduler.py`
+    - 对 `--attention-backend hsa` 的请求启用 `Req.enable_hsa_lmk(page_size, lmk_id)`
+  - `python/sglang/srt/managers/schedule_batch.py`
+    - `Req` 支持：
+      - prompt 插入：每 `page_size-1` 个 token 插入 1 个 LMK（FlashHSA 语义）
+      - decode 强制：当 `len(fill_ids) % page_size == page_size-1` 时，下一步强制插入 LMK（不可见）
+  - `python/sglang/srt/managers/scheduler_output_processor_mixin.py`
+    - decode 输出处理：LMK 只进 `fill_ids`，不进 `output_ids`，因此不被 stream/detokenizer 看到
+  - `python/sglang/srt/model_executor/model_runner.py`
+    - sampling 时永远 mask 掉 LMK id，避免其被采样为用户 token
+- **GPU-only tests**
+  - `python/sglang/test/attention/test_hsa_lmk_runtime_injection_gpu.py`
+
+**状态**：✅ 已完成
 
 ### **4.x（新增主线）：LMK token 注入 + 从 KV gather \(E_i\)**
 

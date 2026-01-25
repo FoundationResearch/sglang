@@ -2,7 +2,7 @@
 
 ### 目标进度概览
 - **HSA 已作为 `AttentionBackend` 接入**：可用 `--attention-backend hsa` 选择（当前 attention compute 仍 delegate 到 dense，HSA kernel 尚未落地；但 selection 已实现并写入 metadata）。
-- **Paged-KV-first 的关键 plumbing 已打通**：metadata（page table/kv indices）、KV 写入链路、per-page chunk repr 存取、GPU-only 测试。
+- **Paged-KV-first 的关键 plumbing 已打通**：metadata（page table/kv indices）、KV 写入链路、LMK 语义（不可见输出）与 GPU-only 测试。
 
 ### 1) 文档与路线（对齐 SGLang 架构）
 - ✅ `dev/hsa_dev_roadmap.md`：按 SGLang 的 **Paged KV + Radix prefix cache + AttentionBackend** 范式重写/对齐。
@@ -22,9 +22,7 @@
     - `real_page_table`（page_id table）
     - 透传 dense backend 的 `kv_indptr/kv_indices`（含 window 版本）
   - `forward_decode/forward_extend` 仍 **delegate 到 `TritonAttnBackend`**（保证当前阶段端到端可跑）
-  - ✅ 接入 **completed page 写 repr** 的 Phase‑1 hook（占位实现：用 boundary token 的 K 作为 repr）：
-    - decode：`seq_len % page_size == 0` 时写
-    - extend：扫描 extend 段内所有 boundary 命中点写
+  - ✅ decode path 计算 selection，并写入 `HSAMetadata.hsa_*` debug 字段（attention 计算仍 delegate）
 
 ### 4) \(E_i\) 语义对齐 FlashHSA（LMK 真实 token）
 - ✅ \(E_i\) 定义切换为：**每个 page 的 LMK token（最后一个 slot）在该层 KV cache 中的 K**
@@ -35,13 +33,11 @@
 ### 5) GPU-only 单元测试（验证 plumbing/行为）
 - ✅ `python/sglang/test/attention/test_hsa_backend_gpu.py`
   - smoke：metadata 可构造 + forward 可 delegate（dummy dense backend）
-- ✅ `python/sglang/test/attention/test_hsa_kvpool_repr.py`
-  - KV pool repr 写/读 + version guard（CUDA）
-- ✅ `python/sglang/test/attention/test_hsa_backend_chunk_repr_gpu.py`
-  - completed vs partial page 的 repr 写入规则（CUDA）
 - ✅ `python/sglang/test/attention/test_hsa_backend_dense_integration_gpu.py`
   - **真实集成测试（不 monkeypatch）**：真实 `TritonAttnBackend` decode 路径可跑，且 selection 能从 KV gather LMK-K 并排除 non-completed pages
   - 注：为单测环境 patch `dp_attention.get_attention_tp_size()` 为 1，避免 “dp attention not initialized” 断言
+ - ✅ `python/sglang/test/attention/test_hsa_lmk_runtime_injection_gpu.py`
+   - 验证 FlashHSA 风格 prompt 插入规则与 decode “强制 LMK 且不可见输出”契约
 
 ### 6) Selection（Step 4：Torch reference，先用于 metadata/可观测，不影响 compute）
 - ✅ `python/sglang/srt/layers/attention/hsa/selector.py`
@@ -49,8 +45,16 @@
   - SWA→HSA：排除 window pages
   - fixed‑K top‑k（`group/head`），无效候选 mask 为 `-inf`，输出 `-1` padding
 - ✅ `python/sglang/srt/layers/attention/hsa_backend.py`
-  - decode path 计算 selection，并写入 `HSAMetadata.hsa_*` debug 字段（attention 计算仍 delegate）
+  - decode path 计算 selection，并写入 `HSAMetadata.hsa_*` debug 字段
 - ✅ `python/sglang/test/attention/test_hsa_selector_decode_gpu.py`（CUDA）
+
+### 7) LMK runtime 注入（不可见输出闭环）
+- ✅ `python/sglang/srt/managers/scheduler.py`
+  - 对 `--attention-backend hsa` 的请求启用 LMK runtime 注入
+- ✅ `python/sglang/srt/managers/schedule_batch.py`
+  - `Req` 支持 LMK：prompt 插入（FlashHSA）、decode 强制 LMK（不可见输出）、`seqlen` 按 `fill_ids` 计算
+- ✅ `python/sglang/srt/model_executor/model_runner.py`
+  - sampling 阶段永远 mask 掉 LMK id，避免其被当作用户可见 token 采样出来
 
 ### 7) 环境与依赖
 - ✅ `dev/requirements.txt` 已补齐 bring-up 阶段遇到的 import/test 依赖（包含 `sgl-kernel` 等）
