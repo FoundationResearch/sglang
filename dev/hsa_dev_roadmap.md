@@ -5,8 +5,10 @@
 ## 核心架构目标（对齐 SGLang 现实实现）
 
 1. **Radix‑Aware Page Representation（\(E_i\)）**
-   - **存储粒度**：\(E_i\) 应与 **page_id（物理页）** 1:1 绑定，而不是与 token slot 绑定（避免 `page_size` 倍冗余）。  
-   - **生命周期**：随 Radix cache 的“页对齐前缀”复用与释放；不进入 radix tree 的尾部 partial page **不应产生/复用** \(E_i\)。
+   - **官方语义（推荐主线）**：\(E_i\) 由 **该 page 的 LMK token（最后一个 slot）的 K 表征**定义，而不是额外存一份 repr buffer。
+     - FlashHSA 官方实现中：`lmk_id = vocab_size`，embedding/lm_head 扩到 `vocab_size+1`，并按 `(chunk_size-1)` 分组后在每组末尾插入 LMK。
+   - **存储粒度**：\(E_i\) 与 **page_id（物理页）** 1:1 绑定（LMK slot 即 `page_id*page_size + page_size-1`）。  
+   - **生命周期**：随 Radix cache 的“页对齐前缀”复用与释放；**partial page（未插入 LMK）不应参与 selection**，也不应被当作有定义的 \(E_i\)。
 
 2. **Paged HSA Kernel（必须项）**  
    - HSA kernel 必须支持 SGLang 的 paged 寻址语义：通过 **`kv_indptr/kv_indices`（token-level）或 page_id table（page-level）** 间接寻址 K/V，不能假设 `blk_idx * block_size` 连续布局（对照 `python/sglang/srt/layers/attention/triton_ops/decode_attention.py` 的 load 方式）。
@@ -23,24 +25,35 @@
 
 ### 任务列表
 - [ ] **M0.1：确定 HSA 的 Chunk/Page 语义**  
-  - **约束**：`chunk_size == page_size`（与 SGLang paged allocator 对齐）。  
-  - **注意**：SGLang 默认 `page_size=1`（见 `python/sglang/srt/server_args.py`），HSA 必须显式要求/设置 `page_size`（例如 32/64）。
+  - **约束**：`chunk_size == page_size`（与 SGLang paged allocator 对齐，且包含 LMK slot）。  
+  - **新增硬约束（LMK）**：每个 page 最后一个 slot 固定为 LMK，故每页真实 token 数为 `page_size-1`。  
+  - **注意**：SGLang 默认 `page_size=1`（见 `python/sglang/srt/server_args.py`），HSA/LMK 必须显式要求 `page_size >= 2`（例如 32/64）。
 - [ ] **M0.2：定义 \(E_i\) 的产生时机与一致性规则**  
-  - 推荐：仅在“页完成”（`seq_len % page_size == 0`）时生成并写入 \(E_i\)（partial page 不生成/不复用）。
+  - **FlashHSA 语义**：当一个 chunk 填满 `page_size-1` 个真实 token 时，插入 1 个 LMK token 并写入 KV；该 LMK token 在每一层的 K（可选加 `lmk_norm`）即 \(E_i\)。
+  - **推理输出规则**：LMK token 只用于 KV/selection，不应被用户看到（不做采样、不输出）。  
+  - **Radix/prefix 规则**：Radix prefix cache 必须在 “包含 LMK 的 token 序列坐标系” 下工作：prefix 对齐与复用时，LMK 也应被视为序列的一部分（否则 prefix 对齐会错位）。
   - 说明：Radix cache 在 `page_size>1` 时按页对齐缓存 keys；尾部 partial page 不进入 tree（对照 `python/sglang/srt/mem_cache/radix_cache.py` 的 `cache_protected_len` 注释）。
 - [ ] **M0.3：定义 HSA Selection API（输出必须可直接驱动 paged kernel）**  
   - 输入：`Q`（per-token/per-request）、历史 \(E_i\)（按 page_id 索引）、窗口/SWA 相关辅助（可选）。
   - 输出（至少固定一种主线）：`selected_page_ids`（或等价的“可映射到 page_id 的 table”）+ `weights`。
   - 要求：输出语义与 SGLang 的 paged indices 链路一致（参考 NSA 的 `TopkTransformMethod.PAGED` 与 `page_table_1 -> real_page_table` 变换逻辑，见 `python/sglang/srt/layers/attention/nsa_backend.py`）。
+  - **新增（LMK gather）**：明确 \(E_i\) 的获取方式：
+    - `lmk_token_loc = page_id * page_size + (page_size-1)`；
+    - selection 需要从 KV cache gather LMK 的 K（paged-friendly），并且只能对 “completed pages” 做。
 - [ ] **M0.4：集成形态选择**  
   - 选择 `AttentionBackend` 路径：新增 `hsa` backend（对齐 `python/sglang/srt/layers/attention/attention_registry.py` 的注册方式）。
   - 明确：混层策略（哪些层 HSA / 哪些层 dense/SWA），以及如何在 backend 内 dispatch。
+  - **新增（运行时注入点）**：确定 LMK token 的插入由谁负责（推荐：SGLang runtime / scheduler 层做，不侵入模型权重逻辑）。
 
 ### 测试方案
 - [ ] **Contract Test（小单测）**：在 `python/sglang/test/attention/` 新增 `test_hsa_contract.py` 验证：
   - token_loc <-> page_id 转换一致性；
   - partial page 不产生 \(E_i\)；  
   - radix prefix 命中时 \(E_i\) 可复用（同 page_id）。
+  - **新增（LMK）**：验证 LMK 插入与“不可见输出”：
+    - 每 `page_size-1` 个真实 token 插入 1 个 LMK；
+    - LMK 不参与采样/不输出；
+    - window_size 按包含 LMK 的长度计数（与你的约定一致）。
 
 ---
 
@@ -49,13 +62,12 @@
 **目标**：让 \(E_i\) 成为“与 KV 同生命周期的缓存对象”，并且能被 radix prefix 复用。
 
 ### 任务列表
-- [ ] **M1.1：在 KV pool 中新增 per-page 表征缓冲区**  
-  - 修改：`python/sglang/srt/mem_cache/memory_pool.py`（KVCache 实现，例如 `MHATokenToKVPool` / `MLATokenToKVPool`）。
-  - 设计：新增 `chunk_repr_buffer`（建议按 **page_id** 存储：shape `[num_pages, ...]`），并增加 `valid/version`（避免被回收页误复用）。
-- [ ] **M1.2：定义读写接口（以 page_id 为主）**  
-  - `save_chunk_repr(page_ids, repr, *, layer_id)`
-  - `get_chunk_repr(page_ids, *, layer_id) -> repr`
-  - 可选：提供 `token_loc -> page_id` 的辅助函数（或约定由 backend 统一完成）。
+- [ ] **M1.1（LMK 主线）：确保 KV cache 中存在 LMK slot，并可用于 selection**  
+  - 修改：运行时 token 组织逻辑，使每页最后一个 token 为 LMK（并写 KV）。
+  - 约束：只有 completed pages（LMK 已写入）才进入 selection 候选集。
+- [ ] **M1.2（可选优化）：保留/重用 per-page repr buffer 作为 LMK-K cache**  
+  - 修改：`python/sglang/srt/mem_cache/memory_pool.py`（`MHATokenToKVPool`）。
+  - 设计：`chunk_repr_buffer` 可从 KV gather 得到的 LMK-K 缓存化；仍需 `valid/version` 防止 page reuse 误读。
 - [ ] **M1.3：SWA/双池语义（如启用 sliding window）**
   - 明确：HSA 使用 full pool 还是 SWA pool；若混用，定义 repr 的映射/双份策略（参考 `SWAKVPool` 的 full→swa index mapping）。
 
@@ -78,6 +90,7 @@
   - 目标：把 top‑k + “token index -> page_id/page_table index”尽量融合，避免额外 gather/transform 开销。
 - [ ] **M2.3：定义 selection 输出与 attention kernel 输入的精确 shape 契约**  
   - 明确 group/head/softmax_head 三种策略中至少选一种作为主线，其他作为扩展。
+  - **新增（LMK）**：明确 selection logits 计算使用的 \(E_i\) 是 “LMK-K”，需要从 KV cache gather（或从 LMK-K cache 读取）。
 
 ### 测试方案
 - [ ] **Correctness**：`python/sglang/test/attention/test_hsa_selection.py`
@@ -97,6 +110,8 @@
   - 关键：K/V load 必须通过 paged 索引语义实现（不能假设连续 KV）。
 - [ ] **M3.2：prefill/extend kernel（可先用组合算子实现）**
   - 先 correctness，再性能；与 `extend_attention` 的 metadata/indices 组织对齐。
+
+> 注意：在进入 M3 kernel 前，必须先闭环 LMK 的 runtime contract（插入/不可见输出/与 prefix cache 对齐），否则 kernel 很难验证正确性。
 
 ### 测试方案
 - [ ] **Kernel Correctness**：`python/sglang/test/attention/test_hsa_paged_kernel.py`

@@ -10,13 +10,19 @@
 
 - **Chunk/Page 语义**
   - **必须**：`chunk_size == page_size`。
-  - **必须**：只对 “completed page”（`seq_len % page_size == 0`）生成/写入 \(E_i\)；partial page 不进入可复用集合。
+  - **必须（LMK 主线）**：每个 page 最后一个 slot 固定为 LMK，故每页真实 token 上限为 `page_size - 1`。
+  - **必须（LMK 主线）**：只对 “completed page”（LMK 已写入 KV）定义 \(E_i\) 并参与 selection；partial page 不进入可复用集合。
 - **\(E_i\) 存储粒度**
-  - **必须**：按 **page_id（物理页）** 存，而不是按 token slot 存。
-  - **必须**：提供 `valid/version` 机制避免页回收后误读旧值。
+  - **推荐主线（FlashHSA 语义）**：\(E_i\) 由该 page 的 **LMK token 的 K** 定义：
+    - `lmk_token_loc = page_id * page_size + (page_size - 1)`
+    - selection 从 KV cache gather LMK-K 得到 \(E_i\)（paged-friendly）
+  - **可选优化**：保留 per-page `chunk_repr_buffer` 作为 “LMK-K cache”，仍需 `valid/version` 防 page reuse 误读。
 - **Selection 输出契约**
   - 至少固定一条主线（推荐）：输出能直接驱动 paged kernel 的 `selected_page_ids`/`page_table` + `weights`。
   - 与 NSA 对齐：最好支持 fused transform，把 top‑k 直接变成“可用于 gather 的 paged index 表”。
+ - **LMK 不可见输出契约**
+   - 推理时 LMK token 不应被采样/不应输出给用户（仅用于写 KV 与产生 \(E_i\)）。
+   - `window_size`（SWA）按 **包含 LMK 的 token 长度** 计数（与你当前约定一致）。
 
 ---
 
@@ -116,6 +122,8 @@
 - ✅ 提供接口：`save_chunk_repr()` / `get_chunk_repr()` / `get_page_version()` / `bump_page_version()`
 - ✅ GPU-only 单测：`python/sglang/test/attention/test_hsa_kvpool_repr.py`（写/读 + version guard）
 
+> 备注：在采用 LMK 真实 token 主线后，这个 repr buffer 预计会变为 “LMK-K cache（可选）”，或逐步淡出（以 KV cache 的 LMK slot 为真值来源）。
+
 ---
 
 ## 4. Selection / Top‑K：从 \(q \cdot E_i\) 到 `selected_page_ids + weights`
@@ -151,6 +159,30 @@
 - ✅ KV pool 新增：`MHATokenToKVPool.get_chunk_repr_valid_mask(...)`（selection 用于 `-inf` mask）
 - ✅ `HSAAttnBackend.forward_decode` 已运行 selection，并把结果写到 `HSAMetadata` 的 debug 字段（compute 仍 delegate dense）
 - ✅ GPU-only 单测：`python/sglang/test/attention/test_hsa_selector_decode_gpu.py`
+
+### **4.x（新增主线）：LMK token 注入 + 从 KV gather \(E_i\)**
+
+> 这一块是进入 paged kernel 前必须先定死的 runtime contract（否则 kernel 的正确性无法闭环）。
+
+- **目标**
+  - 把 “\(E_i\) = LMK-K” 变成系统真实语义：LMK 走完整网络、写 KV、但不对外吐 token。
+  - selection 从 KV cache gather LMK-K（或从 LMK-K cache 读取），不再依赖 Phase‑1 的占位 repr 写入。
+
+- **需要确认/对齐的点（来自 FlashHSA 官方实现）**
+  - LMK id：`lmk_id = vocab_size`，embedding/lm_head 需要支持 `vocab_size+1`（模型权重/训练侧配合）。
+  - 插入规则：每 `page_size-1` 个真实 token 后插入 1 个 LMK，形成 page 长度 `page_size`。
+  - labels 规则：LMK 的 label 必须是 `-100`（训练时忽略 loss）；推理时 LMK 不应采样/输出。
+
+- **实现 TODO（SGLang）**
+  - [ ] **插入点（decode）**：当某请求“下一步将触发 LMK”时，调度一次 “LMK step”（写 KV，不输出 token）。
+  - [ ] **插入点（extend/prefill）**：在 ragged 输入里按 `(page_size-1)` 自动插入 LMK，并保证 `seq_lens/out_cache_loc` 对齐。
+  - [ ] **prefix cache / radix 对齐**：Radix prefix cache 必须在 “包含 LMK 的 token 序列” 上对齐（LMK 作为真实 token 参与 prefix）。
+  - [ ] **selection 输入改造**：`page_id -> lmk_token_loc -> gather(K_lmk)` 形成 `cand_chunk_repr`（paged-friendly）。
+  - [ ] **候选集约束**：只允许 completed pages（LMK 已写入）进入候选；partial page 必须排除/mask。
+  - [ ] **GPU-only tests**：
+    - [ ] decode：每 `page_size-1` 个真实 token 插入 1 个 LMK 且不对外吐 token
+    - [ ] selection：LMK gather 的 \(E_i\) 与 “从 repr buffer 读”一致（若 buffer 仍保留）
+    - [ ] prefix 场景：prefix 命中时 LMK 对齐不乱
 
 ---
 

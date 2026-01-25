@@ -110,26 +110,26 @@
 
 文件：`python/sglang/srt/mem_cache/memory_pool.py`（`MHATokenToKVPool`）
 
-#### **Buffers**
-- `chunk_repr_buffer[layer]`: `[num_pages, num_kv_heads, head_dim]`
-- `chunk_repr_version[layer]`: `[num_pages]` int32
-- `page_version`: `[num_pages]` int32（每个物理 page 的全局“当前版本号”）
+#### **重要：我们切换到“LMK 作为真实 token”的官方语义（推荐主线）**
 
-#### **APIs（selection/kernel 会用到）**
-- `save_chunk_repr(layer_id, page_ids, repr, page_version=None)`
-- `get_chunk_repr(layer_id, page_ids, page_version=None) -> repr`
-  - 如果传了 `page_version`：version 不一致会返回 **全 0**
-- `get_chunk_repr_valid_mask(layer_id, page_ids, page_version=None) -> bool[N]`
-  - 推荐：selection 时把无效 pages 直接 mask 成 `-inf`
-- `get_page_version(page_ids) -> int32[N]`
-- `bump_page_version(page_ids) -> int32[N]`（临时 building block；生产要绑定 allocator/radix 生命周期）
+我们从 `dev/FlashHSA`（官方实现）确认到的做法是：
+- **LMK 是一个真实 token id**：`lmk_id = config.vocab_size`（也就是在原 vocab 之后追加 1 个 token）。
+- **模型侧扩容 embedding / lm_head**：embedding 与输出头都扩到 `vocab_size + 1`（或再做 padding 到 32 的倍数）。
+- **每个 chunk/page 的最后一个位置固定放 LMK**：
+  - 输入按 `(chunk_size - 1)` 分组，每组末尾 append `lmk_id`，使得每个 chunk 总长度为 `chunk_size`。
+  - 这样 “每个 chunk 的 LMK token” 会像正常 token 一样过完每一层并写入 KV cache。
+- **训练时不让 LMK 参与 loss**：labels 在 LMK 位置填 `-100`（见官方 `_insert_special_tokens(labels, -100)`）。
+- **推理时 LMK 插入通常在模型外完成**（官方 `eval/eval_ppl.py` 在输入侧插入；模型 forward 本身不强制插入）。
 
-#### **当前的 repr 写入 hook**
-`HSAAttnBackend` Phase‑1 hook：
-- 只在 page “完成”（completed）时写入 repr
-- 占位 repr：使用边界 token 的 **K 向量**
+因此对 SGLang 来说，\(E_i\) 的来源应以 **“每个 page 的 LMK token 的 K（或某个规范化后的版本）”** 为主，而不是额外维护一个独立的 per-page repr buffer。
 
-Kernel（未来）假设：`E_page` 对“已经 ready 的 pages”存在；无效 pages 必须被 mask。
+> 这也解释了你说的 “\(q\cdot E_i\) 需要 gather”：\(E_i\) 在 KV cache 里，selection 需要按 `page_id -> lmk_token_loc -> K` 做一次 gather（paged-friendly）。
+
+#### **SGLang 侧的 page/chunk 语义（与 LMK 对齐）**
+- `page_size == chunk_size`（包含 LMK 的总 slot 数）
+- **每个 page 最后 1 个 slot 永远留给 LMK**，所以真实文本 token 每页最多 `page_size - 1`
+- **completed page**：只有当 LMK 已被插入并写入 KV 后，该 page 才“可被 HSA selection 使用”
+Kernel（未来）假设：`E_page` 只对“LMK 已写入的 pages”存在；无效 pages 必须被 mask。
 
 ---
 
@@ -156,6 +156,11 @@ Kernel（未来）假设：`E_page` 对“已经 ready 的 pages”存在；无�
 输出：
 - `selected_page_ids`: `[B, H, K]` int32 padded `-1`
 - `selected_scores`: `[B, H, K]` float32
+
+#### **LMK 语义下 selection 的关键变化（将要落地）**
+- `cand_chunk_repr` 的来源改为：`page_id -> lmk_token_loc -> gather(K_lmk)`（而非独立 repr buffer 写入）。
+- **completed pages only**：候选集必须排除 “还没插入 LMK 的 partial page”，否则 LMK slot 里是未定义旧值。
+- window_size（SWA）按你说的：**按包含 LMK 的 token 长度** 计数；这与官方 `topk_head.py` 的 causal/window mask 形式一致（`tq`/`window_size`/`block_size=chunk_size` 都是在 LMK-included 的坐标系里）。
 
 ---
 
@@ -190,6 +195,11 @@ Selection 给出的是 **page_id**，但 KV 读取依赖 **token_loc**（通常�
   - correctness 更快闭环，但 metadata 带宽更大
 
 建议：第一版正确性优先时，通常 **方案 B 更快落地**。
+
+#### **LMK 方案下的额外翻译点：page_id -> lmk_token_loc**
+LMK 固定在 page 的最后一个 slot：
+- `lmk_token_loc = page_id * page_size + (page_size - 1)`
+这让 selection 获取 \(E_i\) 与 kernel 内做 “LMK gather” 都更直接（paged-friendly）。
 
 ---
 
