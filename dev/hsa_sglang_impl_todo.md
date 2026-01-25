@@ -16,7 +16,6 @@
   - **推荐主线（FlashHSA 语义）**：\(E_i\) 由该 page 的 **LMK token 的 K** 定义：
     - `lmk_token_loc = page_id * page_size + (page_size - 1)`
     - selection 从 KV cache gather LMK-K 得到 \(E_i\)（paged-friendly）
-  - **可选优化**：保留 per-page `chunk_repr_buffer` 作为 “LMK-K cache”，仍需 `valid/version` 防 page reuse 误读。
 - **Selection 输出契约**
   - 至少固定一条主线（推荐）：输出能直接驱动 paged kernel 的 `selected_page_ids`/`page_table` + `weights`。
   - 与 NSA 对齐：最好支持 fused transform，把 top‑k 直接变成“可用于 gather 的 paged index 表”。
@@ -91,20 +90,14 @@
 
 ---
 
-## 3. KV Pool：为 \(E_i\) 增加 per-page buffer（并与页回收安全协作）
+## 3. KV / \(E_i\)：严格对齐 FlashHSA（LMK 真实 token）
 
 - **文件**：`python/sglang/srt/mem_cache/memory_pool.py`
-  - **任务**：在 KVCache 实现中为每层增加 repr buffer（建议先覆盖主流：`MHATokenToKVPool`；MLA 后补）
-    - `MHATokenToKVPool`
-      - 新增成员（按 layer 存 list 或单个大 tensor）：
-        - `self.chunk_repr_buffer[layer_id]`：shape `[num_pages, repr_dim]` 或 `[num_pages, heads, repr_dim]`
-        - `self.chunk_repr_version[layer_id]`：shape `[num_pages]`（int32/64）
-        - `self.page_version`：shape `[num_pages]`（全局页版本；页被 allocator 重新分配时递增）
-      - 新增接口：
-        - `def save_chunk_repr(self, layer_id: int, page_ids: Tensor, repr: Tensor, page_version: Tensor | None = None)`
-        - `def get_chunk_repr(self, layer_id: int, page_ids: Tensor, page_version: Tensor | None = None) -> Tensor`
-        - `def get_page_version(self, page_ids: Tensor) -> Tensor`
-    - 注意：allocator “free page” 不会清零内存；因此必须靠 version/valid 防止误复用。
+  - **约束**：不增加任何 per-page repr buffer。
+  - **\(E_i\) 定义（FlashHSA）**：
+    - 每个 page 最后一个 slot 为 LMK：`lmk_token_loc = page_id * page_size + (page_size - 1)`
+    - 每层 selection 使用该层 KV cache 里的 `K[lmk_token_loc]` 作为 \(E_i\)
+  - **安全性**：通过 “completed-page gating”（只允许 `page_id < floor(seq_len / page_size)`）避免读到未定义 KV。
 
 - **文件**：`python/sglang/srt/mem_cache/allocator.py`
   - **任务（可选，但推荐）**：提供 “页版本”维护位置（两种方案择一）
@@ -114,15 +107,9 @@
 - **文件**：`python/sglang/srt/mem_cache/swa_memory_pool.py`
   - **任务**：若 HSA 需要 SWA pool 参与（混层/窗口），明确 repr buffer 在 full/swa 的放置与映射策略（参考 `SWAKVPool.translate_loc_from_full_to_swa`）。
 
-**状态**：✅ 已完成（Milestone 1 的 storage + 安全机制闭环）
-- ✅ `MHATokenToKVPool` 新增 per‑page repr buffer（按 `page_id = loc // page_size` 索引）：
-  - `chunk_repr_buffer[layer]`：`[num_pages, head_num, head_dim]`
-  - `chunk_repr_version[layer]`：`[num_pages]`
-  - `page_version`：`[num_pages]`
-- ✅ 提供接口：`save_chunk_repr()` / `get_chunk_repr()` / `get_page_version()` / `bump_page_version()`
-- ✅ GPU-only 单测：`python/sglang/test/attention/test_hsa_kvpool_repr.py`（写/读 + version guard）
-
-> 备注：在采用 LMK 真实 token 主线后，这个 repr buffer 预计会变为 “LMK-K cache（可选）”，或逐步淡出（以 KV cache 的 LMK slot 为真值来源）。
+**状态**：🟡 需要重做（已确认：不使用任何 per-page repr buffer）
+- 我们将完全遵循 FlashHSA：\(E_i\) 来自 KV cache 中 LMK token 的 K（按 layer 分别 gather）。
+- 因此不再新增/维护任何额外的 per-page 状态，避免与 Radix/prefix 生命周期打架。
 
 ---
 
@@ -134,7 +121,7 @@
   - **固定 K**：`--hsa-topk` 固定，输出不足时用 `-1` padding，并配套 mask / `-inf` score。
   - **候选集 = 本次 query 的活跃 pages**：仅对 `req_to_token[:seq_len]` 中出现过的 `page_id` 计算 \(q \cdot E_i\)。
   - **SWA→HSA 模式的 SWA 排除**：先用 SWA 覆盖“近邻窗口”，selection 只在窗口之外的 pages 上做 top‑k（等价于原 repo 的 “causal block mask” 思路）。
-  - **repr 有效性**：selection 必须利用 `page_version`/`chunk_repr_version` 将无效 page 直接 mask 成 `-inf`，避免 all‑zero repr 参与竞争导致错误选择。
+  - **completed-page gating**：selection 必须排除未完成 pages（LMK 未写入 KV 的 pages），避免读到未定义 KV。
   - **策略支持**：先实现 `group`/`head`（命名对齐 `dev/hsa-kernel-main`），未来再加 `softmax_head`（SWA/HSA 融合需要 `lse_swa`）。
 
 - **新增目录（建议）**：`python/sglang/srt/layers/attention/hsa/`
@@ -156,7 +143,6 @@
 - ✅ 新增：`python/sglang/srt/layers/attention/hsa/selector.py`
   - `build_active_page_candidates(...)`：活跃 pages + SWA window pages 排除
   - `select_topk_pages_decode(...)`：decode top‑k（固定 K；`group/head`）
-- ✅ KV pool 新增：`MHATokenToKVPool.get_chunk_repr_valid_mask(...)`（selection 用于 `-inf` mask）
 - ✅ `HSAAttnBackend.forward_decode` 已运行 selection，并把结果写到 `HSAMetadata` 的 debug 字段（compute 仍 delegate dense）
 - ✅ GPU-only 单测：`python/sglang/test/attention/test_hsa_selector_decode_gpu.py`
 

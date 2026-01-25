@@ -57,7 +57,7 @@
 
 ---
 
-## Milestone 1：KV Cache 扩展（per-page \(E_i\) buffer + Radix 复用）
+## Milestone 1：KV Cache 扩展（LMK 语义 + Radix 复用）
 
 **目标**：让 \(E_i\) 成为“与 KV 同生命周期的缓存对象”，并且能被 radix prefix 复用。
 
@@ -65,16 +65,13 @@
 - [ ] **M1.1（LMK 主线）：确保 KV cache 中存在 LMK slot，并可用于 selection**  
   - 修改：运行时 token 组织逻辑，使每页最后一个 token 为 LMK（并写 KV）。
   - 约束：只有 completed pages（LMK 已写入）才进入 selection 候选集。
-- [ ] **M1.2（可选优化）：保留/重用 per-page repr buffer 作为 LMK-K cache**  
-  - 修改：`python/sglang/srt/mem_cache/memory_pool.py`（`MHATokenToKVPool`）。
-  - 设计：`chunk_repr_buffer` 可从 KV gather 得到的 LMK-K 缓存化；仍需 `valid/version` 防止 page reuse 误读。
 - [ ] **M1.3：SWA/双池语义（如启用 sliding window）**
   - 明确：HSA 使用 full pool 还是 SWA pool；若混用，定义 repr 的映射/双份策略（参考 `SWAKVPool` 的 full→swa index mapping）。
 
 ### 测试方案
-- [ ] **Unit Test**：`python/sglang/test/attention/test_hsa_kvpool_repr.py`
-  - 写入 KV + \(E_i\)，prefix hit 后能复用 \(E_i\)；
-  - evict / page reuse 后，旧 \(E_i\) 不应被错误读到（依赖 valid/version）。
+- [ ] **Unit Test（GPU-only）**：验证 LMK 语义与 completed-page gating
+  - selection 只从 KV gather LMK 的 K 得到 \(E_i\)
+  - 非 completed pages 必须被 mask（不能参与 top‑k）
 
 ---
 
