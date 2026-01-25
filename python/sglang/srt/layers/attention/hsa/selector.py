@@ -104,7 +104,7 @@ def select_topk_pages_decode(
       cand_page_ids: [B, C] int32 padded with -1
       cand_mask: [B, C] bool
       cand_chunk_repr: [B, C, H, D] (kv heads)
-      cand_chunk_repr_valid: [B, C] bool, validity under page_version guard
+      cand_chunk_repr_valid: [B, C] bool, caller-provided validity mask
       topk: fixed K
       selection_strategy: "group" or "head" (mirrors hsa-kernel reference naming)
       sm_scale: optional scaling; default 1/sqrt(D)

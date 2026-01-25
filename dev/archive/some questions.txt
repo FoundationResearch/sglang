@@ -15,10 +15,8 @@
 
 在 `MHATokenToKVPool` 里我们现在有两类东西：
 
-- **KV cache**（本来就有）：`k_buffer[layer]` / `v_buffer[layer]`  
-  - shape 类似：`[(size + page_size), head_num, head_dim]`（按 token slot 存）
-- **chunk repr cache（新增）**：`chunk_repr_buffer[layer]`  
-  - shape：`[num_pages, head_num, head_dim]`（按 **page_id** 存）
+ - **KV cache**（本来就有）：`k_buffer[layer]` / `v_buffer[layer]`  
+   - shape 类似：`[(size + page_size), head_num, head_dim]`（按 token slot 存）
 
 也就是说：当一个 page 装满 16 个 token 后，KV 仍然在 `k_buffer/v_buffer` 里；**repr 是额外的一条“按页索引的 side buffer”**，不挤占 page 的 token slot。
 
@@ -28,9 +26,6 @@
 有，上限由 **KV cache 的总容量**决定，严格来说就是：
 
 - `num_pages = size // page_size + 1`（`+1` 是 dummy page 0）
-- 所以 `chunk_repr_buffer[layer]` 的容量就是 **最多存 `num_pages` 个 page 的 repr**，每层一份。
-
-它不会无限增长：你给 KV cache 配多大（`size`），repr 的 page 表就多大；KV cache 不够会 OOM/allocator 分配失败，repr 也一样（它在初始化时就一次性分配出来）。
 
 额外开销大概是：
 

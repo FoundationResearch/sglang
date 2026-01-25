@@ -83,13 +83,11 @@ def test_hsa_selector_decode_head_strategy_deterministic_topk_cuda():
 
 
 @pytest.mark.skipif(torch.cuda.device_count() == 0, reason="CUDA device required for this test")
-def test_hsa_selector_decode_masks_invalid_chunk_repr_by_version_cuda():
+def test_hsa_selector_decode_masks_invalid_candidates_by_valid_mask_cuda():
     from sglang.srt.layers.attention.hsa.selector import (
         build_active_page_candidates,
         select_topk_pages_decode,
     )
-    from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
-    from sglang.srt.layers.radix_attention import RadixAttention
 
     device = "cuda"
     dtype = torch.float16
@@ -112,40 +110,15 @@ def test_hsa_selector_decode_masks_invalid_chunk_repr_by_version_cuda():
         window_size=None,
     )
 
-    pool = MHATokenToKVPool(
-        size=64,
-        page_size=page_size,
-        dtype=dtype,
-        head_num=H,
-        head_dim=D,
-        layer_num=1,
-        device=device,
-        enable_memory_saver=False,
-        enable_alt_stream=False,
-    )
-    layer = RadixAttention(
-        num_heads=HQ,
-        head_dim=D,
-        scaling=1.0,
-        num_kv_heads=H,
-        layer_id=0,
-    )
+    # Make candidate 2 have huge repr so it would win if valid.
+    C = int(cand_page_ids.shape[1])
+    assert C == 3
+    cand_repr = torch.zeros((B, C, H, D), device=device, dtype=dtype)
+    cand_repr[0, 2, :, 0] = 100.0  # page 2, all kv heads
 
-    # Make page 2 have huge repr so it would win if valid.
-    pages = torch.tensor([0, 1, 2], device=device, dtype=torch.int32)
-    repr = torch.zeros((3, H, D), device=device, dtype=dtype)
-    repr[2, :, 0] = 100.0
-    pool.save_chunk_repr(layer.layer_id, pages, repr)
-
-    # Invalidate page 2 by bumping its page_version without updating repr version.
-    pool.bump_page_version(torch.tensor([2], device=device, dtype=torch.int32))
-
-    flat = cand_page_ids.reshape(-1).clamp_min(0)
-    flat_ver = pool.get_page_version(flat)
-    flat_valid = pool.get_chunk_repr_valid_mask(layer.layer_id, flat, flat_ver)
-    flat_repr = pool.get_chunk_repr(layer.layer_id, flat, flat_ver)
-    cand_repr = flat_repr.view(B, cand_page_ids.shape[1], H, D)
-    cand_valid = (flat_valid & cand_mask.reshape(-1)).view(B, cand_page_ids.shape[1])
+    # Mark candidate 2 as invalid via explicit valid-mask.
+    cand_valid = torch.ones((B, C), device=device, dtype=torch.bool)
+    cand_valid[0, 2] = False
 
     q = torch.zeros((B, HQ, D), device=device, dtype=dtype)
     q[:, 0, 0] = 1.0  # should favor dim0
@@ -161,7 +134,7 @@ def test_hsa_selector_decode_masks_invalid_chunk_repr_by_version_cuda():
         sm_scale=1.0,
     )
 
-    # Page 2 is invalid -> should not appear in selection.
+    # Candidate page 2 is invalid -> should not appear in selection.
     assert 2 not in sel.selected_page_ids[0, 0].tolist()
 
 

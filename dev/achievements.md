@@ -26,12 +26,11 @@
     - decode：`seq_len % page_size == 0` 时写
     - extend：扫描 extend 段内所有 boundary 命中点写
 
-### 4) KV Pool：per-page chunk repr buffer + version guard
-- ✅ `python/sglang/srt/mem_cache/memory_pool.py`（`MHATokenToKVPool`）
-  - 增加 `chunk_repr_buffer[layer]`：`[num_pages, head_num, head_dim]`（按 `page_id = loc // page_size`）
-  - 增加 `chunk_repr_version[layer]` 与全局 `page_version`
-  - 提供接口：`save_chunk_repr()` / `get_chunk_repr()` / `get_page_version()` / `bump_page_version()`
-  - 版本不匹配时 `get_chunk_repr(..., page_version=...)` 返回全 0（避免 page reuse 误读旧 repr）
+### 4) \(E_i\) 语义对齐 FlashHSA（LMK 真实 token）
+- ✅ \(E_i\) 定义切换为：**每个 page 的 LMK token（最后一个 slot）在该层 KV cache 中的 K**
+  - `lmk_token_loc = page_id * page_size + (page_size - 1)`
+  - selection 从 KV cache gather `K[lmk_token_loc]`（每层各自 gather）
+  - 通过 **completed-page gating** 排除未写入 LMK 的 pages
 
 ### 5) GPU-only 单元测试（验证 plumbing/行为）
 - ✅ `python/sglang/test/attention/test_hsa_backend_gpu.py`
@@ -41,7 +40,7 @@
 - ✅ `python/sglang/test/attention/test_hsa_backend_chunk_repr_gpu.py`
   - completed vs partial page 的 repr 写入规则（CUDA）
 - ✅ `python/sglang/test/attention/test_hsa_backend_dense_integration_gpu.py`
-  - **真实集成测试（不 monkeypatch）**：真实 `TritonAttnBackend` decode 路径可跑，且 completed-page repr hook 会写入 `chunk_repr_buffer`
+  - **真实集成测试（不 monkeypatch）**：真实 `TritonAttnBackend` decode 路径可跑，且 selection 能从 KV gather LMK-K 并排除 non-completed pages
   - 注：为单测环境 patch `dp_attention.get_attention_tp_size()` 为 1，避免 “dp attention not initialized” 断言
 
 ### 6) Selection（Step 4：Torch reference，先用于 metadata/可观测，不影响 compute）
@@ -49,8 +48,6 @@
   - active pages candidates（仅本请求活跃 pages）
   - SWA→HSA：排除 window pages
   - fixed‑K top‑k（`group/head`），无效候选 mask 为 `-inf`，输出 `-1` padding
-- ✅ `python/sglang/srt/mem_cache/memory_pool.py`
-  - `MHATokenToKVPool.get_chunk_repr_valid_mask(...)`：用于 selection 的 version-guard 有效性 mask
 - ✅ `python/sglang/srt/layers/attention/hsa_backend.py`
   - decode path 计算 selection，并写入 `HSAMetadata.hsa_*` debug 字段（attention 计算仍 delegate）
 - ✅ `python/sglang/test/attention/test_hsa_selector_decode_gpu.py`（CUDA）
@@ -61,4 +58,4 @@
 
 ### 下一阶段（尚未完成）
 - ⏳ Step 5：paged HSA decode kernel（先闭环 decode correctness，再优化/融合）
-- ⏳ 将 `page_version` 与 allocator/radix 的 page reuse 生命周期强绑定（生产级安全）
+- ⏳ 将 allocator/radix 的 page reuse 生命周期与 HSA 的“completed-page”语义强绑定（生产级安全）

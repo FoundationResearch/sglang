@@ -54,7 +54,8 @@ def test_hsa_backend_real_triton_decode_integration_cuda():
     Integration test:
     - Use real TritonAttnBackend (no monkeypatch) under HSAAttnBackend
     - Run init_forward_metadata + forward_decode
-    - Verify KV write succeeds and completed-page repr hook writes into chunk_repr_buffer
+    - Verify KV write succeeds and HSA selection (FlashHSA semantics: E_i = K(LMK)) runs without error
+      and masks out non-completed pages.
     """
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
@@ -70,8 +71,9 @@ def test_hsa_backend_real_triton_decode_integration_cuda():
     head_dim = 8
     page_size = 4
 
-    # We want seq_len to be a page boundary so repr hook triggers.
-    # Pre-existing tokens: 3, decode adds 1 -> total_len=4 (completed).
+    # We want total_len to be a page boundary so page 0 is "completed" under LMK semantics:
+    # completed_pages = floor(seq_len / page_size).
+    # Pre-existing tokens: 3, decode adds 1 -> total_len=4 -> completed_pages=1 -> page_id 0 is eligible.
     prefill_len = 3
     decode_len = 1
     total_len = prefill_len + decode_len
@@ -128,11 +130,9 @@ def test_hsa_backend_real_triton_decode_integration_cuda():
         layer_id=0,
     )
 
-    # Build req_to_token mapping so kv_indices includes all tokens up to total_len.
-    # Avoid loc=0 (reserved/padded); start at page_size for convenience.
-    token_locs = torch.arange(
-        page_size, page_size + total_len, dtype=torch.int32, device=device
-    )  # [4,5,6,7]
+    # Build req_to_token mapping so it spans two pages, but only page 0 is completed.
+    # Use locs [1,2,3,4] -> page_ids [0,0,0,1]. LMK for page 0 is loc=3.
+    token_locs = torch.arange(1, 1 + total_len, dtype=torch.int32, device=device)  # [1,2,3,4]
     model_runner.req_to_token_pool.req_to_token[0, :total_len] = token_locs
 
     # Prefill KV cache for first prefill_len tokens.
@@ -168,9 +168,13 @@ def test_hsa_backend_real_triton_decode_integration_cuda():
     assert out.is_cuda
     assert out.shape == (batch_size, num_heads * head_dim)
 
-    # Completed-page repr hook should have written to page_id = loc // page_size.
-    page_id = int(out_cache_loc.item()) // page_size
-    repr_saved = model_runner.token_to_kv_pool.chunk_repr_buffer[0][page_id]
-    assert torch.allclose(repr_saved, k_new[0], atol=0, rtol=0)
+    # Selection should have populated metadata. Under completed-page masking, only page 0 is eligible.
+    md = hsa.forward_metadata
+    assert md is not None
+    assert md.hsa_selected_page_ids is not None
+    # [B, H, K] with K=64 by default; first entry should be page 0, and page 1 must not appear.
+    selected = md.hsa_selected_page_ids[0, 0].tolist()
+    assert 0 in selected
+    assert 1 not in selected
 
 
