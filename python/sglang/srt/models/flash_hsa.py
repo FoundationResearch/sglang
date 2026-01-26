@@ -12,8 +12,8 @@ Key FlashHSA semantic differences we must respect at load time:
   - We keep `config.vocab_size` as the *base* vocab size (so logits/sampling and
     stop conditions behave as usual), but allocate embed/lm_head weights using the
     padded vocab size so LMK has a valid embedding row and weights can be loaded.
-  - Sliding-window size used for the fused SWA/HSA path is renamed to
-    `sliding_window_fusion_size` (fallback to `sliding_window` for compatibility).
+  - Sliding-window size used for the fused SWA/HSA path is
+    `sliding_window_fusion_size` and gated by `use_sliding_window_fusion`.
 
 NOTE: The actual fused SWA/HSA kernels are implemented by attention backends.
 This file focuses on model construction + weight loading compatibility.
@@ -153,7 +153,7 @@ class HSAForCausalLM(_Qwen3ForCausalLM):
 
     def get_attention_sliding_window_size(self) -> Optional[int]:
         # This value is used by ModelRunner to configure SWA window indices for backends.
-        use_sw = bool(getattr(self.config, "use_sliding_window", False))
+        use_sw = bool(getattr(self.config, "use_sliding_window_fusion", False))
         if not use_sw:
             return None
         return _get_sliding_window_fusion_size(self.config)
