@@ -176,3 +176,4 @@ def test_hsa_selector_decode_fixed_k_padding_cuda():
     assert sel.selected_page_ids[0, 0].tolist() == [5, -1, -1]
     assert sel.selected_page_ids[0, 1].tolist() == [5, -1, -1]
 
+
