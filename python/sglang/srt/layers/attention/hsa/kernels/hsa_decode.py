@@ -163,7 +163,10 @@ def hsa_decode_paged_fwd_kernel(
         acc += w * out_page
 
     out_ptr = OUT_ptr + pid_b * stride_out_b + pid_hq * stride_out_hq
-    tl.store(out_ptr + offs_d * stride_out_d, acc.to(tl.bfloat16), mask=True)
+    if OUT_DTYPE == 1:
+        tl.store(out_ptr + offs_d * stride_out_d, acc.to(tl.bfloat16), mask=True)
+    else:
+        tl.store(out_ptr + offs_d * stride_out_d, acc.to(tl.float16), mask=True)
 
 
 def hsa_decode_paged_fwd(
@@ -218,7 +221,8 @@ def hsa_decode_paged_fwd(
     w_ = hsa_weights.contiguous()
 
     if out is None:
-        out = torch.empty((B, HQ, D), device=q.device, dtype=torch.bfloat16)
+        out_dtype = q.dtype if q.dtype in (torch.float16, torch.bfloat16) else torch.bfloat16
+        out = torch.empty((B, HQ, D), device=q.device, dtype=out_dtype)
     else:
         assert out.shape == (B, HQ, D)
 
@@ -260,6 +264,7 @@ def hsa_decode_paged_fwd(
         PAGE_SIZE=int(page_size),
         MAX_T=MAX_T,
         mask_last_token=bool(mask_last_token),
+        OUT_DTYPE=1 if out.dtype == torch.bfloat16 else 0,
         num_warps=4,
     )
     return out
