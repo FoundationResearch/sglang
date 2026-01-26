@@ -426,8 +426,13 @@ class HSAAttnBackend(AttentionBackend):
                 swa_weight_q = None
                 out_swa = None
             else:
-                # Torch SWA branch over the last `window_size` tokens (LMK slots excluded).
-                # This mirrors FlashHSA sparse path: lse_swa participates in a (K+1)-way softmax.
+                # SWA branch for SWA→HSA merged path.
+                #
+                # Official FlashHSA uses `torch.nn.attention.flex_attention` with a custom block mask:
+                #   - local windowed causal
+                #   - excludes LMK slots ((kv_idx + 1) % chunk_size != 0)
+                #
+                # We mirror that here for speed & semantic alignment.
                 B = int(q3.shape[0])
                 D = int(q3.shape[2])
                 k_cache_all = pool.get_key_buffer(layer.layer_id)
@@ -436,34 +441,86 @@ class HSAAttnBackend(AttentionBackend):
                 out_swa = torch.zeros((B, HQ, D), device=q3.device, dtype=torch.float32)
                 lse_swa = torch.full((B, HQ), float("-inf"), device=q3.device, dtype=torch.float32)
 
-                seq_lens_i64 = md.cache_seqlens_int32.to(torch.int64)
-                for b in range(B):
-                    seqlen = int(seq_lens_i64[b].item())
-                    if seqlen <= 0:
-                        continue
-                    w = min(seqlen, int(window_size))
-                    start = seqlen - w
-                    tok_pos = torch.arange(start, seqlen, device=q3.device, dtype=torch.int64)
-                    # Exclude LMK token positions (last slot in each page).
-                    keep = (tok_pos % int(self.page_size)) != (int(self.page_size) - 1)
-                    tok_pos = tok_pos[keep]
-                    if tok_pos.numel() == 0:
-                        continue
-                    token_locs = page_table_1[b, tok_pos].to(torch.int64)  # [S]
+                try:
+                    from torch.nn.attention.flex_attention import flex_attention, create_block_mask
 
-                    q_hgd = q3[b].view(H, G, D).to(torch.float32)  # [H,G,D]
-                    for kv_h in range(H):
-                        k_win = k_cache_all[token_locs, kv_h, :].to(torch.float32)  # [S,D]
-                        v_win = v_cache_all[token_locs, kv_h, :].to(torch.float32)  # [S,D]
-                        logits = (q_hgd[kv_h] @ k_win.transpose(0, 1)) * float(
-                            getattr(layer, "scaling", 1.0)
-                        )  # [G,S]
-                        lse = torch.logsumexp(logits, dim=-1)  # [G]
-                        p = torch.softmax(logits, dim=-1)  # [G,S]
-                        o = p @ v_win  # [G,D]
-                        hq_start = kv_h * G
-                        out_swa[b, hq_start : hq_start + G, :] = o
-                        lse_swa[b, hq_start : hq_start + G] = lse
+                    seq_lens_i64 = md.cache_seqlens_int32.to(torch.int64)
+                    for b in range(B):
+                        seqlen = int(seq_lens_i64[b].item())
+                        if seqlen <= 0:
+                            continue
+
+                        q_idx_global = seqlen - 1
+                        start_global = q_idx_global - int(window_size) + 1
+                        if start_global < 0:
+                            start_global = 0
+                        chunk_start = (start_global // int(self.page_size)) * int(self.page_size)
+
+                        # Build a fixed-length KV window [window_size] by clamping positions into [0, seqlen-1].
+                        kv_pos_global = start_global + torch.arange(
+                            int(window_size), device=q3.device, dtype=torch.int64
+                        )  # [W]
+                        kv_pos_clamped = kv_pos_global.clamp_min(0).clamp_max(seqlen - 1)
+                        token_locs = page_table_1[b, kv_pos_clamped].to(torch.int64)  # [W]
+
+                        # Gather KV: [W, H, D] -> [1, H, W, D]
+                        k_win = k_cache_all[token_locs].transpose(0, 1).unsqueeze(0)  # [1,H,W,D]
+                        v_win = v_cache_all[token_locs].transpose(0, 1).unsqueeze(0)  # [1,H,W,D]
+                        q_b = q3[b].unsqueeze(0).unsqueeze(2)  # [1,HQ,1,D]
+
+                        def block_causal_mask(_bb, _hh, _q_idx, kv_idx):
+                            # Map kv_idx (0..W-1) into global token index.
+                            kv_global = kv_idx + start_global
+                            # windowed + chunk aligned + exclude LMK slots
+                            return (
+                                (kv_global >= chunk_start)
+                                & (kv_global <= q_idx_global)
+                                & (((kv_global + 1) % int(self.page_size)) != 0)
+                            )
+
+                        block_mask = create_block_mask(
+                            block_causal_mask, B=None, H=None, Q_LEN=1, KV_LEN=int(window_size)
+                        )
+                        o, lse = flex_attention(
+                            q_b,
+                            k_win,
+                            v_win,
+                            block_mask=block_mask,
+                            enable_gqa=True,
+                            return_lse=True,
+                        )  # o: [1,HQ,1,D], lse: [1,HQ,1]
+
+                        out_swa[b] = o.squeeze(0).squeeze(1).to(torch.float32)
+                        lse_swa[b] = lse.squeeze(0).squeeze(1).to(torch.float32)
+                except Exception:
+                    # Fallback to a simple torch implementation (kept for robustness across torch versions).
+                    seq_lens_i64 = md.cache_seqlens_int32.to(torch.int64)
+                    for b in range(B):
+                        seqlen = int(seq_lens_i64[b].item())
+                        if seqlen <= 0:
+                            continue
+                        w = min(seqlen, int(window_size))
+                        start = seqlen - w
+                        tok_pos = torch.arange(start, seqlen, device=q3.device, dtype=torch.int64)
+                        keep = (tok_pos % int(self.page_size)) != (int(self.page_size) - 1)
+                        tok_pos = tok_pos[keep]
+                        if tok_pos.numel() == 0:
+                            continue
+                        token_locs = page_table_1[b, tok_pos].to(torch.int64)
+
+                        q_hgd = q3[b].view(H, G, D).to(torch.float32)
+                        for kv_h in range(H):
+                            k_win = k_cache_all[token_locs, kv_h, :].to(torch.float32)
+                            v_win = v_cache_all[token_locs, kv_h, :].to(torch.float32)
+                            logits = (q_hgd[kv_h] @ k_win.transpose(0, 1)) * float(
+                                getattr(layer, "scaling", 1.0)
+                            )
+                            lse = torch.logsumexp(logits, dim=-1)
+                            p = torch.softmax(logits, dim=-1)
+                            o = p @ v_win
+                            hq_start = kv_h * G
+                            out_swa[b, hq_start : hq_start + G, :] = o
+                            lse_swa[b, hq_start : hq_start + G] = lse
 
                 out_swa = out_swa.to(torch.bfloat16)
 
