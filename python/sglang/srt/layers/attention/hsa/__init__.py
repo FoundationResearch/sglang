@@ -1,8 +1,8 @@
-# Kernel scaffolds (Triton)
-from .kernels import hsa_decode_fwd
+# Kernels (Triton)
+from .kernels import hsa_decode_paged_fwd
 
 __all__ = [
-    "hsa_decode_fwd",
+    "hsa_decode_paged_fwd",
 ]
 
 """
