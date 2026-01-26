@@ -12,8 +12,8 @@ Key FlashHSA semantic differences we must respect at load time:
   - We keep `config.vocab_size` as the *base* vocab size (so logits/sampling and
     stop conditions behave as usual), but allocate embed/lm_head weights using the
     padded vocab size so LMK has a valid embedding row and weights can be loaded.
-  - Sliding-window size used for the fused SWA/HSA path is
-    `sliding_window_fusion_size` and gated by `use_sliding_window_fusion`.
+  - Sliding-window size used for the SWA→HSA merged path is
+    `sliding_window_merging_size` and gated by `use_sliding_window_merging`.
 
 NOTE: The actual fused SWA/HSA kernels are implemented by attention backends.
 This file focuses on model construction + weight loading compatibility.
@@ -46,12 +46,11 @@ def next_of_y(x: int, y: int) -> int:
     return (x + y - 1) // y * y
 
 
-def _get_sliding_window_fusion_size(config) -> Optional[int]:
-    # New name (requested): sliding_window_fusion_size
-    if hasattr(config, "sliding_window_fusion_size") and getattr(
-        config, "sliding_window_fusion_size"
+def _get_sliding_window_merging_size(config) -> Optional[int]:
+    if hasattr(config, "sliding_window_merging_size") and getattr(
+        config, "sliding_window_merging_size"
     ) is not None:
-        return int(getattr(config, "sliding_window_fusion_size"))
+        return int(getattr(config, "sliding_window_merging_size"))
     return None
 
 
@@ -165,11 +164,11 @@ class HSAForCausalLM(_Qwen3ForCausalLM):
             return None
         return _get_sliding_window_attention_size(self.config)
 
-    def get_flashhsa_fusion_sliding_window_size(self) -> Optional[int]:
-        # Used by HSAAttnBackend selection (SWA→HSA exclusion) / future fused kernels.
-        if not bool(getattr(self.config, "use_sliding_window_fusion", False)):
+    def get_flashhsa_merging_sliding_window_size(self) -> Optional[int]:
+        # Used by HSAAttnBackend selection (SWA→HSA exclusion) / future merged kernels.
+        if not bool(getattr(self.config, "use_sliding_window_merging", False)):
             return None
-        return _get_sliding_window_fusion_size(self.config)
+        return _get_sliding_window_merging_size(self.config)
 
     def get_flashhsa_hsa_layer_ids(self) -> List[int]:
         """Default per-layer HSA pattern from FlashHSA: every `full_attn_interleave`-th layer."""

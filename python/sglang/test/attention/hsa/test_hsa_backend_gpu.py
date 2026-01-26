@@ -96,7 +96,7 @@ def _make_minimal_hsa_backend(monkeypatch):
         hsa_selection_strategy="head",
         hsa_layers="0",
         hsa_window_size=None,
-        hsa_enable_swa_fusion=False,
+        hsa_enable_swa_merging=False,
     )
     model_config = types.SimpleNamespace(is_encoder_decoder=False)
     model_runner = types.SimpleNamespace(

@@ -53,7 +53,7 @@ class _MinimalServerArgs:
         self.hsa_selection_strategy = "head"
         self.hsa_layers = None
         self.hsa_window_size = None
-        self.hsa_enable_swa_fusion = False
+        self.hsa_enable_swa_merging = False
 
 
 @pytest.mark.skipif(
