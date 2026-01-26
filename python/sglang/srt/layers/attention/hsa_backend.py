@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Optional
+import re
+from typing import TYPE_CHECKING, Optional, Set
 
 import torch
 
@@ -48,6 +49,7 @@ class HSAAttnBackend(AttentionBackend):
             model_runner.server_args, "hsa_selection_strategy", "head"
         )
         self.hsa_layers = getattr(model_runner.server_args, "hsa_layers", None)
+        self._hsa_layer_ids: Optional[Set[int]] = self._resolve_hsa_layer_ids()
         self.hsa_window_size = getattr(model_runner.server_args, "hsa_window_size", None)
         self.hsa_enable_swa_fusion = getattr(
             model_runner.server_args, "hsa_enable_swa_fusion", False
@@ -65,14 +67,41 @@ class HSAAttnBackend(AttentionBackend):
         self._dense_backend = TritonAttnBackend(model_runner, **kwargs)
         self.forward_metadata: Optional[HSAMetadata] = None
 
-    def _is_hsa_layer(self, layer_id: int) -> bool:
+    def _resolve_hsa_layer_ids(self) -> Optional[Set[int]]:
+        """Resolve per-layer HSA enable set.
+
+        Priority:
+        1) CLI: --hsa-layers (string/list)
+        2) Model-provided default (FlashHSA): model.get_flashhsa_hsa_layer_ids()
+        3) None => apply HSA selection to all layers (current default behavior)
+        """
+
         layers = self.hsa_layers
-        if layers is None:
+        if layers is not None:
+            try:
+                if isinstance(layers, (list, tuple, set)):
+                    return set(int(x) for x in layers)
+                if isinstance(layers, str):
+                    parts = [p for p in re.split(r"[,\s]+", layers.strip()) if p]
+                    return set(int(p) for p in parts)
+            except Exception:
+                return None
+
+        get_default = getattr(getattr(self.model_runner, "model", None), "get_flashhsa_hsa_layer_ids", None)
+        if callable(get_default):
+            try:
+                default_layers = get_default()
+                if default_layers:
+                    return set(int(x) for x in default_layers)
+            except Exception:
+                return None
+
+        return None
+
+    def _is_hsa_layer(self, layer_id: int) -> bool:
+        if self._hsa_layer_ids is None:
             return True
-        try:
-            return int(layer_id) in set(int(x) for x in layers)
-        except Exception:
-            return True
+        return int(layer_id) in self._hsa_layer_ids
 
     def _get_effective_window_size(self) -> Optional[int]:
         if self.hsa_window_size is not None:
