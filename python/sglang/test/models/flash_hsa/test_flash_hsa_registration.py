@@ -35,9 +35,9 @@ def test_flash_hsa_autoconfig_and_registry(tmp_path: Path):
         "num_hidden_layers": 2,
         "num_attention_heads": 16,
         "num_key_value_heads": 4,
-        "use_sliding_window_fusion": True,
+        "use_sliding_window_merging": True,
         # New name (requested); old name "sliding_window" should not be required.
-        "sliding_window_fusion_size": 64,
+        "sliding_window_merging_size": 64,
         "use_sliding_window_attention": True,
         "sliding_window_attention_size": 32,
         # FlashHSA scheduling pattern
@@ -57,7 +57,7 @@ def test_flash_hsa_autoconfig_and_registry(tmp_path: Path):
     assert c.model_type == "flash_hsa"
     assert isinstance(c, FlashHSAConfig)
     assert getattr(c, "architectures", None) == ["HSAForCausalLM"]
-    assert getattr(c, "sliding_window_fusion_size", None) == 64
+    assert getattr(c, "sliding_window_merging_size", None) == 64
     assert getattr(c, "sliding_window_attention_size", None) == 32
 
     # Registry resolution
@@ -82,7 +82,7 @@ def test_flash_hsa_window_size_fallback_warns(tmp_path: Path):
         "num_hidden_layers": 2,
         "num_attention_heads": 16,
         "num_key_value_heads": 4,
-        # Official-format input: single window for both fusion + sliding-attention layers.
+        # Official-format input: single window for both merging + sliding-attention layers.
         "use_sliding_window": True,
         "sliding_window": 64,
         "full_attn_interleave": 4,
@@ -93,7 +93,7 @@ def test_flash_hsa_window_size_fallback_warns(tmp_path: Path):
 
     c = AutoConfig.from_pretrained(str(tmp_path), trust_remote_code=True)
 
-    assert getattr(c, "sliding_window_fusion_size", None) == 64
+    assert getattr(c, "sliding_window_merging_size", None) == 64
     assert getattr(c, "sliding_window_attention_size", None) == 64
 
 

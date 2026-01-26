@@ -44,15 +44,15 @@ class FlashHSAConfig(PretrainedConfig):
         attention_dropout: float = 0.0,
         # ---- Official FlashHSA-format knobs (compat input) ----
         # Upstream uses a single window size for both:
-        # - HSA-layer fusion SWA
+        # - HSA-layer SWA (for SWA→HSA merging)
         # - standalone sliding window attention layers
         #
         # We accept these keys and map them into the split knobs below.
         use_sliding_window: Optional[bool] = None,
         sliding_window: Optional[int] = None,
-        # Sliding window for HSA-layer fusion SWA (inside HierarchicalSparseAttention).
-        use_sliding_window_fusion: bool = False,
-        sliding_window_fusion_size: Optional[int] = None,
+        # Sliding window for HSA-layer SWA used in SWA→HSA merging (inside HierarchicalSparseAttention).
+        use_sliding_window_merging: bool = False,
+        sliding_window_merging_size: Optional[int] = None,
         # Sliding window for standalone sliding-window attention layers (layer_types == "sliding_attention").
         use_sliding_window_attention: bool = False,
         sliding_window_attention_size: Optional[int] = None,
@@ -89,22 +89,22 @@ class FlashHSAConfig(PretrainedConfig):
         # ---- Sliding window config semantics ----
         # Two supported input formats:
         #   A) Official FlashHSA: (use_sliding_window, sliding_window)
-        #      -> mapped to BOTH fusion + attention windows
-        #   B) Split SGLang: (use_sliding_window_fusion, sliding_window_fusion_size) and
+        #      -> mapped to BOTH merging + attention windows
+        #   B) Split SGLang: (use_sliding_window_merging, sliding_window_merging_size) and
         #                   (use_sliding_window_attention, sliding_window_attention_size)
         #
         # We do NOT allow mixing formats to avoid ambiguous intent.
         if use_sliding_window is not None or sliding_window is not None:
             if (
-                use_sliding_window_fusion
+                use_sliding_window_merging
                 or use_sliding_window_attention
-                or sliding_window_fusion_size is not None
+                or sliding_window_merging_size is not None
                 or sliding_window_attention_size is not None
             ):
                 raise ValueError(
                     "FlashHSAConfig: do not mix official keys "
                     "(`use_sliding_window`, `sliding_window`) with split keys "
-                    "(`use_sliding_window_fusion`, `sliding_window_fusion_size`, "
+                    "(`use_sliding_window_merging`, `sliding_window_merging_size`, "
                     "`use_sliding_window_attention`, `sliding_window_attention_size`)."
                 )
             if use_sliding_window is None:
@@ -119,22 +119,22 @@ class FlashHSAConfig(PretrainedConfig):
                         "when `use_sliding_window=True`."
                     )
                 w = int(sliding_window)
-                self.use_sliding_window_fusion = True
-                self.sliding_window_fusion_size = w
+                self.use_sliding_window_merging = True
+                self.sliding_window_merging_size = w
                 self.use_sliding_window_attention = True
                 self.sliding_window_attention_size = w
             else:
-                self.use_sliding_window_fusion = False
-                self.sliding_window_fusion_size = None
+                self.use_sliding_window_merging = False
+                self.sliding_window_merging_size = None
                 self.use_sliding_window_attention = False
                 self.sliding_window_attention_size = None
         else:
             # Split format (no implicit fallback between the two sizes)
-            self.use_sliding_window_fusion = bool(use_sliding_window_fusion)
+            self.use_sliding_window_merging = bool(use_sliding_window_merging)
             self.use_sliding_window_attention = bool(use_sliding_window_attention)
-            self.sliding_window_fusion_size = (
-                int(sliding_window_fusion_size)
-                if sliding_window_fusion_size is not None
+            self.sliding_window_merging_size = (
+                int(sliding_window_merging_size)
+                if sliding_window_merging_size is not None
                 else None
             )
             self.sliding_window_attention_size = (
@@ -142,9 +142,9 @@ class FlashHSAConfig(PretrainedConfig):
                 if sliding_window_attention_size is not None
                 else None
             )
-            if self.use_sliding_window_fusion and self.sliding_window_fusion_size is None:
+            if self.use_sliding_window_merging and self.sliding_window_merging_size is None:
                 raise ValueError(
-                    "FlashHSAConfig: `use_sliding_window_fusion=True` requires `sliding_window_fusion_size`."
+                    "FlashHSAConfig: `use_sliding_window_merging=True` requires `sliding_window_merging_size`."
                 )
             if self.use_sliding_window_attention and self.sliding_window_attention_size is None:
                 raise ValueError(

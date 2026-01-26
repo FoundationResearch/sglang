@@ -21,35 +21,70 @@ def _vprint(*args):
         print(*args, flush=True)
 
 
-def _torch_ref_hsa_decode_from_selected(
+def _torch_swa_decode_window(
+    *,
+    q: torch.Tensor,  # [B,HQ,D] bf16
+    k_cache: torch.Tensor,  # [Nloc,H,D] bf16
+    v_cache: torch.Tensor,  # [Nloc,H,D] bf16
+    page_table_1: torch.Tensor,  # [B,MAX_T] int32
+    seq_lens: torch.Tensor,  # [B] int32
+    page_size: int,
+    window_size: int,
+    sm_scale: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return (out_swa, lse_swa) in float32 with LMK slots excluded."""
+    B, HQ, D = q.shape
+    _, H, _ = k_cache.shape
+    assert HQ % H == 0
+    G = HQ // H
+
+    out = torch.zeros((B, HQ, D), device=q.device, dtype=torch.float32)
+    lse = torch.full((B, HQ), float("-inf"), device=q.device, dtype=torch.float32)
+    seq_lens_i64 = seq_lens.to(torch.int64)
+
+    for b in range(B):
+        seqlen = int(seq_lens_i64[b].item())
+        if seqlen <= 0:
+            continue
+        w = min(seqlen, int(window_size))
+        start = seqlen - w
+        tok_pos = torch.arange(start, seqlen, device=q.device, dtype=torch.int64)
+        keep = (tok_pos % int(page_size)) != (int(page_size) - 1)
+        tok_pos = tok_pos[keep]
+        if tok_pos.numel() == 0:
+            continue
+        token_locs = page_table_1[b, tok_pos].to(torch.int64)
+        q_hgd = q[b].view(H, G, D).to(torch.float32)
+        for kv_h in range(H):
+            k_win = k_cache[token_locs, kv_h, :].to(torch.float32)  # [S,D]
+            v_win = v_cache[token_locs, kv_h, :].to(torch.float32)
+            logits = (q_hgd[kv_h] @ k_win.transpose(0, 1)) * float(sm_scale)  # [G,S]
+            lse_b = torch.logsumexp(logits, dim=-1)  # [G]
+            p = torch.softmax(logits, dim=-1)
+            o = p @ v_win
+            hq_start = kv_h * G
+            out[b, hq_start : hq_start + G, :] = o
+            lse[b, hq_start : hq_start + G] = lse_b
+    return out, lse
+
+
+def _torch_hsa_decode_from_weights(
     *,
     q: torch.Tensor,  # [B,HQ,D] bf16
     k_cache: torch.Tensor,  # [Nloc,H,D] bf16
     v_cache: torch.Tensor,  # [Nloc,H,D] bf16
     page_table_1: torch.Tensor,  # [B,MAX_T] int32
     selected_page_ids: torch.Tensor,  # [B,H,K] int32
-    selected_scores: torch.Tensor,  # [B,H,K] fp32
+    hsa_weights: torch.Tensor,  # [B,HQ,K] float32
     page_size: int,
     sm_scale: float,
     mask_last_token: bool,
 ) -> torch.Tensor:
-    """
-    End-to-end torch reference:
-    - Compute hsa_weights as softmax over selected_scores (mask invalid page_ids)
-    - Expand weights from kv-head to q-head (G = HQ/H)
-    - Paged attention per selected page with mask_last_token semantics
-    """
     B, HQ, D = q.shape
     _, H, _ = k_cache.shape
     assert HQ % H == 0
     G = HQ // H
     K = int(selected_page_ids.shape[2])
-
-    valid = selected_page_ids >= 0
-    scores = selected_scores.masked_fill(~valid, float("-inf"))
-    w_kv = torch.softmax(scores, dim=-1)
-    w_kv = torch.nan_to_num(w_kv, nan=0.0).float()  # [B,H,K]
-    w_q = w_kv[:, :, None, :].expand(B, H, G, K).reshape(B, HQ, K)  # [B,HQ,K]
 
     out = torch.zeros((B, HQ, D), device=q.device, dtype=torch.float32)
     for b in range(B):
@@ -58,20 +93,18 @@ def _torch_ref_hsa_decode_from_selected(
             qq = q[b, hq].float()
             for ki in range(K):
                 pid = int(selected_page_ids[b, kv_h, ki].item())
-                if pid < 0:
-                    continue
-                w = float(w_q[b, hq, ki].item())
-                if w == 0.0:
+                w = float(hsa_weights[b, hq, ki].item())
+                if pid < 0 or w == 0.0:
                     continue
                 token_start = pid * int(page_size)
                 token_end = token_start + int(page_size)
                 token_locs = page_table_1[b, token_start:token_end].to(torch.int64)
-                k = k_cache[token_locs, kv_h].float()  # [S,D]
+                k = k_cache[token_locs, kv_h].float()
                 v = v_cache[token_locs, kv_h].float()
                 if mask_last_token:
                     k = k[:-1]
                     v = v[:-1]
-                logits = (k @ qq) * float(sm_scale)  # [S']
+                logits = (k @ qq) * float(sm_scale)
                 p = torch.softmax(logits, dim=0)
                 out[b, hq] += w * (p @ v)
     return out
@@ -80,12 +113,11 @@ def _torch_ref_hsa_decode_from_selected(
 @pytest.mark.skipif(
     torch.cuda.device_count() == 0, reason="CUDA device required for this test"
 )
-def test_hsa_backend_end_to_end_decode_is_math_correct_cuda():
+def test_hsa_backend_end_to_end_decode_merged_is_math_correct_cuda():
     """
-    True end-to-end correctness test (GPU-only):
-    - Real HSAAttnBackend + real Triton paged HSA decode kernel
-    - Deterministic LMK-K setup so selection chooses known completed pages
-    - Compare backend output vs torch reference that recomputes selection + weights + paged attention
+    End-to-end correctness test for decode merged (SWA→HSA→merged):
+    - Backend: selection (exclude SWA window pages) + (K+1)-way softmax weights + HSA kernel + SWA branch merged.
+    - Torch ref: recompute selection + recompute SWA (window) out/lse + same weight softmax + paged attention ref + merge.
     """
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.layers.attention.hsa.selector import (
@@ -99,7 +131,6 @@ def test_hsa_backend_end_to_end_decode_is_math_correct_cuda():
     device = "cuda"
     dtype = torch.bfloat16
 
-    # Small shapes (but non-trivial: grouped heads)
     B = 1
     H = 2
     G = 2
@@ -107,19 +138,17 @@ def test_hsa_backend_end_to_end_decode_is_math_correct_cuda():
     D = 16
     page_size = 4
     topk = 1
+    window_size = 4
+    sm_scale = float(D) ** -0.5
 
-    # Internal seq_len includes LMKs:
-    # - pages 0 and 1 are completed (LMKs at token indices 3 and 7)
-    # - page 2 is active but not completed; should be gated out
-    prefill_len = 8
+    prefill_len = 12  # pages 0,1,2 completed (LMKs at 3,7,11)
     decode_len = 1
-    total_len = prefill_len + decode_len  # 9 => completed_pages = 2
+    total_len = prefill_len + decode_len  # 13 => completed_pages = 3, page 3 incomplete
 
     max_batch_size = 8
     max_context_len = 64
     max_total_num_tokens = max_batch_size * max_context_len
 
-    # Minimal model_runner for TritonAttnBackend init under HSAAttnBackend.
     model_runner = types.SimpleNamespace()
     model_runner.device = device
     model_runner.dtype = dtype
@@ -138,7 +167,7 @@ def test_hsa_backend_end_to_end_decode_is_math_correct_cuda():
         config=types.SimpleNamespace(
             hsa_topk=topk,
             hsa_selection_strategy="head",
-            enable_swa_hsa_merging=False,
+            enable_swa_hsa_merging=True,
         )
     )
     model_runner.server_args = types.SimpleNamespace(
@@ -152,12 +181,11 @@ def test_hsa_backend_end_to_end_decode_is_math_correct_cuda():
         hsa_topk=topk,
         hsa_selection_strategy="head",
         hsa_layers="0",
-        hsa_window_size=None,
-        hsa_enable_swa_merging=False,
+        hsa_window_size=window_size,
+        hsa_enable_swa_merging=True,
         hsa_lmk_id=-1,
     )
 
-    # Pools
     req_to_token = torch.zeros(
         (max_batch_size, max_context_len), dtype=torch.int32, device=device
     )
@@ -178,59 +206,50 @@ def test_hsa_backend_end_to_end_decode_is_math_correct_cuda():
     model_runner.token_to_kv_pool_allocator = object()
 
     backend = HSAAttnBackend(model_runner)
-
     layer = RadixAttention(
         num_heads=HQ,
         head_dim=D,
-        scaling=float(D) ** -0.5,
+        scaling=sm_scale,
         num_kv_heads=H,
         layer_id=0,
     )
 
-    # Token locs are real KV slots. Use contiguous slots so pages are well-defined:
-    # page0: 0..3 (LMK at 3), page1: 4..7 (LMK at 7), page2 starts at 8 (incomplete).
     token_locs = torch.arange(0, total_len, dtype=torch.int32, device=device)
     model_runner.req_to_token_pool.req_to_token[0, :total_len] = token_locs
 
-    # Prefill KV for first 8 tokens (includes LMKs at loc 3 and 7).
+    # Prefill KV (including LMKs at 3,7,11)
     prefill_loc = token_locs[:prefill_len].to(torch.int64)
     cache_k = torch.randn((prefill_len, H, D), device=device, dtype=dtype)
     cache_v = torch.randn_like(cache_k)
 
-    # Make LMK-K deterministic to force selection:
-    # - For kv head 0: page0 wins (lmk at 3 => +e0), page1 loses (lmk at 7 => +e1)
-    # - For kv head 1: page1 wins (lmk at 7 => +e0), page0 loses (lmk at 3 => +e1)
+    # Deterministic LMK-K so selection chooses page0/page1 (not page2 which is in SWA window pages)
     e0 = torch.zeros((D,), device=device, dtype=dtype)
     e0[0] = 10.0
     e1 = torch.zeros((D,), device=device, dtype=dtype)
     e1[1] = 10.0
-    # loc=3 is LMK for page0
+    # page0 lmk loc=3
     cache_k[3, 0, :] = e0
     cache_k[3, 1, :] = e1
-    # loc=7 is LMK for page1
+    # page1 lmk loc=7
     cache_k[7, 0, :] = e1
     cache_k[7, 1, :] = e0
+    # page2 lmk loc=11 (in SWA window pages; should be excluded from candidates)
+    cache_k[11, :, :] = e1
 
-    # Poison LMK V slots so masking is actually tested.
+    # Poison LMK V slots so masking/exclusion is enforced.
     cache_v[3, :, :] = 10000.0
     cache_v[7, :, :] = 10000.0
+    cache_v[11, :, :] = 10000.0
 
     model_runner.token_to_kv_pool.set_kv_buffer(layer, prefill_loc, cache_k, cache_v)
 
-    # Decode: add 1 token at loc=8 (page2, incomplete).
+    # Decode at loc=12
     q3 = torch.zeros((B, HQ, D), device=device, dtype=dtype)
-    # Make q align with desired winners under "head" strategy (max over group):
-    # - kv head0 (hq 0,1) align to e0 => selects page0 for head0
-    # - kv head1 (hq 2,3) align to e0 => selects page1 for head1 (because we set page1 lmk for head1 to e0)
-    q3[0, 0, :] = e0
-    q3[0, 1, :] = e0
-    q3[0, 2, :] = e0
-    q3[0, 3, :] = e0
+    q3[0, :, :] = e0
     q = q3.reshape(B, HQ * D)
-
     k_new = torch.randn((B, H, D), device=device, dtype=dtype)
     v_new = torch.randn_like(k_new)
-    out_cache_loc = token_locs[-1:].to(torch.int64)  # loc=8
+    out_cache_loc = token_locs[-1:].to(torch.int64)
 
     forward_batch = ForwardBatch(
         forward_mode=ForwardMode.DECODE,
@@ -248,17 +267,17 @@ def test_hsa_backend_end_to_end_decode_is_math_correct_cuda():
 
     backend.init_forward_metadata(forward_batch)
     out_backend = backend.forward_decode(q, k_new, v_new, layer, forward_batch, save_kv_cache=True)
-    assert out_backend.shape == (B, HQ * D)
+    out_backend_3 = out_backend.view(B, HQ, D)
 
     md = backend.forward_metadata
     assert md is not None
 
-    # --- Torch reference recomputes selection (same semantics) ---
+    # Torch recompute selection (exclude SWA window pages via window_size)
     cand_page_ids, cand_mask = build_active_page_candidates(
         page_table_1=md.page_table_1,
         seq_lens=md.cache_seqlens_int32,
         page_size=page_size,
-        window_size=None,
+        window_size=window_size,
     )
     completed_pages = torch.div(
         md.cache_seqlens_int32.to(torch.int64), int(page_size), rounding_mode="floor"
@@ -268,7 +287,7 @@ def test_hsa_backend_end_to_end_decode_is_math_correct_cuda():
     lmk_locs = safe_page_ids * int(page_size) + (int(page_size) - 1)
     flat_lmk = lmk_locs.reshape(-1)
     k_cache_full = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
-    flat_repr = k_cache_full[flat_lmk]  # [B*C, H, D]
+    flat_repr = k_cache_full[flat_lmk]
     cand_repr = flat_repr.view(B, cand_page_ids.shape[1], H, D)
 
     sel = select_topk_pages_decode(
@@ -282,31 +301,52 @@ def test_hsa_backend_end_to_end_decode_is_math_correct_cuda():
         sm_scale=layer.scaling,
     )
 
-    # Sanity: backend and ref selection should match.
     torch.testing.assert_close(md.hsa_selected_page_ids, sel.selected_page_ids)
     torch.testing.assert_close(md.hsa_selected_scores, sel.selected_scores)
 
-    # --- Torch reference output ---
-    ref = _torch_ref_hsa_decode_from_selected(
+    # Torch SWA branch (out + lse)
+    out_swa, lse_swa = _torch_swa_decode_window(
+        q=q3,
+        k_cache=forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id),
+        v_cache=forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id),
+        page_table_1=md.page_table_1,
+        seq_lens=md.cache_seqlens_int32,
+        page_size=page_size,
+        window_size=window_size,
+        sm_scale=layer.scaling,
+    )
+
+    # Compute merged weights: softmax over [scores_q, lse_swa]
+    scores_kv = sel.selected_scores.to(torch.float32)  # [B,H,K]
+    valid = sel.selected_page_ids >= 0
+    scores_kv = scores_kv.masked_fill(~valid, float("-inf"))
+    scores_q = scores_kv[:, :, None, :].expand(B, H, G, topk).reshape(B, HQ, topk)
+    cat = torch.cat([scores_q, lse_swa.unsqueeze(-1)], dim=-1)
+    w_all = torch.softmax(cat, dim=-1)
+    w_all = torch.nan_to_num(w_all, nan=0.0)
+    hsa_w = w_all[:, :, :topk]
+    swa_w = w_all[:, :, topk]
+
+    # Torch HSA branch with weights
+    out_hsa = _torch_hsa_decode_from_weights(
         q=q3,
         k_cache=forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id),
         v_cache=forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id),
         page_table_1=md.page_table_1,
         selected_page_ids=sel.selected_page_ids,
-        selected_scores=sel.selected_scores,
+        hsa_weights=hsa_w,
         page_size=page_size,
         sm_scale=layer.scaling,
         mask_last_token=True,
     )
 
-    out_backend_3 = out_backend.view(B, HQ, D)
-    torch.testing.assert_close(out_backend_3.float(), ref, rtol=3e-2, atol=3e-2)
+    out_ref = out_hsa + (swa_w[:, :, None] * out_swa)
+    torch.testing.assert_close(out_backend_3.float(), out_ref, rtol=3e-2, atol=3e-2)
 
-    _vprint("### test_hsa_backend_end_to_end_decode_is_math_correct_cuda")
-    _vprint(f"- total_len={total_len} page_size={page_size} completed_pages={total_len // page_size}")
-    _vprint(f"- cand_page_ids={cand_page_ids[0].tolist()} cand_mask={cand_mask[0].tolist()}")
+    _vprint("### test_hsa_backend_end_to_end_decode_merged_is_math_correct_cuda")
+    _vprint(f"- window_size={window_size} cand_page_ids={cand_page_ids[0].tolist()}")
     _vprint(f"- selected_page_ids={sel.selected_page_ids[0].tolist()}")
-    _vprint(f"- max_abs_err={(out_backend_3.float() - ref).abs().max().item()}")
-    _vprint("=> Conclusion: HSAAttnBackend decode (selection + weights + Triton kernel) matches torch reference.")
+    _vprint(f"- max_abs_err={(out_backend_3.float() - out_ref).abs().max().item()}")
+    _vprint("=> Conclusion: decode merged (SWA→HSA→merged) matches torch reference.")
 
 

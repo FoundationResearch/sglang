@@ -447,7 +447,7 @@ class ServerArgs:
     hsa_selection_strategy: Optional[str] = None
     hsa_layers: Optional[str] = None
     hsa_window_size: Optional[int] = None
-    hsa_enable_swa_fusion: Optional[bool] = None
+    hsa_enable_swa_merging: Optional[bool] = None
     # Landmark token id (LMK). By default we follow FlashHSA: lmk_id == vocab_size.
     # This id must be valid for the loaded model weights (embedding/lm_head).
     hsa_lmk_id: int = -1
@@ -3578,11 +3578,20 @@ class ServerArgs:
             "config or backend defaults. Only used when --attention-backend hsa.",
         )
         parser.add_argument(
-            "--hsa-enable-swa-fusion",
+            "--hsa-enable-swa-merging",
             action=argparse.BooleanOptionalAction,
-            default=ServerArgs.hsa_enable_swa_fusion,
-            help="(Override-only) Enable SWA→HSA fusion for FlashHSA semantics. If unset, read from model config. "
+            default=ServerArgs.hsa_enable_swa_merging,
+            help="(Override-only) Enable SWA→HSA merged path for FlashHSA semantics. If unset, read from model config. "
             "Only used when --attention-backend hsa.",
+        )
+        # Deprecated alias (kept for convenience; prefer --hsa-enable-swa-merging).
+        parser.add_argument(
+            "--hsa-enable-swa-fusion",
+            "--no-hsa-enable-swa-fusion",
+            dest="hsa_enable_swa_merging",
+            action=argparse.BooleanOptionalAction,
+            default=argparse.SUPPRESS,
+            help="(DEPRECATED) Use --hsa-enable-swa-merging / --no-hsa-enable-swa-merging instead.",
         )
         parser.add_argument(
             "--hsa-lmk-id",
