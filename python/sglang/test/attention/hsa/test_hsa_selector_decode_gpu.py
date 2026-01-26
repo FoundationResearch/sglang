@@ -1,5 +1,14 @@
+import os
 import pytest
 import torch
+
+
+_HSA_VERBOSE = os.getenv("SGLANG_HSA_TEST_VERBOSE", "0") == "1"
+
+
+def _vprint(*args):
+    if _HSA_VERBOSE:
+        print(*args, flush=True)
 
 
 @pytest.mark.skipif(torch.cuda.device_count() == 0, reason="CUDA device required for this test")
@@ -20,6 +29,13 @@ def test_hsa_build_active_page_candidates_excludes_swa_window_pages_cuda():
         page_size=page_size,
         window_size=5,
     )
+
+    _vprint("### test_hsa_build_active_page_candidates_excludes_swa_window_pages_cuda")
+    _vprint(f"- page_size={page_size} window_size=5")
+    _vprint(f"- page_table_1[0]={page_table_1[0].tolist()}")
+    _vprint(f"- seq_lens={seq_lens.tolist()}")
+    _vprint(f"- cand_page_ids={cand_page_ids.tolist()} cand_mask={cand_mask.tolist()}")
+    _vprint("=> Conclusion: SWA window pages were excluded; only earlier pages remain.")
 
     assert cand_page_ids.is_cuda
     assert cand_mask.is_cuda
@@ -75,6 +91,10 @@ def test_hsa_selector_decode_head_strategy_deterministic_topk_cuda():
         selection_strategy="head",
         sm_scale=1.0,  # keep arithmetic simple for assertions
     )
+
+    _vprint("### test_hsa_selector_decode_head_strategy_deterministic_topk_cuda")
+    _vprint(f"- selected_page_ids={sel.selected_page_ids.tolist()}")
+    _vprint("=> Conclusion: deterministic top-k returns pages [1,2] for both kv heads.")
 
     # top-2 should be pages {1,2}. Order is sorted by candidate index (deterministic).
     assert sel.selected_page_ids.shape == (B, H, K)
@@ -134,6 +154,11 @@ def test_hsa_selector_decode_masks_invalid_candidates_by_valid_mask_cuda():
         sm_scale=1.0,
     )
 
+    _vprint("### test_hsa_selector_decode_masks_invalid_candidates_by_valid_mask_cuda")
+    _vprint(f"- cand_page_ids={cand_page_ids.tolist()} cand_valid={cand_valid.tolist()}")
+    _vprint(f"- selected_page_ids={sel.selected_page_ids.tolist()}")
+    _vprint("=> Conclusion: invalid candidates never appear in selection output.")
+
     # Candidate page 2 is invalid -> should not appear in selection.
     assert 2 not in sel.selected_page_ids[0, 0].tolist()
 
@@ -170,6 +195,10 @@ def test_hsa_selector_decode_fixed_k_padding_cuda():
         selection_strategy="group",
         sm_scale=1.0,
     )
+
+    _vprint("### test_hsa_selector_decode_fixed_k_padding_cuda")
+    _vprint(f"- selected_page_ids={sel.selected_page_ids.tolist()}")
+    _vprint("=> Conclusion: fixed-K output pads missing entries with -1.")
 
     assert sel.selected_page_ids.shape == (B, H, K)
     # First entry is the only candidate; rest padded with -1.

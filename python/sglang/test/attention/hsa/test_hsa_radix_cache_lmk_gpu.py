@@ -1,3 +1,4 @@
+import os
 import pytest
 import torch
 
@@ -5,6 +6,13 @@ import torch
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="GPU-only test: CUDA not available."
 )
+
+_HSA_VERBOSE = os.getenv("SGLANG_HSA_TEST_VERBOSE", "0") == "1"
+
+
+def _vprint(*args):
+    if _HSA_VERBOSE:
+        print(*args, flush=True)
 
 
 def test_hsa_radix_cache_prefix_match_includes_lmk_and_is_page_aligned_cuda():
@@ -61,6 +69,11 @@ def test_hsa_radix_cache_prefix_match_includes_lmk_and_is_page_aligned_cuda():
     req1.req_pool_idx = req_to_token_pool.alloc(1)[0]
     req1.init_next_round_input(cache)  # sets fill_ids and (empty) prefix match state
 
+    _vprint("### test_hsa_radix_cache_prefix_match_includes_lmk_and_is_page_aligned_cuda")
+    _vprint(f"- page_size={page_size} lmk_id={lmk_id}")
+    _vprint(f"- origin_input_ids={origin}")
+    _vprint(f"- req1.fill_ids(with_lmk)={req1.fill_ids}")
+
     assert req1.fill_ids == [1, 2, 3, lmk_id, 4, 5, 6, lmk_id, 7]
     # Allocate token slots and populate req_to_token_pool for all engine-visible tokens.
     kv_slots1 = allocator.alloc(len(req1.fill_ids))
@@ -83,6 +96,12 @@ def test_hsa_radix_cache_prefix_match_includes_lmk_and_is_page_aligned_cuda():
     assert req2.fill_ids[: len(expected_tokens)] == expected_tokens
 
     expected_kv = kv_slots1[: len(expected_tokens)].to(torch.int64)
+    _vprint(f"- expected_tokens(page_aligned)={expected_tokens}")
+    _vprint(f"- req2.prefix_indices={req2.prefix_indices.tolist()}")
+    _vprint(f"- expected_kv(from_req1_slots)={expected_kv.tolist()}")
+    _vprint(
+        "=> Conclusion: radix prefix match reused the exact KV slots for the page-aligned prefix (includes LMK)."
+    )
     assert req2.prefix_indices.numel() == expected_kv.numel()
     assert torch.equal(req2.prefix_indices, expected_kv)
 

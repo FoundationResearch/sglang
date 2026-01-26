@@ -1,3 +1,4 @@
+import os
 import types
 
 import pytest
@@ -7,6 +8,13 @@ import torch
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="GPU-only test: CUDA not available."
 )
+
+_HSA_VERBOSE = os.getenv("SGLANG_HSA_TEST_VERBOSE", "0") == "1"
+
+
+def _vprint(*args):
+    if _HSA_VERBOSE:
+        print(*args, flush=True)
 
 
 class _FakeReqToTokenPool:
@@ -126,6 +134,10 @@ def test_hsa_backend_init_forward_metadata_cuda(monkeypatch):
 
     hsa.init_forward_metadata(forward_batch)
     assert hsa.forward_metadata is not None
+    _vprint("### test_hsa_backend_init_forward_metadata_cuda")
+    _vprint(f"- page_table_1.shape={tuple(hsa.forward_metadata.page_table_1.shape)}")
+    _vprint(f"- real_page_table[0]={hsa.forward_metadata.real_page_table[0].tolist()}")
+    _vprint("=> Conclusion: HSAMetadata tables were constructed and dense metadata pointers exist.")
 
     # Dense backend init was called
     assert hsa._dense_backend.called_init is True
@@ -163,6 +175,9 @@ def test_hsa_backend_forward_delegates_to_dense_cuda(monkeypatch):
     assert hsa._dense_backend.called_decode == 1
 
     out2 = hsa.forward_extend(q, k, v, layer, forward_batch, save_kv_cache=False)
+    _vprint("### test_hsa_backend_forward_delegates_to_dense_cuda")
+    _vprint(f"- decode_out_unique={float(out.flatten()[0].item())} extend_out_unique={float(out2.flatten()[0].item())}")
+    _vprint("=> Conclusion: HSAAttnBackend delegates compute to dense backend in Phase-1.")
     assert out2.is_cuda
     assert torch.all(out2 == 5.0)
     assert hsa._dense_backend.called_extend == 1
