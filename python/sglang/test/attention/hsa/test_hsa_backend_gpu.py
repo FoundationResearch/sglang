@@ -94,7 +94,7 @@ def _make_minimal_hsa_backend(monkeypatch):
     server_args = types.SimpleNamespace(
         hsa_topk=64,
         hsa_selection_strategy="head",
-        hsa_layers=None,
+        hsa_layers="0",
         hsa_window_size=None,
         hsa_enable_swa_fusion=False,
     )
@@ -163,7 +163,8 @@ def test_hsa_backend_forward_delegates_to_dense_cuda(monkeypatch):
 
     # Minimal forward_batch required by signature (not used by dummy forward)
     forward_batch = types.SimpleNamespace(forward_mode=None)
-    layer = types.SimpleNamespace()
+    # Non-HSA layer => should still delegate to dense backend
+    layer = types.SimpleNamespace(layer_id=999, tp_q_head_num=1, qk_head_dim=1, v_head_dim=1)
 
     q = torch.randn((4, 128), device="cuda", dtype=torch.float16)
     k = torch.randn_like(q)

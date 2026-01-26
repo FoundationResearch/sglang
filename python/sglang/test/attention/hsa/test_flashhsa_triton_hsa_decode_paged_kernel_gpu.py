@@ -72,9 +72,9 @@ def test_flashhsa_triton_hsa_decode_paged_matches_torch_cuda():
     max_t = num_pages * page_size
     nloc = 4096
 
-    q = torch.randn((B, HQ, D), device=device, dtype=torch.float16)
-    k = torch.randn((nloc, H, D), device=device, dtype=torch.float16)
-    v = torch.randn((nloc, H, D), device=device, dtype=torch.float16)
+    q = torch.randn((B, HQ, D), device=device, dtype=torch.bfloat16)
+    k = torch.randn((nloc, H, D), device=device, dtype=torch.bfloat16)
+    v = torch.randn((nloc, H, D), device=device, dtype=torch.bfloat16)
 
     # Non-contiguous token_loc mapping: each token index maps to a random KV slot.
     page_table_1 = torch.randint(0, nloc, (B, max_t), device=device, dtype=torch.int32)
@@ -87,7 +87,7 @@ def test_flashhsa_triton_hsa_decode_paged_matches_torch_cuda():
         device=device,
         dtype=torch.int32,
     )
-    weights = torch.rand((B, HQ, TOPK), device=device, dtype=torch.float16)
+    weights = torch.rand((B, HQ, TOPK), device=device, dtype=torch.bfloat16)
     weights = weights / (weights.sum(dim=-1, keepdim=True) + 1e-6)
 
     sm_scale = float(D) ** -0.5
@@ -135,9 +135,9 @@ def test_flashhsa_triton_hsa_decode_paged_masks_lmk_slot_cuda():
     max_t = num_pages * page_size
     nloc = 2048
 
-    q = torch.randn((B, HQ, D), device=device, dtype=torch.float16)
-    k = torch.randn((nloc, H, D), device=device, dtype=torch.float16)
-    v = torch.randn((nloc, H, D), device=device, dtype=torch.float16)
+    q = torch.randn((B, HQ, D), device=device, dtype=torch.bfloat16)
+    k = torch.randn((nloc, H, D), device=device, dtype=torch.bfloat16)
+    v = torch.randn((nloc, H, D), device=device, dtype=torch.bfloat16)
 
     # Map token indices to a fixed KV slot sequence for page 0 so we can poison LMK slot.
     base = torch.randint(0, nloc - page_size, (1,), device=device, dtype=torch.int64).item()
@@ -150,7 +150,7 @@ def test_flashhsa_triton_hsa_decode_paged_masks_lmk_slot_cuda():
     v[lmk_loc, 0, :] = 10000.0
 
     selected_page_ids = torch.tensor([[[0]]], device=device, dtype=torch.int32)  # [B,H,K]
-    weights = torch.ones((B, HQ, TOPK), device=device, dtype=torch.float16)
+    weights = torch.ones((B, HQ, TOPK), device=device, dtype=torch.bfloat16)
     sm_scale = float(D) ** -0.5
 
     out_masked = hsa_decode_paged_fwd(
