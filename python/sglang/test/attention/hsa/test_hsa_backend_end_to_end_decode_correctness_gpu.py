@@ -284,6 +284,7 @@ def test_hsa_backend_end_to_end_decode_is_math_correct_cuda():
 
     # Sanity: backend and ref selection should match.
     torch.testing.assert_close(md.hsa_selected_page_ids, sel.selected_page_ids)
+    torch.testing.assert_close(md.hsa_selected_scores, sel.selected_scores)
 
     # --- Torch reference output ---
     ref = _torch_ref_hsa_decode_from_selected(
