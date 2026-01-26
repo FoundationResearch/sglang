@@ -145,6 +145,18 @@ def test_hsa_backend_end_to_end_decode_merged_is_math_correct_cuda():
     decode_len = 1
     total_len = prefill_len + decode_len  # 13 => completed_pages = 3, page 3 incomplete
 
+    _vprint("### GOLDEN TEST: decode merged (SWA→HSA→merged) end-to-end correctness")
+    _vprint(
+        "This is the highest-signal correctness test because it checks the full decode path:\n"
+        "- LMK-K gather -> selection -> selected_page_ids/scores\n"
+        "- SWA branch (windowed causal, LMK excluded) -> lse_swa\n"
+        "- (K+1)-way softmax weights over [scores, lse_swa]\n"
+        "- HSA paged Triton kernel output\n"
+        "- final merged output == torch reference"
+    )
+    _vprint(f"- dtype={dtype} B={B} H={H} HQ={HQ} D={D} page_size={page_size} topk={topk} window_size={window_size}")
+    _vprint(f"- prefill_len={prefill_len} decode_len={decode_len} total_len={total_len}")
+
     max_batch_size = 8
     max_context_len = 64
     max_total_num_tokens = max_batch_size * max_context_len
@@ -303,6 +315,10 @@ def test_hsa_backend_end_to_end_decode_merged_is_math_correct_cuda():
 
     torch.testing.assert_close(md.hsa_selected_page_ids, sel.selected_page_ids)
     torch.testing.assert_close(md.hsa_selected_scores, sel.selected_scores)
+    _vprint("### Step A: selection agreement (backend == torch ref)")
+    _vprint(f"- cand_page_ids={cand_page_ids[0].tolist()} cand_mask={cand_mask[0].tolist()}")
+    _vprint(f"- selected_page_ids(by_kv_head)={sel.selected_page_ids[0].tolist()}")
+    _vprint(f"- selected_scores(by_kv_head)={sel.selected_scores[0].tolist()}")
 
     # Torch SWA branch (out + lse)
     out_swa, lse_swa = _torch_swa_decode_window(
@@ -315,6 +331,8 @@ def test_hsa_backend_end_to_end_decode_merged_is_math_correct_cuda():
         window_size=window_size,
         sm_scale=layer.scaling,
     )
+    _vprint("### Step B: SWA branch (torch ref)")
+    _vprint(f"- lse_swa[0,:]={lse_swa[0].tolist()}")
 
     # Compute merged weights: softmax over [scores_q, lse_swa]
     scores_kv = sel.selected_scores.to(torch.float32)  # [B,H,K]
@@ -326,6 +344,9 @@ def test_hsa_backend_end_to_end_decode_merged_is_math_correct_cuda():
     w_all = torch.nan_to_num(w_all, nan=0.0)
     hsa_w = w_all[:, :, :topk]
     swa_w = w_all[:, :, topk]
+    _vprint("### Step C: merged weights (torch ref)")
+    _vprint(f"- hsa_w[0].tolist()={hsa_w[0].tolist()}")
+    _vprint(f"- swa_w[0].tolist()={swa_w[0].tolist()}")
 
     # Torch HSA branch with weights
     out_hsa = _torch_hsa_decode_from_weights(
@@ -347,6 +368,9 @@ def test_hsa_backend_end_to_end_decode_merged_is_math_correct_cuda():
     _vprint(f"- window_size={window_size} cand_page_ids={cand_page_ids[0].tolist()}")
     _vprint(f"- selected_page_ids={sel.selected_page_ids[0].tolist()}")
     _vprint(f"- max_abs_err={(out_backend_3.float() - out_ref).abs().max().item()}")
-    _vprint("=> Conclusion: decode merged (SWA→HSA→merged) matches torch reference.")
+    _vprint(
+        "=> GOLDEN CONCLUSION: backend decode merged output matches torch reference end-to-end "
+        "(selection + SWA lse + merged weights + HSA paged attention + final merge)."
+    )
 
 
