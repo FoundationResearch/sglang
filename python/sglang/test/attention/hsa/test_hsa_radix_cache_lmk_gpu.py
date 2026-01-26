@@ -40,7 +40,9 @@ def test_hsa_radix_cache_prefix_match_includes_lmk_and_is_page_aligned_cuda():
         enable_memory_saver=False,
         enable_alt_stream=False,
     )
-    allocator = TokenToKVPoolAllocator(size=1024, dtype=torch.int64, device=device, kvcache=kv_pool, need_sort=False)
+    allocator = TokenToKVPoolAllocator(
+        size=1024, dtype=torch.int64, device=device, kvcache=kv_pool, need_sort=False
+    )
 
     cache = RadixCache(
         CacheInitParams(
@@ -63,7 +65,9 @@ def test_hsa_radix_cache_prefix_match_includes_lmk_and_is_page_aligned_cuda():
     # Allocate token slots and populate req_to_token_pool for all engine-visible tokens.
     kv_slots1 = allocator.alloc(len(req1.fill_ids))
     assert kv_slots1 is not None
-    req_to_token_pool.req_to_token[req1.req_pool_idx, : len(req1.fill_ids)] = kv_slots1.to(torch.int32)
+    req_to_token_pool.req_to_token[req1.req_pool_idx, : len(req1.fill_ids)] = kv_slots1.to(
+        torch.int32
+    )
 
     # Cache the unfinished request (stores page-aligned prefix based on fill_ids).
     cache.cache_unfinished_req(req1)

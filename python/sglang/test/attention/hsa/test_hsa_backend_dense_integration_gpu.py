@@ -148,7 +148,7 @@ def test_hsa_backend_real_triton_decode_integration_cuda():
     k_new = torch.full((batch_size, num_heads, head_dim), 3.0, device=device, dtype=dtype)
     v_new = torch.zeros_like(k_new)
 
-    out_cache_loc = token_locs[-1:].to(torch.int64)  # last token loc, [7]
+    out_cache_loc = token_locs[-1:].to(torch.int64)  # last token loc
     forward_batch = ForwardBatch(
         forward_mode=ForwardMode.DECODE,
         batch_size=batch_size,
