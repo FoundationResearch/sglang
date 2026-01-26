@@ -35,7 +35,7 @@ def test_flash_hsa_autoconfig_and_registry(tmp_path: Path):
         "num_hidden_layers": 2,
         "num_attention_heads": 16,
         "num_key_value_heads": 4,
-        "use_sliding_window": True,
+        "use_sliding_window_fusion": True,
         # New name (requested); old name "sliding_window" should not be required.
         "sliding_window_fusion_size": 64,
         # FlashHSA scheduling pattern
@@ -50,7 +50,10 @@ def test_flash_hsa_autoconfig_and_registry(tmp_path: Path):
         f"loaded AutoConfig: model_type={c.model_type} arch={getattr(c,'architectures',None)}"
     )
 
+    from sglang.srt.configs.flash_hsa import FlashHSAConfig
+
     assert c.model_type == "flash_hsa"
+    assert isinstance(c, FlashHSAConfig)
     assert getattr(c, "architectures", None) == ["HSAForCausalLM"]
     assert getattr(c, "sliding_window_fusion_size", None) == 64
 
