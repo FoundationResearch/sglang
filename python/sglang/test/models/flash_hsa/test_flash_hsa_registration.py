@@ -38,6 +38,8 @@ def test_flash_hsa_autoconfig_and_registry(tmp_path: Path):
         "use_sliding_window_fusion": True,
         # New name (requested); old name "sliding_window" should not be required.
         "sliding_window_fusion_size": 64,
+        "use_sliding_window_attention": True,
+        "sliding_window_attention_size": 32,
         # FlashHSA scheduling pattern
         "full_attn_interleave": 4,
         "chunk_size": 64,
@@ -56,6 +58,7 @@ def test_flash_hsa_autoconfig_and_registry(tmp_path: Path):
     assert isinstance(c, FlashHSAConfig)
     assert getattr(c, "architectures", None) == ["HSAForCausalLM"]
     assert getattr(c, "sliding_window_fusion_size", None) == 64
+    assert getattr(c, "sliding_window_attention_size", None) == 32
 
     # Registry resolution
     from sglang.srt.models.registry import ModelRegistry
@@ -63,5 +66,36 @@ def test_flash_hsa_autoconfig_and_registry(tmp_path: Path):
     supported = set(ModelRegistry.get_supported_archs())
     _vprint(f"supported archs contains HSAForCausalLM? {'HSAForCausalLM' in supported}")
     assert "HSAForCausalLM" in supported
+
+
+def test_flash_hsa_window_size_fallback_warns(tmp_path: Path):
+    import sglang.srt.configs  # noqa: F401
+    from transformers import AutoConfig
+
+    cfg_path = tmp_path / "config.json"
+    cfg = {
+        "model_type": "flash_hsa",
+        "architectures": ["HSAForCausalLM"],
+        "vocab_size": 100278,
+        "hidden_size": 1024,
+        "intermediate_size": 4096,
+        "num_hidden_layers": 2,
+        "num_attention_heads": 16,
+        "num_key_value_heads": 4,
+        # Only provide fusion window size; attention window should fallback with a warning.
+        "use_sliding_window_fusion": True,
+        "sliding_window_fusion_size": 64,
+        "use_sliding_window_attention": True,
+        "full_attn_interleave": 4,
+        "chunk_size": 64,
+        "tie_word_embeddings": True,
+    }
+    cfg_path.write_text(json.dumps(cfg), encoding="utf-8")
+
+    with pytest.warns(UserWarning, match="sliding_window_attention_size"):
+        c = AutoConfig.from_pretrained(str(tmp_path), trust_remote_code=True)
+
+    assert getattr(c, "sliding_window_fusion_size", None) == 64
+    assert getattr(c, "sliding_window_attention_size", None) == 64
 
 
