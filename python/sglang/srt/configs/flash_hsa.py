@@ -13,7 +13,6 @@ We also register this config with Transformers AutoConfig mapping so that
 
 from __future__ import annotations
 
-import warnings
 from typing import Literal, Optional
 
 from transformers.configuration_utils import PretrainedConfig, layer_type_validation
@@ -43,6 +42,14 @@ class FlashHSAConfig(PretrainedConfig):
         rope_scaling=None,
         attention_bias: bool = False,
         attention_dropout: float = 0.0,
+        # ---- Official FlashHSA-format knobs (compat input) ----
+        # Upstream uses a single window size for both:
+        # - HSA-layer fusion SWA
+        # - standalone sliding window attention layers
+        #
+        # We accept these keys and map them into the split knobs below.
+        use_sliding_window: Optional[bool] = None,
+        sliding_window: Optional[int] = None,
         # Sliding window for HSA-layer fusion SWA (inside HierarchicalSparseAttention).
         use_sliding_window_fusion: bool = False,
         sliding_window_fusion_size: Optional[int] = None,
@@ -79,43 +86,70 @@ class FlashHSAConfig(PretrainedConfig):
         self.attention_bias = attention_bias
         self.attention_dropout = attention_dropout
 
-        self.use_sliding_window_fusion = bool(use_sliding_window_fusion)
-        self.use_sliding_window_attention = bool(use_sliding_window_attention)
-
-        self.sliding_window_fusion_size = (
-            int(sliding_window_fusion_size) if sliding_window_fusion_size is not None else None
-        )
-        self.sliding_window_attention_size = (
-            int(sliding_window_attention_size)
-            if sliding_window_attention_size is not None
-            else None
-        )
-
-        # If only one window size is provided, default the other to the same value and warn.
-        if self.sliding_window_fusion_size is None and self.sliding_window_attention_size is not None:
-            self.sliding_window_fusion_size = int(self.sliding_window_attention_size)
-            warnings.warn(
-                "FlashHSAConfig: `sliding_window_fusion_size` is not set; "
-                "falling back to `sliding_window_attention_size` to keep them consistent.",
-                stacklevel=2,
+        # ---- Sliding window config semantics ----
+        # Two supported input formats:
+        #   A) Official FlashHSA: (use_sliding_window, sliding_window)
+        #      -> mapped to BOTH fusion + attention windows
+        #   B) Split SGLang: (use_sliding_window_fusion, sliding_window_fusion_size) and
+        #                   (use_sliding_window_attention, sliding_window_attention_size)
+        #
+        # We do NOT allow mixing formats to avoid ambiguous intent.
+        if use_sliding_window is not None or sliding_window is not None:
+            if (
+                use_sliding_window_fusion
+                or use_sliding_window_attention
+                or sliding_window_fusion_size is not None
+                or sliding_window_attention_size is not None
+            ):
+                raise ValueError(
+                    "FlashHSAConfig: do not mix official keys "
+                    "(`use_sliding_window`, `sliding_window`) with split keys "
+                    "(`use_sliding_window_fusion`, `sliding_window_fusion_size`, "
+                    "`use_sliding_window_attention`, `sliding_window_attention_size`)."
+                )
+            if use_sliding_window is None:
+                raise ValueError(
+                    "FlashHSAConfig: official format requires `use_sliding_window` "
+                    "when `sliding_window` is provided."
+                )
+            if bool(use_sliding_window):
+                if sliding_window is None:
+                    raise ValueError(
+                        "FlashHSAConfig: official format requires `sliding_window` "
+                        "when `use_sliding_window=True`."
+                    )
+                w = int(sliding_window)
+                self.use_sliding_window_fusion = True
+                self.sliding_window_fusion_size = w
+                self.use_sliding_window_attention = True
+                self.sliding_window_attention_size = w
+            else:
+                self.use_sliding_window_fusion = False
+                self.sliding_window_fusion_size = None
+                self.use_sliding_window_attention = False
+                self.sliding_window_attention_size = None
+        else:
+            # Split format (no implicit fallback between the two sizes)
+            self.use_sliding_window_fusion = bool(use_sliding_window_fusion)
+            self.use_sliding_window_attention = bool(use_sliding_window_attention)
+            self.sliding_window_fusion_size = (
+                int(sliding_window_fusion_size)
+                if sliding_window_fusion_size is not None
+                else None
             )
-        if self.sliding_window_attention_size is None and self.sliding_window_fusion_size is not None:
-            self.sliding_window_attention_size = int(self.sliding_window_fusion_size)
-            warnings.warn(
-                "FlashHSAConfig: `sliding_window_attention_size` is not set; "
-                "falling back to `sliding_window_fusion_size` to keep them consistent.",
-                stacklevel=2,
+            self.sliding_window_attention_size = (
+                int(sliding_window_attention_size)
+                if sliding_window_attention_size is not None
+                else None
             )
-
-        # Enforce that if a mode is enabled, its window size must be available.
-        if self.use_sliding_window_fusion and self.sliding_window_fusion_size is None:
-            raise ValueError(
-                "FlashHSAConfig: `use_sliding_window_fusion=True` requires `sliding_window_fusion_size`."
-            )
-        if self.use_sliding_window_attention and self.sliding_window_attention_size is None:
-            raise ValueError(
-                "FlashHSAConfig: `use_sliding_window_attention=True` requires `sliding_window_attention_size`."
-            )
+            if self.use_sliding_window_fusion and self.sliding_window_fusion_size is None:
+                raise ValueError(
+                    "FlashHSAConfig: `use_sliding_window_fusion=True` requires `sliding_window_fusion_size`."
+                )
+            if self.use_sliding_window_attention and self.sliding_window_attention_size is None:
+                raise ValueError(
+                    "FlashHSAConfig: `use_sliding_window_attention=True` requires `sliding_window_attention_size`."
+                )
 
         self.max_window_layers = max_window_layers
 
