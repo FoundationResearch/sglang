@@ -106,6 +106,19 @@ class HSAAttnBackend(AttentionBackend):
     def _get_effective_window_size(self) -> Optional[int]:
         if self.hsa_window_size is not None:
             return int(self.hsa_window_size)
+        # FlashHSA: allow separate fusion window size (distinct from standalone SWA layers).
+        get_fusion_window = getattr(
+            getattr(self.model_runner, "model", None),
+            "get_flashhsa_fusion_sliding_window_size",
+            None,
+        )
+        if callable(get_fusion_window):
+            try:
+                w = get_fusion_window()
+                if w is not None:
+                    return int(w)
+            except Exception:
+                pass
         if getattr(self.model_runner, "sliding_window_size", None) is not None:
             return int(self.model_runner.sliding_window_size)
         return None

@@ -13,6 +13,7 @@ We also register this config with Transformers AutoConfig mapping so that
 
 from __future__ import annotations
 
+import warnings
 from typing import Literal, Optional
 
 from transformers.configuration_utils import PretrainedConfig, layer_type_validation
@@ -42,9 +43,12 @@ class FlashHSAConfig(PretrainedConfig):
         rope_scaling=None,
         attention_bias: bool = False,
         attention_dropout: float = 0.0,
-        # Sliding window (Fusion SWA/HSA)
+        # Sliding window for HSA-layer fusion SWA (inside HierarchicalSparseAttention).
         use_sliding_window_fusion: bool = False,
         sliding_window_fusion_size: Optional[int] = None,
+        # Sliding window for standalone sliding-window attention layers (layer_types == "sliding_attention").
+        use_sliding_window_attention: bool = False,
+        sliding_window_attention_size: Optional[int] = None,
         max_window_layers: int = 28,
         layer_types=None,
         # HSA specifics
@@ -76,11 +80,42 @@ class FlashHSAConfig(PretrainedConfig):
         self.attention_dropout = attention_dropout
 
         self.use_sliding_window_fusion = bool(use_sliding_window_fusion)
+        self.use_sliding_window_attention = bool(use_sliding_window_attention)
+
         self.sliding_window_fusion_size = (
-            int(sliding_window_fusion_size)
-            if sliding_window_fusion_size is not None
+            int(sliding_window_fusion_size) if sliding_window_fusion_size is not None else None
+        )
+        self.sliding_window_attention_size = (
+            int(sliding_window_attention_size)
+            if sliding_window_attention_size is not None
             else None
         )
+
+        # If only one window size is provided, default the other to the same value and warn.
+        if self.sliding_window_fusion_size is None and self.sliding_window_attention_size is not None:
+            self.sliding_window_fusion_size = int(self.sliding_window_attention_size)
+            warnings.warn(
+                "FlashHSAConfig: `sliding_window_fusion_size` is not set; "
+                "falling back to `sliding_window_attention_size` to keep them consistent.",
+                stacklevel=2,
+            )
+        if self.sliding_window_attention_size is None and self.sliding_window_fusion_size is not None:
+            self.sliding_window_attention_size = int(self.sliding_window_fusion_size)
+            warnings.warn(
+                "FlashHSAConfig: `sliding_window_attention_size` is not set; "
+                "falling back to `sliding_window_fusion_size` to keep them consistent.",
+                stacklevel=2,
+            )
+
+        # Enforce that if a mode is enabled, its window size must be available.
+        if self.use_sliding_window_fusion and self.sliding_window_fusion_size is None:
+            raise ValueError(
+                "FlashHSAConfig: `use_sliding_window_fusion=True` requires `sliding_window_fusion_size`."
+            )
+        if self.use_sliding_window_attention and self.sliding_window_attention_size is None:
+            raise ValueError(
+                "FlashHSAConfig: `use_sliding_window_attention=True` requires `sliding_window_attention_size`."
+            )
 
         self.max_window_layers = max_window_layers
 

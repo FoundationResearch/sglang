@@ -55,6 +55,14 @@ def _get_sliding_window_fusion_size(config) -> Optional[int]:
     return None
 
 
+def _get_sliding_window_attention_size(config) -> Optional[int]:
+    if hasattr(config, "sliding_window_attention_size") and getattr(
+        config, "sliding_window_attention_size"
+    ) is not None:
+        return int(getattr(config, "sliding_window_attention_size"))
+    return None
+
+
 def _get_flashhsa_padded_vocab_size(config) -> int:
     base_vocab_size = int(getattr(config, "vocab_size"))
     # FlashHSA: lmk_id == base_vocab_size, so embeddings must have >= base_vocab_size + 1 rows.
@@ -152,9 +160,14 @@ class HSAForCausalLM(_Qwen3ForCausalLM):
     # ---- FlashHSA-specific helpers for engine ----
 
     def get_attention_sliding_window_size(self) -> Optional[int]:
-        # This value is used by ModelRunner to configure SWA window indices for backends.
-        use_sw = bool(getattr(self.config, "use_sliding_window_fusion", False))
-        if not use_sw:
+        # Used by ModelRunner to configure standalone sliding-window attention layers.
+        if not bool(getattr(self.config, "use_sliding_window_attention", False)):
+            return None
+        return _get_sliding_window_attention_size(self.config)
+
+    def get_flashhsa_fusion_sliding_window_size(self) -> Optional[int]:
+        # Used by HSAAttnBackend selection (SWA→HSA exclusion) / future fused kernels.
+        if not bool(getattr(self.config, "use_sliding_window_fusion", False)):
             return None
         return _get_sliding_window_fusion_size(self.config)
 
