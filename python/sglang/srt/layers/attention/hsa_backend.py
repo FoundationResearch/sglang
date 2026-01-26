@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import re
 from typing import TYPE_CHECKING, Optional, Set
 
@@ -21,6 +22,24 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
     from sglang.srt.model_executor.model_runner import ModelRunner
     from sglang.srt.speculative.spec_info import SpecInput
+
+
+logger = logging.getLogger(__name__)
+
+_COMPILED_FLEX_ATTN = None
+_FLEX_FALLBACK_WARNED = False
+
+
+def _get_compiled_flex_attention():
+    """Return a cached torch.compile'd flex_attention callable (best-effort)."""
+    global _COMPILED_FLEX_ATTN
+    if _COMPILED_FLEX_ATTN is not None:
+        return _COMPILED_FLEX_ATTN
+    from torch.nn.attention.flex_attention import flex_attention
+
+    # Compiling the base entrypoint (as recommended by PyTorch) avoids the unfused slow path.
+    _COMPILED_FLEX_ATTN = torch.compile(flex_attention, dynamic=False)
+    return _COMPILED_FLEX_ATTN
 
 
 class HSAAttnBackend(AttentionBackend):
@@ -442,7 +461,8 @@ class HSAAttnBackend(AttentionBackend):
                 lse_swa = torch.full((B, HQ), float("-inf"), device=q3.device, dtype=torch.float32)
 
                 try:
-                    from torch.nn.attention.flex_attention import flex_attention, create_block_mask
+                    from torch.nn.attention.flex_attention import create_block_mask
+                    flex_attn = _get_compiled_flex_attention()
 
                     seq_lens_i64 = md.cache_seqlens_int32.to(torch.int64)
                     for b in range(B):
@@ -481,19 +501,40 @@ class HSAAttnBackend(AttentionBackend):
                         block_mask = create_block_mask(
                             block_causal_mask, B=None, H=None, Q_LEN=1, KV_LEN=int(window_size)
                         )
-                        o, lse = flex_attention(
-                            q_b,
-                            k_win,
-                            v_win,
-                            block_mask=block_mask,
-                            enable_gqa=True,
-                            return_lse=True,
-                        )  # o: [1,HQ,1,D], lse: [1,HQ,1]
+                        # Newer PyTorch uses return_aux; keep a backward-compatible fallback.
+                        try:
+                            from torch.nn.attention.flex_attention import AuxRequest
+
+                            o, aux = flex_attn(
+                                q_b,
+                                k_win,
+                                v_win,
+                                block_mask=block_mask,
+                                enable_gqa=True,
+                                return_aux=AuxRequest(lse=True),
+                            )
+                            lse = aux.lse
+                        except Exception:
+                            o, lse = flex_attn(
+                                q_b,
+                                k_win,
+                                v_win,
+                                block_mask=block_mask,
+                                enable_gqa=True,
+                                return_lse=True,
+                            )  # o: [1,HQ,1,D], lse: [1,HQ,1]
 
                         out_swa[b] = o.squeeze(0).squeeze(1).to(torch.float32)
                         lse_swa[b] = lse.squeeze(0).squeeze(1).to(torch.float32)
                 except Exception:
                     # Fallback to a simple torch implementation (kept for robustness across torch versions).
+                    global _FLEX_FALLBACK_WARNED
+                    if not _FLEX_FALLBACK_WARNED:
+                        _FLEX_FALLBACK_WARNED = True
+                        logger.warning(
+                            "FlashHSA SWA branch: flex_attention failed; falling back to slow torch impl. "
+                            "This may be much slower. Set SGLANG_HSA_TEST_VERBOSE=1 for more context."
+                        )
                     seq_lens_i64 = md.cache_seqlens_int32.to(torch.int64)
                     for b in range(B):
                         seqlen = int(seq_lens_i64[b].item())
