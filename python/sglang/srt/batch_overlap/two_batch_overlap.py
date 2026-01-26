@@ -598,6 +598,8 @@ class TboForwardBatchPreparer:
             child_b.extend_prefix_lens,
             child_b.extend_seq_lens,
             child_b.extend_num_tokens,
+            page_size=int(get_global_server_args().page_size),
+            enable_landmark_positions=(get_global_server_args().attention_backend == "hsa"),
         )
 
     @classmethod
