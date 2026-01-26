@@ -1,3 +1,4 @@
+import os
 import types
 
 import pytest
@@ -9,6 +10,13 @@ import torch
 from sglang.srt.layers import dp_attention as _dp_attn
 
 _dp_attn.get_attention_tp_size = lambda: 1  # TP size = 1 for unit test
+
+_HSA_VERBOSE = os.getenv("SGLANG_HSA_TEST_VERBOSE", "0") == "1"
+
+
+def _vprint(*args):
+    if _HSA_VERBOSE:
+        print(*args, flush=True)
 
 
 pytestmark = pytest.mark.skipif(
@@ -174,6 +182,11 @@ def test_hsa_backend_real_triton_decode_integration_cuda():
     assert md.hsa_selected_page_ids is not None
     # [B, H, K] with K=64 by default; first entry should be page 0, and page 1 must not appear.
     selected = md.hsa_selected_page_ids[0, 0].tolist()
+    _vprint("### test_hsa_backend_real_triton_decode_integration_cuda")
+    _vprint(f"- page_size={page_size} total_len={total_len} completed_pages={total_len // page_size}")
+    _vprint(f"- token_locs={token_locs.tolist()}")
+    _vprint(f"- selected_page_ids(head0)={selected[:8]} ...")
+    _vprint("=> Conclusion: selection ran and excluded non-completed pages under LMK semantics.")
     assert 0 in selected
     assert 1 not in selected
 
