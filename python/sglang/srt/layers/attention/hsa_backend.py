@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, Optional, Set
 import torch
 
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
+from sglang.srt.layers.attention.hsa.kernels import hsa_decode_paged_fwd
 from sglang.srt.layers.attention.hsa.metadata import HSAMetadata
 from sglang.srt.layers.attention.hsa.selector import (
     build_active_page_candidates,
@@ -43,16 +44,28 @@ class HSAAttnBackend(AttentionBackend):
         self.device = model_runner.device
         self.page_size = model_runner.page_size
 
-        # Minimal config from CLI (stored for future HSA logic)
-        self.hsa_topk = getattr(model_runner.server_args, "hsa_topk", 64)
-        self.hsa_selection_strategy = getattr(
-            model_runner.server_args, "hsa_selection_strategy", "head"
+        # HSA config resolution (override-only server args; model config is source-of-truth).
+        server_args = getattr(model_runner, "server_args", None)
+        cfg = getattr(getattr(model_runner, "model", None), "config", None)
+
+        default_topk = getattr(cfg, "hsa_topk", 64)
+        override_topk = getattr(server_args, "hsa_topk", None)
+        self.hsa_topk = int(override_topk) if override_topk is not None else int(default_topk)
+
+        default_sel = getattr(cfg, "hsa_selection_strategy", "head")
+        override_sel = getattr(server_args, "hsa_selection_strategy", None)
+        self.hsa_selection_strategy = (
+            str(override_sel) if override_sel is not None else str(default_sel)
         )
-        self.hsa_layers = getattr(model_runner.server_args, "hsa_layers", None)
+
+        self.hsa_layers = getattr(server_args, "hsa_layers", None)
         self._hsa_layer_ids: Optional[Set[int]] = self._resolve_hsa_layer_ids()
-        self.hsa_window_size = getattr(model_runner.server_args, "hsa_window_size", None)
-        self.hsa_enable_swa_fusion = getattr(
-            model_runner.server_args, "hsa_enable_swa_fusion", False
+
+        self.hsa_window_size = getattr(server_args, "hsa_window_size", None)
+        default_fusion = bool(getattr(cfg, "enable_swa_hsa_fusion", False))
+        override_fusion = getattr(server_args, "hsa_enable_swa_fusion", None)
+        self.hsa_enable_swa_fusion = (
+            bool(override_fusion) if override_fusion is not None else bool(default_fusion)
         )
 
         # Delegate dense attention implementation for now.
@@ -324,14 +337,85 @@ class HSAAttnBackend(AttentionBackend):
         save_kv_cache: bool = True,
         **kwargs,
     ):
-        # Step 4: run selection (SWA→HSA) to populate metadata; compute still uses dense backend.
+        # Step 4: run selection (SWA→HSA) to populate metadata.
         self._run_selection_decode(q=q, layer=layer, forward_batch=forward_batch)
-        # Phase 1: delegate to dense attention backend for correctness/runability.
-        # Phase 2+: replace with HSA selection + paged HSA kernel.
-        out = self._dense_backend.forward_decode(
-            q, k, v, layer, forward_batch, save_kv_cache=save_kv_cache, **kwargs
+
+        # Non-HSA layers: delegate to dense backend.
+        if not self._is_hsa_layer(layer.layer_id):
+            return self._dense_backend.forward_decode(
+                q, k, v, layer, forward_batch, save_kv_cache=save_kv_cache, **kwargs
+            )
+
+        if self.hsa_enable_swa_fusion:
+            raise NotImplementedError(
+                "SWA→HSA fusion is not wired in HSAAttnBackend yet. "
+                "For now, run with --no-hsa-enable-swa-fusion (or config enable_swa_hsa_fusion=false)."
+            )
+
+        md = self.forward_metadata
+        pool = getattr(forward_batch, "token_to_kv_pool", None)
+        if md is None or pool is None:
+            return self._dense_backend.forward_decode(
+                q, k, v, layer, forward_batch, save_kv_cache=save_kv_cache, **kwargs
+            )
+
+        # Save current KV into the paged KV cache (same as TritonAttnBackend).
+        if save_kv_cache:
+            pool.set_kv_buffer(layer, forward_batch.out_cache_loc, k, v)
+
+        # Prepare q: [B, HQ, D]
+        q = q.reshape(-1, layer.tp_q_head_num * layer.qk_head_dim)
+        q3 = q.view(-1, layer.tp_q_head_num, layer.qk_head_dim)
+
+        if layer.qk_head_dim != layer.v_head_dim:
+            raise NotImplementedError(
+                "HSAAttnBackend.hsa_decode_paged_fwd currently assumes qk_head_dim == v_head_dim."
+            )
+
+        # Robustness: overlay out_cache_loc into a temporary token->slot table at position (seq_len - 1).
+        page_table_1 = md.page_table_1
+        if getattr(forward_batch, "out_cache_loc", None) is not None:
+            seq_lens_i64 = md.cache_seqlens_int32.to(torch.int64)
+            B = int(forward_batch.batch_size)
+            if B > 0:
+                page_table_1 = page_table_1.clone()
+                out_locs = forward_batch.out_cache_loc[:B].to(torch.int32)
+                for b in range(B):
+                    seqlen = int(seq_lens_i64[b].item())
+                    if seqlen > 0 and seqlen <= page_table_1.shape[1]:
+                        page_table_1[b, seqlen - 1] = out_locs[b]
+
+        # Weights: softmax over selected scores (HSA-only; no SWA fusion yet).
+        selected_page_ids = md.hsa_selected_page_ids  # [B, H, K]
+        selected_scores = md.hsa_selected_scores  # [B, H, K]
+        valid = selected_page_ids >= 0
+        scores = selected_scores.masked_fill(~valid, float("-inf"))
+        w_kv = torch.softmax(scores, dim=-1)
+        w_kv = torch.nan_to_num(w_kv, nan=0.0).to(q3.dtype)
+
+        H = int(layer.tp_k_head_num)
+        HQ = int(layer.tp_q_head_num)
+        assert HQ % H == 0
+        G = HQ // H
+        w_q = (
+            w_kv[:, :, None, :]
+            .expand(w_kv.shape[0], H, G, w_kv.shape[2])
+            .reshape(w_kv.shape[0], HQ, w_kv.shape[2])
+            .contiguous()
         )
-        return out
+
+        out3 = hsa_decode_paged_fwd(
+            q=q3,
+            k_cache=pool.get_key_buffer(layer.layer_id),
+            v_cache=pool.get_value_buffer(layer.layer_id),
+            page_table_1=page_table_1,
+            selected_page_ids=selected_page_ids,
+            hsa_weights=w_q,
+            page_size=int(self.page_size),
+            sm_scale=getattr(layer, "scaling", None),
+            mask_last_token=True,
+        )
+        return out3.reshape(q.shape[0], layer.tp_q_head_num * layer.v_head_dim)
 
     def forward_extend(
         self,

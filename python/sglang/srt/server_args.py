@@ -440,11 +440,14 @@ class ServerArgs:
     nsa_decode_backend: str = "fa3"
     # HSA (Hierarchical Sparse Attention)
     # NOTE: HSA requires page_size == chunk_size (see dev/hsa_dev_roadmap.md).
-    hsa_topk: int = 64
-    hsa_selection_strategy: str = "head"
+    # Override-only semantics:
+    # - If None => read from model config (e.g., FlashHSAConfig) or backend defaults.
+    # - If set  => force override model config (useful for debugging/experiments).
+    hsa_topk: Optional[int] = None
+    hsa_selection_strategy: Optional[str] = None
     hsa_layers: Optional[str] = None
     hsa_window_size: Optional[int] = None
-    hsa_enable_swa_fusion: bool = False
+    hsa_enable_swa_fusion: Optional[bool] = None
     # Landmark token id (LMK). By default we follow FlashHSA: lmk_id == vocab_size.
     # This id must be valid for the loaded model weights (embedding/lm_head).
     hsa_lmk_id: int = -1
@@ -3549,14 +3552,16 @@ class ServerArgs:
             "--hsa-topk",
             type=int,
             default=ServerArgs.hsa_topk,
-            help="Top-k pages/chunks to attend for HSA. Only used when --attention-backend hsa.",
+            help="(Override-only) Top-k pages/chunks to attend for HSA. If unset, read from model config. "
+            "Only used when --attention-backend hsa.",
         )
         parser.add_argument(
             "--hsa-selection-strategy",
             type=str,
             default=ServerArgs.hsa_selection_strategy,
             choices=["group", "head", "softmax_head"],
-            help="HSA selection strategy. Only used when --attention-backend hsa.",
+            help="(Override-only) HSA selection strategy. If unset, read from model config/backend defaults. "
+            "Only used when --attention-backend hsa.",
         )
         parser.add_argument(
             "--hsa-layers",
@@ -3569,13 +3574,15 @@ class ServerArgs:
             "--hsa-window-size",
             type=int,
             default=ServerArgs.hsa_window_size,
-            help="Optional sliding window size for HSA masking/fusion. Only used when --attention-backend hsa.",
+            help="(Override-only) Optional sliding window size for HSA masking/fusion. If unset, read from model "
+            "config or backend defaults. Only used when --attention-backend hsa.",
         )
         parser.add_argument(
             "--hsa-enable-swa-fusion",
-            action="store_true",
+            action=argparse.BooleanOptionalAction,
             default=ServerArgs.hsa_enable_swa_fusion,
-            help="If set, enable SWA/dense fusion path for HSA (planned). Only used when --attention-backend hsa.",
+            help="(Override-only) Enable SWA→HSA fusion for FlashHSA semantics. If unset, read from model config. "
+            "Only used when --attention-backend hsa.",
         )
         parser.add_argument(
             "--hsa-lmk-id",

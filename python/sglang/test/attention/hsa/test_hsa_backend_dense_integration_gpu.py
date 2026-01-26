@@ -73,7 +73,7 @@ def test_hsa_backend_real_triton_decode_integration_cuda():
     from sglang.srt.layers.attention.hsa_backend import HSAAttnBackend
 
     device = "cuda"
-    dtype = torch.float16
+    dtype = torch.bfloat16
 
     # Keep shapes tiny to reduce compile time.
     batch_size = 1
