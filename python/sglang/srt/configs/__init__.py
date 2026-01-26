@@ -23,6 +23,9 @@ from sglang.srt.configs.step3_vl import (
     Step3VLConfig,
 )
 
+# Side-effect import: register FlashHSA ("flash_hsa") as a known HF config type.
+import sglang.srt.configs.flash_hsa  # noqa: F401
+
 __all__ = [
     "AfmoeConfig",
     "ExaoneConfig",
