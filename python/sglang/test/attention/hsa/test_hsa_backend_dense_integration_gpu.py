@@ -37,6 +37,8 @@ class _MinimalModelConfig:
 
 class _MinimalServerArgs:
     def __init__(self):
+        # Attention backend name (read by TritonAttnBackend for FlashHSA semantics).
+        self.attention_backend = "hsa"
         # Speculative (unused in this test, but required by TritonAttnBackend __init__)
         self.speculative_num_draft_tokens = 0
         self.speculative_num_steps = 0

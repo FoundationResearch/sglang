@@ -484,7 +484,12 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         # Init position information
         if ret.forward_mode.is_decode() or ret.forward_mode.is_target_verify():
             if ret.positions is None:
-                ret.positions = clamp_position(batch.seq_lens)
+                if model_runner.server_args.attention_backend == "hsa":
+                    ret.positions = compute_decode_positions_landmark(
+                        batch.seq_lens, page_size=int(model_runner.page_size)
+                    )
+                else:
+                    ret.positions = clamp_position(batch.seq_lens)
         else:
             assert isinstance(batch.extend_seq_lens, list)
             assert isinstance(batch.extend_prefix_lens, list)
@@ -500,6 +505,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 ret.extend_prefix_lens,
                 ret.extend_seq_lens,
                 ret.extend_num_tokens,
+                page_size=int(model_runner.page_size),
+                enable_landmark_positions=(model_runner.server_args.attention_backend == "hsa"),
             )
             if ret.positions is None:
                 ret.positions = positions
@@ -990,7 +997,28 @@ def compute_position(
     extend_prefix_lens: torch.Tensor,
     extend_seq_lens: torch.Tensor,
     extend_seq_lens_sum: int,
+    *,
+    page_size: Optional[int] = None,
+    enable_landmark_positions: bool = False,
 ):
+    """Compute rotary positions for EXTEND-style batches.
+
+    Default behavior: positions are contiguous ranges [prefix_len, prefix_len+extend_len).
+
+    FlashHSA landmark semantics: LMK token repeats the previous real token's position.
+    Given engine-visible token index g (0-based), the position id is:
+      pos(g) = g - floor((g+1)/page_size)
+
+    We enable this only when `enable_landmark_positions=True` and `page_size` is provided.
+    """
+    if enable_landmark_positions:
+        if page_size is None or int(page_size) <= 0:
+            raise ValueError("page_size must be provided when enable_landmark_positions=True")
+        positions, extend_start_loc = compute_position_landmark_torch(
+            extend_prefix_lens, extend_seq_lens, page_size=int(page_size)
+        )
+        return positions, extend_start_loc
+
     if support_triton(attn_backend):
         positions, extend_start_loc = compute_position_triton(
             extend_prefix_lens,
@@ -1002,6 +1030,19 @@ def compute_position(
             extend_prefix_lens, extend_seq_lens
         )
     return positions, extend_start_loc
+
+
+def compute_decode_positions_landmark(seq_lens: torch.Tensor, *, page_size: int) -> torch.Tensor:
+    """Compute decode positions with FlashHSA landmark semantics.
+
+    seq_lens are engine-visible lengths (including LMKs).
+    """
+    page_size = int(page_size)
+    if page_size <= 0:
+        raise ValueError("page_size must be > 0")
+    # last token index g = seq_len - 1; handle seq_len==0 safely.
+    g = torch.clamp(seq_lens.to(torch.int64) - 1, min=0)
+    return g - torch.div((g + 1), page_size, rounding_mode="floor")
 
 
 def compute_position_triton(
@@ -1069,6 +1110,29 @@ def compute_position_torch(
                 prefix_len, prefix_len + extend_len, device=extend_prefix_lens.device
             )
             for prefix_len, extend_len in zip(extend_prefix_lens, extend_seq_lens)
+        ],
+        axis=0,
+    )
+    extend_start_loc = torch.zeros_like(extend_seq_lens)
+    extend_start_loc[1:] = torch.cumsum(extend_seq_lens[:-1], dim=0)
+    return positions.to(torch.int64), extend_start_loc
+
+
+def compute_position_landmark_torch(
+    extend_prefix_lens: torch.Tensor,
+    extend_seq_lens: torch.Tensor,
+    *,
+    page_size: int,
+):
+    """Torch reference for FlashHSA landmark position ids (extend)."""
+    page_size = int(page_size)
+    positions = torch.cat(
+        [
+            (
+                (g := torch.arange(prefix_len, prefix_len + extend_len, device=extend_prefix_lens.device))
+                - torch.div((g + 1), page_size, rounding_mode="floor")
+            )
+            for prefix_len, extend_len in zip(extend_prefix_lens.to(torch.int64), extend_seq_lens.to(torch.int64))
         ],
         axis=0,
     )

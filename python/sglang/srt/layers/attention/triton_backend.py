@@ -82,6 +82,11 @@ class TritonAttnBackend(AttentionBackend):
         self.skip_prefill = skip_prefill
         max_bs = model_runner.req_to_token_pool.size
         self.sliding_window_size = model_runner.sliding_window_size
+        self._attn_backend_name = getattr(model_runner.server_args, "attention_backend", None)
+        _ps = getattr(model_runner, "page_size", None)
+        if _ps is None:
+            _ps = getattr(model_runner.server_args, "page_size", None)
+        self._page_size = int(_ps) if _ps is not None else 0
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
         self.token_to_kv_pool_allocator = model_runner.token_to_kv_pool_allocator
         self.num_draft_tokens = model_runner.server_args.speculative_num_draft_tokens
@@ -239,37 +244,77 @@ class TritonAttnBackend(AttentionBackend):
 
         if forward_batch.forward_mode.is_decode_or_idle():
             if spec_info is None:
-                kv_indptr[1 : bs + 1] = torch.cumsum(forward_batch.seq_lens, dim=0)
-                kv_indptr = kv_indptr[: bs + 1]
-                kv_indices = torch.empty(
-                    forward_batch.seq_lens_sum, dtype=torch.int64, device=self.device
-                )
-                create_flashinfer_kv_indices_triton[(bs,)](
-                    self.req_to_token,
-                    forward_batch.req_pool_indices,
-                    forward_batch.seq_lens,
-                    kv_indptr,
-                    None,
-                    kv_indices,
-                    self.req_to_token.stride(0),
-                )
+                if self._attn_backend_name == "hsa":
+                    # FlashHSA mask semantics: LMK tokens are written to KV but never attended as KV.
+                    # Exclude LMK slots from kv_indices.
+                    pos = torch.arange(
+                        int(forward_batch.seq_lens.max().item()),
+                        device=self.device,
+                        dtype=torch.int64,
+                    )
+                    page_table = self.req_to_token[
+                        forward_batch.req_pool_indices, : pos.numel()
+                    ]
+                    valid = pos[None, :] < forward_batch.seq_lens.to(torch.int64)[:, None]
+                    keep = valid & ((pos[None, :] + 1) % int(self._page_size) != 0)
+                    kv_lens = keep.sum(dim=1, dtype=torch.int32)
+                    kv_indptr[1 : bs + 1] = torch.cumsum(kv_lens, dim=0)
+                    kv_indptr = kv_indptr[: bs + 1]
+                    kv_indices = page_table[keep].to(torch.int64)
+                else:
+                    kv_indptr[1 : bs + 1] = torch.cumsum(forward_batch.seq_lens, dim=0)
+                    kv_indptr = kv_indptr[: bs + 1]
+                    kv_indices = torch.empty(
+                        forward_batch.seq_lens_sum, dtype=torch.int64, device=self.device
+                    )
+                    create_flashinfer_kv_indices_triton[(bs,)](
+                        self.req_to_token,
+                        forward_batch.req_pool_indices,
+                        forward_batch.seq_lens,
+                        kv_indptr,
+                        None,
+                        kv_indices,
+                        self.req_to_token.stride(0),
+                    )
                 # Sliding window
                 if (
                     self.sliding_window_size is not None
                     and self.sliding_window_size > 0
                 ):
-                    window_kv_indptr, window_kv_indices, window_kv_lens, _ = (
-                        update_sliding_window_buffer(
-                            self.window_kv_indptr,
-                            self.req_to_token,
-                            self.sliding_window_size,
-                            forward_batch.seq_lens,
-                            forward_batch.req_pool_indices,
-                            bs,
-                            self.device,
-                            self.token_to_kv_pool_allocator,
+                    if self._attn_backend_name == "hsa":
+                        # Exclude LMKs from the local window too (FlashHSA SWA mask).
+                        seq_lens_i64 = forward_batch.seq_lens.to(torch.int64)
+                        raw_lens = torch.minimum(
+                            seq_lens_i64, torch.tensor(int(self.sliding_window_size), device=self.device)
                         )
-                    )
+                        starts = seq_lens_i64 - raw_lens
+                        max_w = int(raw_lens.max().item()) if raw_lens.numel() > 0 else 0
+                        off = torch.arange(max_w, device=self.device, dtype=torch.int64)
+                        pos = starts[:, None] + off[None, :]
+                        valid = off[None, :] < raw_lens[:, None]
+                        keep = valid & ((pos + 1) % int(self._page_size) != 0)
+                        window_kv_lens = keep.sum(dim=1, dtype=torch.int32)
+                        window_kv_indptr = self.window_kv_indptr
+                        window_kv_indptr[1 : bs + 1] = torch.cumsum(window_kv_lens, dim=0)
+                        window_kv_indptr = window_kv_indptr[: bs + 1]
+                        page_table_full = self.req_to_token[
+                            forward_batch.req_pool_indices, :
+                        ]
+                        token_locs = torch.gather(page_table_full, 1, pos.clamp_min(0).clamp_max(page_table_full.shape[1]-1))
+                        window_kv_indices = token_locs[keep].to(torch.int64)
+                    else:
+                        window_kv_indptr, window_kv_indices, window_kv_lens, _ = (
+                            update_sliding_window_buffer(
+                                self.window_kv_indptr,
+                                self.req_to_token,
+                                self.sliding_window_size,
+                                forward_batch.seq_lens,
+                                forward_batch.req_pool_indices,
+                                bs,
+                                self.device,
+                                self.token_to_kv_pool_allocator,
+                            )
+                        )
                     window_num_kv_splits = torch.empty(
                         (bs,), dtype=torch.int32, device=self.device
                     )
@@ -289,7 +334,10 @@ class TritonAttnBackend(AttentionBackend):
                 device=self.device,
             )
             num_kv_splits = torch.empty((bs,), dtype=torch.int32, device=self.device)
-            self.get_num_kv_splits(num_kv_splits, forward_batch.seq_lens)
+            if self._attn_backend_name == "hsa" and spec_info is None:
+                self.get_num_kv_splits(num_kv_splits, kv_lens)
+            else:
+                self.get_num_kv_splits(num_kv_splits, forward_batch.seq_lens)
 
             qo_indptr = None
             custom_mask = None
@@ -369,38 +417,71 @@ class TritonAttnBackend(AttentionBackend):
             attn_logits = None
             attn_lse = None
         else:
-            kv_indptr[1 : bs + 1] = torch.cumsum(
-                forward_batch.extend_prefix_lens, dim=0
-            )
-            kv_indptr = kv_indptr[: bs + 1]
-            kv_indices = torch.empty(
-                sum(forward_batch.extend_prefix_lens_cpu),
-                dtype=torch.int64,
-                device=self.device,
-            )
-            create_flashinfer_kv_indices_triton[(bs,)](
-                self.req_to_token,
-                forward_batch.req_pool_indices,
-                forward_batch.extend_prefix_lens,
-                kv_indptr,
-                None,
-                kv_indices,
-                self.req_to_token.stride(0),
-            )
+            if self._attn_backend_name == "hsa":
+                prefix_lens = forward_batch.extend_prefix_lens.to(torch.int64)
+                max_p = int(prefix_lens.max().item()) if prefix_lens.numel() > 0 else 0
+                pos = torch.arange(max_p, device=self.device, dtype=torch.int64)
+                page_table = self.req_to_token[forward_batch.req_pool_indices, :max_p]
+                valid = pos[None, :] < prefix_lens[:, None]
+                keep = valid & ((pos[None, :] + 1) % int(self._page_size) != 0)
+                kv_lens = keep.sum(dim=1, dtype=torch.int32)
+                kv_indptr[1 : bs + 1] = torch.cumsum(kv_lens, dim=0)
+                kv_indptr = kv_indptr[: bs + 1]
+                kv_indices = page_table[keep].to(torch.int64)
+            else:
+                kv_indptr[1 : bs + 1] = torch.cumsum(
+                    forward_batch.extend_prefix_lens, dim=0
+                )
+                kv_indptr = kv_indptr[: bs + 1]
+                kv_indices = torch.empty(
+                    sum(forward_batch.extend_prefix_lens_cpu),
+                    dtype=torch.int64,
+                    device=self.device,
+                )
+                create_flashinfer_kv_indices_triton[(bs,)](
+                    self.req_to_token,
+                    forward_batch.req_pool_indices,
+                    forward_batch.extend_prefix_lens,
+                    kv_indptr,
+                    None,
+                    kv_indices,
+                    self.req_to_token.stride(0),
+                )
             # Sliding window
             if self.sliding_window_size is not None and self.sliding_window_size > 0:
-                window_kv_indptr, window_kv_indices, _, _ = (
-                    update_sliding_window_buffer(
-                        self.window_kv_indptr,
-                        self.req_to_token,
-                        self.sliding_window_size,
-                        forward_batch.extend_prefix_lens,
-                        forward_batch.req_pool_indices,
-                        bs,
-                        self.device,
-                        self.token_to_kv_pool_allocator,
+                if self._attn_backend_name == "hsa":
+                    prefix_lens_i64 = forward_batch.extend_prefix_lens.to(torch.int64)
+                    raw_lens = torch.minimum(
+                        prefix_lens_i64, torch.tensor(int(self.sliding_window_size), device=self.device)
                     )
-                )
+                    starts = prefix_lens_i64 - raw_lens
+                    max_w = int(raw_lens.max().item()) if raw_lens.numel() > 0 else 0
+                    off = torch.arange(max_w, device=self.device, dtype=torch.int64)
+                    pos = starts[:, None] + off[None, :]
+                    valid = off[None, :] < raw_lens[:, None]
+                    keep = valid & ((pos + 1) % int(self._page_size) != 0)
+                    window_kv_lens = keep.sum(dim=1, dtype=torch.int32)
+                    window_kv_indptr = self.window_kv_indptr
+                    window_kv_indptr[1 : bs + 1] = torch.cumsum(window_kv_lens, dim=0)
+                    window_kv_indptr = window_kv_indptr[: bs + 1]
+                    page_table_full = self.req_to_token[
+                        forward_batch.req_pool_indices, :
+                    ]
+                    token_locs = torch.gather(page_table_full, 1, pos.clamp_min(0).clamp_max(page_table_full.shape[1]-1))
+                    window_kv_indices = token_locs[keep].to(torch.int64)
+                else:
+                    window_kv_indptr, window_kv_indices, _, _ = (
+                        update_sliding_window_buffer(
+                            self.window_kv_indptr,
+                            self.req_to_token,
+                            self.sliding_window_size,
+                            forward_batch.extend_prefix_lens,
+                            forward_batch.req_pool_indices,
+                            bs,
+                            self.device,
+                            self.token_to_kv_pool_allocator,
+                        )
+                    )
 
             qo_indptr = self.qo_indptr
             qo_indptr[1 : bs + 1] = torch.cumsum(forward_batch.extend_seq_lens, dim=0)
