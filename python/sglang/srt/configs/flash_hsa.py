@@ -196,10 +196,6 @@ def _register_flash_hsa_autoconfig() -> None:
     try:
         from transformers.models.auto.configuration_auto import CONFIG_MAPPING
 
-        if "flash_hsa" not in CONFIG_MAPPING:
-            CONFIG_MAPPING.register("flash_hsa", FlashHSAConfig)
-        # Some internal / research FlashHSA variants use a different model_type but the same
-        # underlying config schema (notably InnerX split-head HSA).
         if "flash_hsa_innerx" not in CONFIG_MAPPING:
             CONFIG_MAPPING.register("flash_hsa_innerx", FlashHSAConfig)
     except Exception:

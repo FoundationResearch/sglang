@@ -488,7 +488,10 @@ class FlashHSAInnerXHierarchicalSparseAttention(nn.Module):
         # --- Selection query (LMK-Q, NO RoPE) ---
         lmk_q, _ = self.lmk_q_proj(hidden_states)  # [T, hk_hsa*D]
         lmk_q_3 = lmk_q.view(-1, self.hk_hsa, self.head_dim)
-        lmk_q_norm = self.lmk_q_norm(lmk_q_3)  # [T, hk_hsa, D]
+        # RMSNorm expects 2D; apply over head_dim with flatten/unflatten.
+        lmk_q_norm = self.lmk_q_norm(lmk_q_3.reshape(-1, self.head_dim)).reshape(
+            lmk_q_3.shape[0], lmk_q_3.shape[1], lmk_q_3.shape[2]
+        )  # [T, hk_hsa, D]
         # Expand to q-head space for selector: [T, hq_hsa, D]
         assert self.hq_hsa % self.hk_hsa == 0
         G = self.hq_hsa // self.hk_hsa

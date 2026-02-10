@@ -13,7 +13,7 @@ def _vprint(msg: str):
 def test_flash_hsa_autoconfig_and_registry(tmp_path: Path):
     """
     Validate two things:
-      1) Transformers AutoConfig can parse model_type="flash_hsa" after SGLang's shim registration.
+      1) Transformers AutoConfig can parse model_type="flash_hsa_innerx" after SGLang's shim registration.
       2) SGLang ModelRegistry can resolve the architecture name "HSAForCausalLM".
 
     This test does NOT instantiate the full model (would require distributed init + GPU memory).
@@ -27,7 +27,7 @@ def test_flash_hsa_autoconfig_and_registry(tmp_path: Path):
     # Create a minimal HF-like folder with config.json.
     cfg_path = tmp_path / "config.json"
     cfg = {
-        "model_type": "flash_hsa",
+        "model_type": "flash_hsa_innerx",
         "architectures": ["HSAForCausalLM"],
         "vocab_size": 100278,
         "hidden_size": 1024,
@@ -35,6 +35,8 @@ def test_flash_hsa_autoconfig_and_registry(tmp_path: Path):
         "num_hidden_layers": 2,
         "num_attention_heads": 16,
         "num_key_value_heads": 4,
+        "hsa_heads": 4,
+        "hsa_qk_ratio": 4,
         "use_sliding_window_merging": True,
         # New name (requested); old name "sliding_window" should not be required.
         "sliding_window_merging_size": 64,
@@ -54,7 +56,7 @@ def test_flash_hsa_autoconfig_and_registry(tmp_path: Path):
 
     from sglang.srt.configs.flash_hsa import FlashHSAConfig
 
-    assert c.model_type == "flash_hsa"
+    assert c.model_type == "flash_hsa_innerx"
     assert isinstance(c, FlashHSAConfig)
     assert getattr(c, "architectures", None) == ["HSAForCausalLM"]
     assert getattr(c, "sliding_window_merging_size", None) == 64
@@ -74,7 +76,7 @@ def test_flash_hsa_window_size_fallback_warns(tmp_path: Path):
 
     cfg_path = tmp_path / "config.json"
     cfg = {
-        "model_type": "flash_hsa",
+        "model_type": "flash_hsa_innerx",
         "architectures": ["HSAForCausalLM"],
         "vocab_size": 100278,
         "hidden_size": 1024,
@@ -82,6 +84,8 @@ def test_flash_hsa_window_size_fallback_warns(tmp_path: Path):
         "num_hidden_layers": 2,
         "num_attention_heads": 16,
         "num_key_value_heads": 4,
+        "hsa_heads": 4,
+        "hsa_qk_ratio": 4,
         # Official-format input: single window for both merging + sliding-attention layers.
         "use_sliding_window": True,
         "sliding_window": 64,
