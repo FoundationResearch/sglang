@@ -80,16 +80,10 @@ class HSAAttnBackend(AttentionBackend):
         self.hsa_layers = getattr(server_args, "hsa_layers", None)
         self._hsa_layer_ids: Optional[Set[int]] = self._resolve_hsa_layer_ids()
 
-        self.hsa_window_size = getattr(server_args, "hsa_window_size", None)
-        # NOTE (terminology): we refer to SWA+HSA combination as "merged" (not "fused") to avoid
-        # confusion with a future single-kernel fused implementation.
-        default_merging = bool(getattr(cfg, "enable_swa_hsa_merging", False)) or bool(
-            getattr(cfg, "use_sliding_window_merging", False)
-        )
-        override_merging = getattr(server_args, "hsa_enable_swa_merging", None)
-        self.hsa_enable_swa_merging = (
-            bool(override_merging) if override_merging is not None else bool(default_merging)
-        )
+        # InnerX ultra only: we always run split-head stitch for HSA layers.
+        # SWA window and LMK visibility are controlled by per-layer kwargs.
+        self.hsa_window_size = None
+        self.hsa_enable_swa_merging = False
 
         # Delegate dense attention implementation for now.
         # NOTE: For encoder-decoder models, triton backend is not supported.
@@ -139,25 +133,7 @@ class HSAAttnBackend(AttentionBackend):
             return True
         return int(layer_id) in self._hsa_layer_ids
 
-    def _get_effective_window_size(self) -> Optional[int]:
-        if self.hsa_window_size is not None:
-            return int(self.hsa_window_size)
-        # FlashHSA: allow separate merging window size (distinct from standalone SWA layers).
-        get_merging_window = getattr(
-            getattr(self.model_runner, "model", None),
-            "get_flashhsa_merging_sliding_window_size",
-            None,
-        )
-        if callable(get_merging_window):
-            try:
-                w = get_merging_window()
-                if w is not None:
-                    return int(w)
-            except Exception:
-                pass
-        if getattr(self.model_runner, "sliding_window_size", None) is not None:
-            return int(self.model_runner.sliding_window_size)
-        return None
+    # (removed) _get_effective_window_size: InnerX ultra passes window via kwargs
 
     def _run_selection_decode(
         self,
@@ -185,11 +161,10 @@ class HSAAttnBackend(AttentionBackend):
         if pool is None or not hasattr(pool, "get_key_buffer"):
             return
 
-        window = self._get_effective_window_size()
+        window = 0
         if window_size_override is not None:
             window = int(window_size_override)
-        # SWA→HSA merged mode: exclude SWA window pages from candidate set.
-        # (In InnerX split-head mode we typically pass window_size_override=None to disable exclusion.)
+        # InnerX ultra: selection candidates are built without window exclusion (window=0).
         # Robustness: in decode, some codepaths/tests may not have updated req_to_token yet.
         # Overlay out_cache_loc into a temporary token->slot table at position (seq_len - 1).
         page_table_1 = md.page_table_1
@@ -583,201 +558,9 @@ class HSAAttnBackend(AttentionBackend):
                 out_all[:, :HQ_swa, :] = out_swa.to(torch.bfloat16)
             out_all[:, HQ_swa:, :] = out_hsa
             return out_all.reshape(q.shape[0], HQ_total * layer.v_head_dim)
-
-        selected_page_ids = md.hsa_selected_page_ids  # [B, H, K]
-        selected_scores = md.hsa_selected_scores  # [B, H, K]
-        H = int(layer.tp_k_head_num)
-        HQ = int(layer.tp_q_head_num)
-        assert HQ % H == 0
-        G = HQ // H
-        TOPK = int(selected_page_ids.shape[2])
-
-        # HSA weights / merged weights:
-        # - HSA-only: softmax over selected_scores => hsa_weights
-        # - SWA→HSA merged: softmax over cat([selected_scores, lse_swa]) => [hsa_weights, swa_weight]
-        if not self.hsa_enable_swa_merging:
-            valid = selected_page_ids >= 0
-            scores = selected_scores.masked_fill(~valid, float("-inf"))
-            w_kv = torch.softmax(scores, dim=-1)
-            w_kv = torch.nan_to_num(w_kv, nan=0.0).to(q3.dtype)
-            w_q = (
-                w_kv[:, :, None, :]
-                .expand(w_kv.shape[0], H, G, TOPK)
-                .reshape(w_kv.shape[0], HQ, TOPK)
-                .contiguous()
-            )
-            swa_weight_q = None
-            out_swa = None
-        else:
-            # NOTE (terminology): we call this "merged" (not "fused") to avoid confusion with a future
-            # single-kernel fused implementation.
-            window_size = self._get_effective_window_size()
-            if window_size is None or int(window_size) <= 0:
-                # No SWA branch; fall back to HSA-only.
-                valid = selected_page_ids >= 0
-                scores = selected_scores.masked_fill(~valid, float("-inf"))
-                w_kv = torch.softmax(scores, dim=-1)
-                w_kv = torch.nan_to_num(w_kv, nan=0.0).to(q3.dtype)
-                w_q = (
-                    w_kv[:, :, None, :]
-                    .expand(w_kv.shape[0], H, G, TOPK)
-                    .reshape(w_kv.shape[0], HQ, TOPK)
-                    .contiguous()
-                )
-                swa_weight_q = None
-                out_swa = None
-            else:
-                # SWA branch for SWA→HSA merged path.
-                #
-                # Official FlashHSA uses `torch.nn.attention.flex_attention` with a custom block mask:
-                #   - local windowed causal
-                #   - excludes LMK slots ((kv_idx + 1) % chunk_size != 0)
-                #
-                # We mirror that here for speed & semantic alignment.
-                B = int(q3.shape[0])
-                D = int(q3.shape[2])
-                k_cache_all = pool.get_key_buffer(layer.layer_id)
-                v_cache_all = pool.get_value_buffer(layer.layer_id)
-
-                out_swa = torch.zeros((B, HQ, D), device=q3.device, dtype=torch.float32)
-                lse_swa = torch.full((B, HQ), float("-inf"), device=q3.device, dtype=torch.float32)
-
-                try:
-                    from torch.nn.attention.flex_attention import create_block_mask
-                    flex_attn = _get_compiled_flex_attention()
-
-                    seq_lens_i64 = md.cache_seqlens_int32.to(torch.int64)
-                    for b in range(B):
-                        seqlen = int(seq_lens_i64[b].item())
-                        if seqlen <= 0:
-                            continue
-
-                        q_idx_global = seqlen - 1
-                        start_global = q_idx_global - int(window_size) + 1
-                        if start_global < 0:
-                            start_global = 0
-                        chunk_start = (start_global // int(self.page_size)) * int(self.page_size)
-
-                        # Build a fixed-length KV window [window_size] by clamping positions into [0, seqlen-1].
-                        kv_pos_global = start_global + torch.arange(
-                            int(window_size), device=q3.device, dtype=torch.int64
-                        )  # [W]
-                        kv_pos_clamped = kv_pos_global.clamp_min(0).clamp_max(seqlen - 1)
-                        token_locs = page_table_1[b, kv_pos_clamped].to(torch.int64)  # [W]
-
-                        # Gather KV: [W, H, D] -> [1, H, W, D]
-                        k_win = k_cache_all[token_locs].transpose(0, 1).unsqueeze(0)  # [1,H,W,D]
-                        v_win = v_cache_all[token_locs].transpose(0, 1).unsqueeze(0)  # [1,H,W,D]
-                        q_b = q3[b].unsqueeze(0).unsqueeze(2)  # [1,HQ,1,D]
-
-                        def block_causal_mask(_bb, _hh, _q_idx, kv_idx):
-                            # Map kv_idx (0..W-1) into global token index.
-                            kv_global = kv_idx + start_global
-                            # windowed + chunk aligned + exclude LMK slots
-                            return (
-                                (kv_global >= chunk_start)
-                                & (kv_global <= q_idx_global)
-                                & (((kv_global + 1) % int(self.page_size)) != 0)
-                            )
-
-                        block_mask = create_block_mask(
-                            block_causal_mask, B=None, H=None, Q_LEN=1, KV_LEN=int(window_size)
-                        )
-                        # Newer PyTorch uses return_aux; keep a backward-compatible fallback.
-                        try:
-                            from torch.nn.attention.flex_attention import AuxRequest
-
-                            o, aux = flex_attn(
-                                q_b,
-                                k_win,
-                                v_win,
-                                block_mask=block_mask,
-                                enable_gqa=True,
-                                return_aux=AuxRequest(lse=True),
-                            )
-                            lse = aux.lse
-                        except Exception:
-                            o, lse = flex_attn(
-                                q_b,
-                                k_win,
-                                v_win,
-                                block_mask=block_mask,
-                                enable_gqa=True,
-                                return_lse=True,
-                            )  # o: [1,HQ,1,D], lse: [1,HQ,1]
-
-                        out_swa[b] = o.squeeze(0).squeeze(1).to(torch.float32)
-                        lse_swa[b] = lse.squeeze(0).squeeze(1).to(torch.float32)
-                except Exception:
-                    # Fallback to a simple torch implementation (kept for robustness across torch versions).
-                    global _FLEX_FALLBACK_WARNED
-                    if not _FLEX_FALLBACK_WARNED:
-                        _FLEX_FALLBACK_WARNED = True
-                        logger.warning(
-                            "FlashHSA SWA branch: flex_attention failed; falling back to slow torch impl. "
-                            "This may be much slower. Set SGLANG_HSA_TEST_VERBOSE=1 for more context."
-                        )
-                    seq_lens_i64 = md.cache_seqlens_int32.to(torch.int64)
-                    for b in range(B):
-                        seqlen = int(seq_lens_i64[b].item())
-                        if seqlen <= 0:
-                            continue
-                        w = min(seqlen, int(window_size))
-                        start = seqlen - w
-                        tok_pos = torch.arange(start, seqlen, device=q3.device, dtype=torch.int64)
-                        keep = (tok_pos % int(self.page_size)) != (int(self.page_size) - 1)
-                        tok_pos = tok_pos[keep]
-                        if tok_pos.numel() == 0:
-                            continue
-                        token_locs = page_table_1[b, tok_pos].to(torch.int64)
-
-                        q_hgd = q3[b].view(H, G, D).to(torch.float32)
-                        for kv_h in range(H):
-                            k_win = k_cache_all[token_locs, kv_h, :].to(torch.float32)
-                            v_win = v_cache_all[token_locs, kv_h, :].to(torch.float32)
-                            logits = (q_hgd[kv_h] @ k_win.transpose(0, 1)) * float(
-                                getattr(layer, "scaling", 1.0)
-                            )
-                            lse = torch.logsumexp(logits, dim=-1)
-                            p = torch.softmax(logits, dim=-1)
-                            o = p @ v_win
-                            hq_start = kv_h * G
-                            out_swa[b, hq_start : hq_start + G, :] = o
-                            lse_swa[b, hq_start : hq_start + G] = lse
-
-                out_swa = out_swa.to(torch.bfloat16)
-
-                # Expand selected_scores from kv-head space [B,H,K] to q-head space [B,HQ,K].
-                scores_kv = selected_scores.to(torch.float32)
-                valid = (selected_page_ids >= 0)
-                scores_kv = scores_kv.masked_fill(~valid, float("-inf"))
-                scores_q = (
-                    scores_kv[:, :, None, :]
-                    .expand(scores_kv.shape[0], H, G, TOPK)
-                    .reshape(scores_kv.shape[0], HQ, TOPK)
-                    .contiguous()
-                )
-
-                cat = torch.cat([scores_q, lse_swa.unsqueeze(-1)], dim=-1)  # [B,HQ,K+1]
-                w_all = torch.softmax(cat, dim=-1)
-                w_all = torch.nan_to_num(w_all, nan=0.0)
-                w_q = w_all[:, :, :TOPK].to(q3.dtype).contiguous()
-                swa_weight_q = w_all[:, :, TOPK].to(q3.dtype).contiguous()
-
-        out3 = hsa_decode_paged_fwd(
-            q=q3,
-            k_cache=pool.get_key_buffer(layer.layer_id),
-            v_cache=pool.get_value_buffer(layer.layer_id),
-            page_table_1=page_table_1,
-            selected_page_ids=selected_page_ids,
-            hsa_weights=w_q,
-            page_size=int(self.page_size),
-            sm_scale=getattr(layer, "scaling", None),
-            mask_last_token=True,
+        raise RuntimeError(
+            "InnerX ultra only: HSA layers must pass `hsa_split_head_info` kwargs."
         )
-        if swa_weight_q is not None and out_swa is not None:
-            out3 = out3 + (swa_weight_q[:, :, None] * out_swa.to(out3.dtype))
-        return out3.reshape(q.shape[0], layer.tp_q_head_num * layer.v_head_dim)
 
     def forward_extend(
         self,
