@@ -448,6 +448,13 @@ class ServerArgs:
     hsa_layers: Optional[str] = None
     hsa_window_size: Optional[int] = None
     hsa_enable_swa_merging: Optional[bool] = None
+    # Experimental: head-wise SWA/HSA split (decode-only for now).
+    # If enabled, HSA layers route the first N kv-head groups to HSA retrieval, and the remaining
+    # kv-head groups to SWA (flex_attention) with LMK excluded. This bypasses SWA→HSA "merged" gating.
+    hsa_headwise_swa_split: Optional[bool] = None
+    # If set, overrides how many kv heads (per TP rank) use HSA retrieval. If unset and headwise split
+    # is enabled, defaults to floor(H/2).
+    hsa_headwise_hsa_kv_heads: Optional[int] = None
     # Landmark token id (LMK). By default we follow FlashHSA: lmk_id == vocab_size.
     # This id must be valid for the loaded model weights (embedding/lm_head).
     hsa_lmk_id: int = -1
@@ -3583,6 +3590,21 @@ class ServerArgs:
             default=ServerArgs.hsa_enable_swa_merging,
             help="(Override-only) Enable SWA→HSA merged path for FlashHSA semantics. If unset, read from model config. "
             "Only used when --attention-backend hsa.",
+        )
+        parser.add_argument(
+            "--hsa-headwise-swa-split",
+            action=argparse.BooleanOptionalAction,
+            default=ServerArgs.hsa_headwise_swa_split,
+            help="(Experimental, override-only) Enable head-wise routing inside HSA layers (decode-only): "
+            "first N kv-head groups use HSA retrieval, remaining kv-head groups use SWA (flex_attention) "
+            "with LMK excluded. This bypasses SWA→HSA merged gating.",
+        )
+        parser.add_argument(
+            "--hsa-headwise-hsa-kv-heads",
+            type=int,
+            default=ServerArgs.hsa_headwise_hsa_kv_heads,
+            help="(Experimental, override-only) Number of kv heads (per TP rank) routed to HSA retrieval when "
+            "--hsa-headwise-swa-split is enabled. If unset, defaults to floor(H/2).",
         )
         # Deprecated alias (kept for convenience; prefer --hsa-enable-swa-merging).
         parser.add_argument(

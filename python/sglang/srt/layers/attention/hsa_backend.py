@@ -91,6 +91,15 @@ class HSAAttnBackend(AttentionBackend):
             bool(override_merging) if override_merging is not None else bool(default_merging)
         )
 
+        # Experimental: head-wise routing between HSA retrieval heads and SWA heads (decode-only).
+        # This bypasses SWA→HSA merged gating and instead stitches outputs by head index.
+        default_headwise = bool(getattr(cfg, "hsa_headwise_swa_split", False))
+        override_headwise = getattr(server_args, "hsa_headwise_swa_split", None)
+        self.hsa_headwise_swa_split = (
+            bool(override_headwise) if override_headwise is not None else bool(default_headwise)
+        )
+        self.hsa_headwise_hsa_kv_heads = getattr(server_args, "hsa_headwise_hsa_kv_heads", None)
+
         # Delegate dense attention implementation for now.
         # NOTE: For encoder-decoder models, triton backend is not supported.
         if model_runner.model_config.is_encoder_decoder:
@@ -102,6 +111,15 @@ class HSAAttnBackend(AttentionBackend):
 
         self._dense_backend = TritonAttnBackend(model_runner, **kwargs)
         self.forward_metadata: Optional[HSAMetadata] = None
+
+    def _get_headwise_hsa_kv_heads(self, h: int) -> int:
+        """Number of kv heads (per TP rank) routed to HSA retrieval in head-wise split mode."""
+        if h <= 0:
+            return 0
+        if self.hsa_headwise_hsa_kv_heads is None:
+            return int(h // 2)
+        n = int(self.hsa_headwise_hsa_kv_heads)
+        return max(0, min(int(h), n))
 
     def _resolve_hsa_layer_ids(self) -> Optional[Set[int]]:
         """Resolve per-layer HSA enable set.
@@ -165,6 +183,7 @@ class HSAAttnBackend(AttentionBackend):
         q: torch.Tensor,
         layer: RadixAttention,
         forward_batch: ForwardBatch,
+        kv_head_end: Optional[int] = None,
     ) -> None:
         """Step 4 (Torch reference): SWA→HSA selection for decode.
 
@@ -239,6 +258,63 @@ class HSAAttnBackend(AttentionBackend):
         flat_repr = k_cache[flat_lmk_locs]  # [B*C, H, D]
         cand_repr = flat_repr.view(B, C, flat_repr.shape[1], flat_repr.shape[2])
         cand_repr_valid = cand_completed
+
+        # Optional: only run selection for a prefix of kv heads (head-wise SWA/HSA split).
+        if kv_head_end is not None:
+            H_full = int(cand_repr.shape[2])
+            kv_head_end = max(0, min(H_full, int(kv_head_end)))
+
+            if kv_head_end == 0:
+                md.hsa_cand_page_ids = cand_page_ids
+                md.hsa_cand_mask = cand_mask
+                md.hsa_selected_page_ids = cand_page_ids.new_full(
+                    (B, layer.tp_k_head_num, self.hsa_topk), -1, dtype=torch.int32
+                )
+                md.hsa_selected_scores = q.new_full(
+                    (B, layer.tp_k_head_num, self.hsa_topk), float("-inf"), dtype=torch.float32
+                )
+                return
+
+            if kv_head_end < H_full:
+                # Slice q/cand_repr so HQ_sel % H_sel == 0. Keep full cand list; only heads are sliced.
+                D = int(cand_repr.shape[3])
+                if q.dim() == 2:
+                    HQ = int(q.shape[1] // D)
+                    G = HQ // H_full
+                    q_sel = q.view(B, HQ, D)[:, : kv_head_end * G, :].contiguous()
+                elif q.dim() == 3:
+                    HQ = int(q.shape[1])
+                    G = HQ // H_full
+                    q_sel = q[:, : kv_head_end * G, :].contiguous()
+                else:
+                    q_sel = q
+
+                cand_repr_sel = cand_repr[:, :, :kv_head_end, :].contiguous()
+                sel_part = select_topk_pages_decode(
+                    q=q_sel,
+                    cand_page_ids=cand_page_ids,
+                    cand_mask=cand_mask,
+                    cand_chunk_repr=cand_repr_sel,
+                    cand_chunk_repr_valid=cand_repr_valid,
+                    topk=int(self.hsa_topk),
+                    selection_strategy=str(self.hsa_selection_strategy),
+                    sm_scale=getattr(layer, "scaling", None),
+                )
+
+                selected_page_ids_full = cand_page_ids.new_full(
+                    (B, H_full, int(self.hsa_topk)), -1, dtype=torch.int32
+                )
+                selected_scores_full = q.new_full(
+                    (B, H_full, int(self.hsa_topk)), float("-inf"), dtype=torch.float32
+                )
+                selected_page_ids_full[:, :kv_head_end, :] = sel_part.selected_page_ids
+                selected_scores_full[:, :kv_head_end, :] = sel_part.selected_scores
+
+                md.hsa_cand_page_ids = sel_part.cand_page_ids
+                md.hsa_cand_mask = sel_part.cand_mask
+                md.hsa_selected_page_ids = selected_page_ids_full
+                md.hsa_selected_scores = selected_scores_full
+                return
 
         sel = select_topk_pages_decode(
             q=q,
@@ -361,7 +437,13 @@ class HSAAttnBackend(AttentionBackend):
         **kwargs,
     ):
         # Step 4: run selection (SWA→HSA) to populate metadata.
-        self._run_selection_decode(q=q, layer=layer, forward_batch=forward_batch)
+        if self.hsa_headwise_swa_split:
+            hsa_kv = self._get_headwise_hsa_kv_heads(int(layer.tp_k_head_num))
+            self._run_selection_decode(
+                q=q, layer=layer, forward_batch=forward_batch, kv_head_end=hsa_kv
+            )
+        else:
+            self._run_selection_decode(q=q, layer=layer, forward_batch=forward_batch)
 
         # Non-HSA layers: delegate to dense backend.
         if not self._is_hsa_layer(layer.layer_id):
@@ -409,6 +491,152 @@ class HSAAttnBackend(AttentionBackend):
         assert HQ % H == 0
         G = HQ // H
         TOPK = int(selected_page_ids.shape[2])
+
+        # Experimental: head-wise split (first kv-head groups use HSA retrieval; remaining use SWA window).
+        if self.hsa_headwise_swa_split:
+            hsa_kv = self._get_headwise_hsa_kv_heads(H)
+            hsa_q_end = int(hsa_kv) * int(G)
+
+            # HSA weights: softmax over selected_scores (HSA-only).
+            valid = selected_page_ids >= 0
+            scores = selected_scores.masked_fill(~valid, float("-inf"))
+            w_kv = torch.softmax(scores, dim=-1)
+            w_kv = torch.nan_to_num(w_kv, nan=0.0).to(q3.dtype)
+            w_q = (
+                w_kv[:, :, None, :]
+                .expand(w_kv.shape[0], H, G, TOPK)
+                .reshape(w_kv.shape[0], HQ, TOPK)
+                .contiguous()
+            )
+
+            out3 = hsa_decode_paged_fwd(
+                q=q3,
+                k_cache=pool.get_key_buffer(layer.layer_id),
+                v_cache=pool.get_value_buffer(layer.layer_id),
+                page_table_1=page_table_1,
+                selected_page_ids=selected_page_ids,
+                hsa_weights=w_q,
+                page_size=int(self.page_size),
+                sm_scale=getattr(layer, "scaling", None),
+                mask_last_token=True,
+            )
+
+            window_size = self._get_effective_window_size()
+            if (
+                window_size is None
+                or int(window_size) <= 0
+                or hsa_kv >= H
+                or hsa_q_end >= HQ
+            ):
+                return out3.reshape(q.shape[0], layer.tp_q_head_num * layer.v_head_dim)
+
+            B = int(q3.shape[0])
+            D = int(q3.shape[2])
+            k_cache_all = pool.get_key_buffer(layer.layer_id)
+            v_cache_all = pool.get_value_buffer(layer.layer_id)
+            out_swa = torch.zeros((B, HQ - hsa_q_end, D), device=q3.device, dtype=torch.float32)
+
+            try:
+                from torch.nn.attention.flex_attention import create_block_mask
+
+                flex_attn = _get_compiled_flex_attention()
+                seq_lens_i64 = md.cache_seqlens_int32.to(torch.int64)
+                for b in range(B):
+                    seqlen = int(seq_lens_i64[b].item())
+                    if seqlen <= 0:
+                        continue
+
+                    q_idx_global = seqlen - 1
+                    start_global = q_idx_global - int(window_size) + 1
+                    if start_global < 0:
+                        start_global = 0
+                    chunk_start = (start_global // int(self.page_size)) * int(self.page_size)
+
+                    kv_pos_global = start_global + torch.arange(
+                        int(window_size), device=q3.device, dtype=torch.int64
+                    )  # [W]
+                    kv_pos_clamped = kv_pos_global.clamp_min(0).clamp_max(seqlen - 1)
+                    token_locs = page_table_1[b, kv_pos_clamped].to(torch.int64)  # [W]
+
+                    # Gather KV: [W, H, D] -> [1, H, W, D] then slice SWA kv heads.
+                    k_win = k_cache_all[token_locs].transpose(0, 1).unsqueeze(0)  # [1,H,W,D]
+                    v_win = v_cache_all[token_locs].transpose(0, 1).unsqueeze(0)  # [1,H,W,D]
+                    k_win = k_win[:, hsa_kv:, :, :]
+                    v_win = v_win[:, hsa_kv:, :, :]
+
+                    # Queries for SWA heads are a contiguous suffix when splitting by kv-head groups.
+                    q_b = q3[b, hsa_q_end:, :].unsqueeze(0).unsqueeze(2)  # [1,HQ_swa,1,D]
+
+                    def block_causal_mask(_bb, _hh, _q_idx, kv_idx):
+                        kv_global = kv_idx + start_global
+                        return (
+                            (kv_global >= chunk_start)
+                            & (kv_global <= q_idx_global)
+                            & (((kv_global + 1) % int(self.page_size)) != 0)
+                        )
+
+                    block_mask = create_block_mask(
+                        block_causal_mask, B=None, H=None, Q_LEN=1, KV_LEN=int(window_size)
+                    )
+
+                    try:
+                        o = flex_attn(
+                            q_b,
+                            k_win,
+                            v_win,
+                            block_mask=block_mask,
+                            enable_gqa=True,
+                        )
+                        if isinstance(o, tuple):
+                            o = o[0]
+                    except Exception:
+                        o, _lse = flex_attn(
+                            q_b,
+                            k_win,
+                            v_win,
+                            block_mask=block_mask,
+                            enable_gqa=True,
+                            return_lse=True,
+                        )
+                    out_swa[b] = o.squeeze(0).squeeze(1).to(torch.float32)
+            except Exception:
+                # Fallback to a simple torch implementation (robust across torch versions).
+                global _FLEX_FALLBACK_WARNED
+                if not _FLEX_FALLBACK_WARNED:
+                    _FLEX_FALLBACK_WARNED = True
+                    logger.warning(
+                        "FlashHSA head-wise SWA branch: flex_attention failed; falling back to slow torch impl. "
+                        "This may be much slower. Set SGLANG_HSA_TEST_VERBOSE=1 for more context."
+                    )
+                seq_lens_i64 = md.cache_seqlens_int32.to(torch.int64)
+                for b in range(B):
+                    seqlen = int(seq_lens_i64[b].item())
+                    if seqlen <= 0:
+                        continue
+                    w = min(seqlen, int(window_size))
+                    start = seqlen - w
+                    tok_pos = torch.arange(start, seqlen, device=q3.device, dtype=torch.int64)
+                    keep = (tok_pos % int(self.page_size)) != (int(self.page_size) - 1)
+                    tok_pos = tok_pos[keep]
+                    if tok_pos.numel() == 0:
+                        continue
+                    token_locs = page_table_1[b, tok_pos].to(torch.int64)
+
+                    q_hgd = q3[b].view(H, G, D).to(torch.float32)
+                    for kv_h in range(int(hsa_kv), H):
+                        k_win = k_cache_all[token_locs, kv_h, :].to(torch.float32)
+                        v_win = v_cache_all[token_locs, kv_h, :].to(torch.float32)
+                        logits = (q_hgd[kv_h] @ k_win.transpose(0, 1)) * float(
+                            getattr(layer, "scaling", 1.0)
+                        )
+                        p = torch.softmax(logits, dim=-1)
+                        o = p @ v_win
+                        rel_h = kv_h - int(hsa_kv)
+                        hq_start = rel_h * G
+                        out_swa[b, hq_start : hq_start + G, :] = o
+
+            out3[:, hsa_q_end:, :] = out_swa.to(out3.dtype)
+            return out3.reshape(q.shape[0], layer.tp_q_head_num * layer.v_head_dim)
 
         # HSA weights / merged weights:
         # - HSA-only: softmax over selected_scores => hsa_weights
