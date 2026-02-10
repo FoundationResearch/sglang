@@ -572,6 +572,10 @@ class HSAAttnBackend(AttentionBackend):
         save_kv_cache: bool = True,
         **kwargs,
     ):
+        # InnerX split-head uses extra kwargs (e.g. `hsa_split_head_info`, `hsa_selection_q`)
+        # that the dense backend does not understand. Extend currently falls back to dense
+        # attention, so we strip HSA-specific kwargs here.
+        kwargs = {k: v for k, v in kwargs.items() if not k.startswith("hsa_")}
         out = self._dense_backend.forward_extend(
             q, k, v, layer, forward_batch, save_kv_cache=save_kv_cache, **kwargs
         )
