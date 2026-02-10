@@ -342,32 +342,54 @@ def test_innerx_end_to_end_model_forward_extend_then_decode_matches_ultra_semant
         attn_backend=backend,
     )
 
-    # Hook the only layer's self_attn (InnerX HSA).
+    # Hook the only layer's self_attn (InnerX HSA), its inner RadixAttention, and o_proj.
     attn_mod = model.model.layers[0].self_attn
+    radix_attn = attn_mod.attn
+    o_proj = attn_mod.o_proj
     captured = {}
 
     def _hook(_m, _args, kwargs, out):
         captured["positions"] = kwargs["positions"]
         captured["hidden_states_in"] = kwargs["hidden_states"]
         captured["forward_batch"] = kwargs["forward_batch"]
-        captured["out"] = out
+        captured["out"] = out.detach().clone()
+
+    def _hook_radix(_m, args, _kwargs, out):
+        # args: (q, k, v, forward_batch)
+        captured["radix_q"] = args[0]
+        captured["radix_k"] = args[1]
+        captured["radix_v"] = args[2]
+        captured["radix_out"] = out.detach().clone()
 
     h = attn_mod.register_forward_hook(_hook, with_kwargs=True)
+    h2 = radix_attn.register_forward_hook(_hook_radix, with_kwargs=True)
+    def _hook_o_proj(_m, _args, out):
+        out0 = out[0] if isinstance(out, (tuple, list)) else out
+        captured["o_proj_out"] = out0.detach().clone()
+    h3 = o_proj.register_forward_hook(_hook_o_proj)
     try:
         backend.init_forward_metadata(fb_dec)
         _ = model.model(fb_dec.input_ids, fb_dec.positions, fb_dec)
     finally:
         h.remove()
+        h2.remove()
+        h3.remove()
 
     assert "out" in captured, "forward hook did not fire"
     hs_in = captured["hidden_states_in"]  # [B?, hidden]
     out_mod = captured["out"]  # [B?, hidden]
+    attn_out_mod = captured["radix_out"]  # [B?, hidden]
+    o_proj_out_mod = captured["o_proj_out"]  # [B?, hidden]
 
     # Normalize shapes to [B, hidden]
     if hs_in.dim() == 1:
         hs_in = hs_in.unsqueeze(0)
     if out_mod.dim() == 1:
         out_mod = out_mod.unsqueeze(0)
+    if attn_out_mod.dim() == 1:
+        attn_out_mod = attn_out_mod.unsqueeze(0)
+    if o_proj_out_mod.dim() == 1:
+        o_proj_out_mod = o_proj_out_mod.unsqueeze(0)
     assert hs_in.shape[0] == 1 and out_mod.shape[0] == 1
 
     # --- Torch reference: ultra InnerX decode semantics for this module ---
@@ -427,7 +449,7 @@ def test_innerx_end_to_end_model_forward_extend_then_decode_matches_ultra_semant
             sm_scale=float(attn_mod.scaling),
         )  # [1,hq_swa,D] float32
 
-        # HSA selection on completed pages.
+        # HSA selection (torch reference): recompute and verify it matches backend metadata.
         cand_page_ids, cand_mask = build_active_page_candidates(
             page_table_1=page_table_1,
             seq_lens=seq_lens,
@@ -456,6 +478,10 @@ def test_innerx_end_to_end_model_forward_extend_then_decode_matches_ultra_semant
             sm_scale=float(attn_mod.scaling),
         )
 
+        assert md.hsa_selected_page_ids is not None and md.hsa_selected_scores is not None
+        torch.testing.assert_close(md.hsa_selected_page_ids, sel.selected_page_ids)
+        torch.testing.assert_close(md.hsa_selected_scores, sel.selected_scores, rtol=0, atol=0)
+
         valid = sel.selected_page_ids >= 0
         scores = sel.selected_scores.masked_fill(~valid, float("-inf"))
         w_kv = torch.softmax(scores, dim=-1)
@@ -483,9 +509,13 @@ def test_innerx_end_to_end_model_forward_extend_then_decode_matches_ultra_semant
         out_ref = attn_mod.o_proj(out_stitch)[0]  # [1, hidden]
 
     max_abs = (out_mod.float() - out_ref.float()).abs().max().item()
+    max_abs_attn = (attn_out_mod.float() - out_stitch.float()).abs().max().item()
+    max_abs_o_proj = (o_proj_out_mod.float() - out_ref.float()).abs().max().item()
     _vprint("### InnerX runner-like end2end (decode self_attn) check")
     _vprint(f"- fill_ids(len={prefill_len})={fill_ids}")
     _vprint(f"- max_abs_err={max_abs}")
+    _vprint(f"- max_abs_err_pre_o_proj={max_abs_attn}")
+    _vprint(f"- max_abs_err_o_proj_hook_vs_ref={max_abs_o_proj}")
 
     torch.testing.assert_close(out_mod, out_ref, rtol=5e-2, atol=5e-2)
 
