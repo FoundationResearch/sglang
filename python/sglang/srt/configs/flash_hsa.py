@@ -20,7 +20,8 @@ from transformers.modeling_rope_utils import rope_config_validation
 
 
 class FlashHSAConfig(PretrainedConfig):
-    model_type = "flash_hsa"
+    # We only support InnerX ultra variant in this repo.
+    model_type = "flash_hsa_innerx"
     keys_to_ignore_at_inference = ["past_key_values"]
 
     def __init__(
@@ -64,6 +65,12 @@ class FlashHSAConfig(PretrainedConfig):
         hsa_mode: Literal["dense", "sparse"] = "sparse",
         hsa_topk: int = 16,
         full_attn_interleave: int = 4,
+        # ---- InnerX / split-head HSA knobs (used by some FlashHSA variants) ----
+        # If set, some HSA layers split heads into a SWA branch + a HSA branch (ultra reference).
+        # These fields may appear in configs with model_type == "flash_hsa_innerx".
+        hsa_heads: Optional[int] = None,
+        hsa_qk_ratio: Optional[int] = None,
+        enable_gate: bool = False,
         **kwargs,
     ):
         self.vocab_size = vocab_size
@@ -159,6 +166,11 @@ class FlashHSAConfig(PretrainedConfig):
         self.hsa_topk = hsa_topk
         self.full_attn_interleave = full_attn_interleave
 
+        # InnerX / split-head HSA config (optional; validated by model implementation when used)
+        self.hsa_heads = hsa_heads
+        self.hsa_qk_ratio = hsa_qk_ratio
+        self.enable_gate = bool(enable_gate)
+
         # RoPE validation (mirrors HF style)
         if self.rope_scaling is not None and isinstance(self.rope_scaling, dict):
             if "type" in self.rope_scaling and "rope_type" not in self.rope_scaling:
@@ -186,6 +198,10 @@ def _register_flash_hsa_autoconfig() -> None:
 
         if "flash_hsa" not in CONFIG_MAPPING:
             CONFIG_MAPPING.register("flash_hsa", FlashHSAConfig)
+        # Some internal / research FlashHSA variants use a different model_type but the same
+        # underlying config schema (notably InnerX split-head HSA).
+        if "flash_hsa_innerx" not in CONFIG_MAPPING:
+            CONFIG_MAPPING.register("flash_hsa_innerx", FlashHSAConfig)
     except Exception:
         # Be conservative: any import/version mismatch should not break SGLang.
         print("[ERROR] Failed to register FlashHSAConfig into Transformers AutoConfig mapping")
