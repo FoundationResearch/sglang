@@ -163,6 +163,15 @@ def test_scheduler_continuous_batching_works_with_innerx_hsa_cuda():
 
                     out = list(rid_to_req["r2"].output_ids)
                     assert len(out) == 6, f"Expected r2 to generate 6 tokens, got {len(out)}"
+                    # Must cross at least one LMK slot during decode (internal LMK step).
+                    from sglang.srt.managers.schedule_batch import Req as _Req
+
+                    lmk_id = int(server_args.hsa_lmk_id)
+                    prompt_fill = _Req._hsa_insert_lmk_prompt(
+                        [1, 2, 3, 4], page_size=int(server_args.page_size), lmk_id=lmk_id
+                    )
+                    internal_lmk_ct = rid_to_req["r2"].fill_ids.count(lmk_id) - prompt_fill.count(lmk_id)
+                    assert internal_lmk_ct >= 1, f"Expected r2 to cross LMK slot, got {internal_lmk_ct=}"
                     return out
 
                 # Dynamic continuous batching: (r1,r2) -> enqueue r3 during decode -> (r2,r3).
@@ -229,6 +238,15 @@ def test_scheduler_continuous_batching_works_with_innerx_hsa_cuda():
 
                 out = list(rid_to_req["r2"].output_ids)
                 assert len(out) == 6, f"Expected r2 to generate 6 tokens, got {len(out)}"
+                # Must cross at least one LMK slot during decode (internal LMK step).
+                from sglang.srt.managers.schedule_batch import Req as _Req
+
+                lmk_id = int(server_args.hsa_lmk_id)
+                prompt_fill = _Req._hsa_insert_lmk_prompt(
+                    [1, 2, 3, 4], page_size=int(server_args.page_size), lmk_id=lmk_id
+                )
+                internal_lmk_ct = rid_to_req["r2"].fill_ids.count(lmk_id) - prompt_fill.count(lmk_id)
+                assert internal_lmk_ct >= 1, f"Expected r2 to cross LMK slot, got {internal_lmk_ct=}"
                 return out
             finally:
                 cleanup_dist_env_and_memory()
