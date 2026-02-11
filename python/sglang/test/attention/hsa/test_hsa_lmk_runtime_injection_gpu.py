@@ -38,8 +38,9 @@ def test_hsa_decode_forces_lmk_and_is_invisible_cuda():
     from sglang.srt.sampling.sampling_params import SamplingParams
 
     # We don't run a real forward; we validate the pure runtime contract:
-    # - LMK appended into fill_ids when next slot is LMK
-    # - LMK not appended into output_ids (user-visible)
+    # - LMK occupies an internal decode step and is appended into fill_ids
+    # - LMK step's sampled token is discarded (user-invisible)
+    # - User-visible token chain is not broken: the sampled visible token is consumed after LMK
     page_size = 4
     lmk_id = 9999
 
@@ -55,20 +56,48 @@ def test_hsa_decode_forces_lmk_and_is_invisible_cuda():
     req.fill_ids = [10, 11, 12]
     req.output_ids = [10, 11, 12]  # what user has seen so far (no LMK)
 
-    # Model "samples" 42, but runtime should force LMK instead.
-    visible = req.hsa_append_next_token_or_lmk(42)
+    # Step A (normal decode): model samples 42 (user-visible). Since next position is LMK slot,
+    # we schedule an internal LMK step as the next input and stash 42 to be consumed after LMK.
+    visible, next_input_override, skip_checks = req.hsa_decode_postprocess_sampled_token(42)
     _vprint("### test_hsa_decode_forces_lmk_and_is_invisible_cuda")
-    _vprint(f"- step1 visible={visible} fill_ids={req.fill_ids} output_ids={req.output_ids}")
-    assert visible is False
+    _vprint(
+        f"- step1 visible={visible} next_input_override={next_input_override} skip={skip_checks} "
+        f"fill_ids={req.fill_ids} output_ids={req.output_ids}"
+    )
+    assert visible is True
+    assert skip_checks is False
+    assert next_input_override == lmk_id
     assert req.fill_ids == [10, 11, 12, lmk_id]
-    assert req.output_ids == [10, 11, 12]
+    assert req.output_ids == [10, 11, 12, 42]
+    assert req.hsa_waiting_for_lmk_step is True
+    assert req.hsa_pending_visible_token_id == 42
 
-    # Next step should accept a visible token again.
-    visible2 = req.hsa_append_next_token_or_lmk(43)
-    _vprint(f"- step2 visible={visible2} fill_ids={req.fill_ids} output_ids={req.output_ids}")
-    _vprint("=> Conclusion: LMK is appended internally (fill_ids) and never emitted (output_ids).")
-    assert visible2 is True
-    assert req.fill_ids == [10, 11, 12, lmk_id, 43]
-    assert req.output_ids == [10, 11, 12, 43]
+    # Step B (internal LMK decode): model samples 43 but it is discarded.
+    visible2, next_input_override2, skip_checks2 = req.hsa_decode_postprocess_sampled_token(43)
+    _vprint(
+        f"- step2 visible={visible2} next_input_override={next_input_override2} skip={skip_checks2} "
+        f"fill_ids={req.fill_ids} output_ids={req.output_ids}"
+    )
+    assert visible2 is False
+    assert skip_checks2 is True
+    assert next_input_override2 == 42
+    # Pending visible token is appended into engine-visible sequence after LMK.
+    assert req.fill_ids == [10, 11, 12, lmk_id, 42]
+    assert req.output_ids == [10, 11, 12, 42]
+    assert req.hsa_waiting_for_lmk_step is False
+    assert req.hsa_pending_visible_token_id is None
+
+    # Step C (next normal decode): model samples 44; now next input is 44 (no LMK scheduling).
+    visible3, next_input_override3, skip_checks3 = req.hsa_decode_postprocess_sampled_token(44)
+    _vprint(
+        f"- step3 visible={visible3} next_input_override={next_input_override3} skip={skip_checks3} "
+        f"fill_ids={req.fill_ids} output_ids={req.output_ids}"
+    )
+    _vprint("=> Conclusion: LMK step is internal; user-visible token chain is preserved across LMK.")
+    assert visible3 is True
+    assert skip_checks3 is False
+    assert next_input_override3 is None
+    assert req.fill_ids == [10, 11, 12, lmk_id, 42, 44]
+    assert req.output_ids == [10, 11, 12, 42, 44]
 
 

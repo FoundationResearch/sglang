@@ -403,19 +403,20 @@ class SchedulerOutputProcessorMixin:
 
             new_accepted_len = 1
             if batch.spec_algorithm.is_none():
-                # HSA LMK runtime injection:
-                # if the next position is the LMK slot (last slot in a page), force LMK token id,
-                # append it to fill_ids (engine-visible), but do NOT emit it to the user.
                 if getattr(req, "hsa_lmk_enabled", False):
                     # `fill_ids` must already represent the engine-visible sequence.
                     if not req.fill_ids:
-                        # Ensure initialized (should happen in req.init_next_round_input).
                         req.fill_ids = req.origin_input_ids + req.output_ids
-                    is_visible = req.hsa_append_next_token_or_lmk(next_token_id)
-                    if not is_visible:
-                        # Internal token: skip output_ids/logprobs/grammar/finish checks.
+                    produced_visible, next_input_override, skip_checks = (
+                        req.hsa_decode_postprocess_sampled_token(next_token_id)
+                    )
+                    if produced_visible:
+                        self.num_generated_tokens += 1
+                    if next_input_override is not None:
+                        batch.output_ids[i] = int(next_input_override)
+                    if skip_checks:
+                        # Internal LMK step: skip finish/logprob/grammar checks.
                         continue
-                    self.num_generated_tokens += 1
                 else:
                     req.output_ids.append(next_token_id)
             elif batch.is_spec_v2:
@@ -429,6 +430,10 @@ class SchedulerOutputProcessorMixin:
             req.check_finished(new_accepted_len)
 
             if req.finished():
+                if getattr(req, "hsa_lmk_enabled", False):
+                    # Avoid leaking LMK scheduling state for finished requests.
+                    req.hsa_waiting_for_lmk_step = False
+                    req.hsa_pending_visible_token_id = None
                 self.maybe_collect_routed_experts(req)
 
                 if self.server_args.disaggregation_decode_enable_offload_kvcache:
