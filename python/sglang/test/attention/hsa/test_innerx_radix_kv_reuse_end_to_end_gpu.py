@@ -322,8 +322,18 @@ def test_innerx_radix_prefix_kv_reuse_runner_like_end2end_cuda():
     h = attn_mod.register_forward_hook(_hook, with_kwargs=True)
     try:
         decode_steps = 8
-        token_id = 13
+        visible_token_id = 13
+        saw_lmk_step = False
         for t in range(decode_steps):
+            # Cross LMK slot: feed LMK exactly at page boundary positions.
+            # `pos_idx` is the engine-visible position to be appended this step.
+            pos_idx = prompt_len + t
+            if (pos_idx % page_size) == (page_size - 1):
+                token_id = lmk_id
+                saw_lmk_step = True
+            else:
+                token_id = visible_token_id
+
             # Allocate per-req KV slot for this new token.
             loc1 = allocator.alloc(1)
             loc2 = allocator.alloc(1)
@@ -332,7 +342,6 @@ def test_innerx_radix_prefix_kv_reuse_runner_like_end2end_cuda():
             loc2 = loc2.to(torch.int64)
 
             # Update req_to_token_pool mapping at the new position.
-            pos_idx = prompt_len + t
             req_to_token_pool.req_to_token[req1.req_pool_idx, pos_idx] = loc1[0].to(torch.int32)
             req_to_token_pool.req_to_token[req2.req_pool_idx, pos_idx] = loc2[0].to(torch.int32)
 
@@ -362,6 +371,8 @@ def test_innerx_radix_prefix_kv_reuse_runner_like_end2end_cuda():
             out = outs["attn_out"]
             # outputs for the two reqs must match (shared prefix + teacher forced identical tokens)
             torch.testing.assert_close(out[0], out[1], rtol=5e-2, atol=5e-2)
+
+        assert saw_lmk_step, "Expected decode sequence to cross an LMK slot (at least one LMK input step)."
 
         # Ensure shared prefix KV entries were never overwritten.
         torch.testing.assert_close(kv_pool.get_key_buffer(0)[prefix_slots], key0, rtol=0, atol=0)
