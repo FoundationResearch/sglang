@@ -541,6 +541,15 @@ class Req:
         self.hsa_lmk_enabled: bool = False
         self.hsa_page_size: Optional[int] = None
         self.hsa_lmk_id: Optional[int] = None
+        # HSA LMK decode scheduling state.
+        #
+        # When the next engine-visible position is the LMK slot, we insert an internal LMK step
+        # without breaking the user-visible autoregressive chain:
+        # - Step t samples visible token v; we emit v to user immediately.
+        # - Step t+1 runs LMK as input; its sampled output is discarded (internal).
+        # - Step t+2 uses v as input (so v's KV is written) and continues normally.
+        self.hsa_pending_visible_token_id: Optional[int] = None
+        self.hsa_waiting_for_lmk_step: bool = False
         self.session_id = session_id
         self.input_embeds = input_embeds
 
@@ -796,25 +805,52 @@ class Req:
         self.hsa_page_size = int(page_size)
         self.hsa_lmk_id = int(lmk_id)
 
-    def hsa_append_next_token_or_lmk(self, next_token_id: int) -> bool:
-        """Append the next token under HSA LMK semantics.
-
-        Returns:
-            True if a user-visible token was appended (output_ids + fill_ids updated).
-            False if an internal LMK was appended (fill_ids updated only).
-        """
+    def hsa_should_insert_lmk_next(self) -> bool:
+        """Whether the next engine-visible position is the LMK slot."""
         if not self.hsa_lmk_enabled:
-            self.output_ids.append(next_token_id)
-            return True
+            return False
         assert self.hsa_page_size is not None and self.hsa_lmk_id is not None
         page_size = int(self.hsa_page_size)
-        # If the next position is the LMK slot (last slot in the page), force LMK.
-        if (len(self.fill_ids) % page_size) == (page_size - 1):
+        return (len(self.fill_ids) % page_size) == (page_size - 1)
+
+    def hsa_decode_postprocess_sampled_token(
+        self, sampled_next_token_id: int
+    ) -> tuple[bool, int | None, bool]:
+        """Post-process a sampled next token under HSA-LMK decode semantics.
+
+        Returns:
+            (produced_visible_token, next_input_override, skip_finish_checks)
+        """
+        if not self.hsa_lmk_enabled:
+            self.output_ids.append(sampled_next_token_id)
+            return True, None, False
+
+        assert self.hsa_page_size is not None and self.hsa_lmk_id is not None
+
+        # Internal LMK step: discard the sampled token and restore next input to pending token.
+        if self.hsa_waiting_for_lmk_step:
+            pending = self.hsa_pending_visible_token_id
+            assert pending is not None
+            self.hsa_waiting_for_lmk_step = False
+            self.hsa_pending_visible_token_id = None
+            # The pending visible token becomes the next engine-visible token (to be consumed next step).
+            self.fill_ids.append(int(pending))
+            return False, int(pending), True
+
+        # Normal step: always emit sampled token to the user.
+        self.output_ids.append(sampled_next_token_id)
+
+        # If next engine-visible position is LMK slot, schedule LMK as next input and stash this token.
+        if self.hsa_should_insert_lmk_next():
+            self.hsa_pending_visible_token_id = int(sampled_next_token_id)
+            self.hsa_waiting_for_lmk_step = True
+            # Append LMK into engine-visible sequence, but do NOT append the sampled token yet.
             self.fill_ids.append(int(self.hsa_lmk_id))
-            return False
-        self.output_ids.append(next_token_id)
-        self.fill_ids.append(next_token_id)
-        return True
+            return True, int(self.hsa_lmk_id), False
+
+        # Otherwise, normal: append sampled token into engine-visible sequence.
+        self.fill_ids.append(int(sampled_next_token_id))
+        return True, None, False
 
     @staticmethod
     def _hsa_insert_lmk_prompt(token_ids: List[int], *, page_size: int, lmk_id: int) -> List[int]:
