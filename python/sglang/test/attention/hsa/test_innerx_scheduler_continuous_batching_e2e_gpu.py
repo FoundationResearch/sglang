@@ -35,11 +35,6 @@ def test_scheduler_continuous_batching_works_with_innerx_hsa_cuda():
     from sglang.srt.sampling.sampling_params import SamplingParams
     from sglang.srt.server_args import PortArgs, ServerArgs, set_global_server_args_for_scheduler
 
-    # This test starts a real Scheduler/ModelRunner, which initializes torch.distributed
-    # and model-parallel global groups. Other tests in the suite may also init these
-    # globals without tearing them down, so we defensively clean up before/after.
-    cleanup_dist_env_and_memory()
-
     # Build a minimal HF-like config folder for FlashHSA InnerX.
     # This keeps the test self-contained (no external checkpoint).
     with tempfile.TemporaryDirectory(prefix="sglang_innerx_sched_e2e_") as tmp:
@@ -70,150 +65,178 @@ def test_scheduler_continuous_batching_works_with_innerx_hsa_cuda():
         with open(os.path.join(tmp, "config.json"), "w", encoding="utf-8") as f:
             json.dump(cfg, f)
 
-        # Configure server args to make scheduling deterministic and lightweight.
-        server_args = ServerArgs(model_path=tmp)
-        server_args.load_format = "dummy"
-        server_args.device = "cuda"
-        server_args.dtype = "bfloat16"
-        server_args.trust_remote_code = True
-        server_args.skip_tokenizer_init = True
-        server_args.disable_cuda_graph = True
-        server_args.disable_overlap_schedule = True
-        # Keep KV cache pool small for unit tests (avoid allocating most of GPU memory).
-        server_args.mem_fraction_static = 0.02
-        server_args.max_total_tokens = 256
+        def _make_server_args() -> ServerArgs:
+            # Configure server args to make scheduling deterministic and lightweight.
+            server_args = ServerArgs(model_path=tmp)
+            server_args.load_format = "dummy"
+            server_args.device = "cuda"
+            server_args.dtype = "bfloat16"
+            server_args.trust_remote_code = True
+            server_args.skip_tokenizer_init = True
+            server_args.disable_cuda_graph = True
+            server_args.disable_overlap_schedule = True
+            server_args.random_seed = 1
+            # Keep KV cache pool small for unit tests (avoid allocating most of GPU memory).
+            server_args.mem_fraction_static = 0.02
+            server_args.max_total_tokens = 256
 
-        # Continuous batching capacity control (critical for this test).
-        server_args.max_running_requests = 2
-        server_args.max_prefill_tokens = 64
-        server_args.max_queued_requests = 16
-        server_args.context_length = 64
+            # Continuous batching capacity control (critical for this test).
+            server_args.max_running_requests = 2
+            server_args.max_prefill_tokens = 64
+            server_args.max_queued_requests = 16
+            server_args.context_length = 64
 
-        # InnerX/FlashHSA runtime knobs.
-        server_args.attention_backend = "hsa"
-        server_args.page_size = 4
-        server_args.hsa_lmk_id = int(cfg["vocab_size"])
+            # InnerX/FlashHSA runtime knobs.
+            server_args.attention_backend = "hsa"
+            server_args.page_size = 4
+            server_args.hsa_lmk_id = int(cfg["vocab_size"])
 
-        # Keep background features off.
-        server_args.enable_metrics = False
-        server_args.enable_trace = False
-        server_args.sleep_on_idle = False
-        server_args.disable_radix_cache = True
-        server_args.speculative_algorithm = None
-        server_args.enable_dp_attention = False
-        server_args.torchao_config = ""
-        server_args.tp_size = 1
-        server_args.pp_size = 1
-        server_args.dp_size = 1
-        server_args.ep_size = 1
+            # Keep background features off.
+            server_args.enable_metrics = False
+            server_args.enable_trace = False
+            server_args.sleep_on_idle = False
+            server_args.disable_radix_cache = True
+            server_args.speculative_algorithm = None
+            server_args.enable_dp_attention = False
+            server_args.torchao_config = ""
+            server_args.tp_size = 1
+            server_args.pp_size = 1
+            server_args.dp_size = 1
+            server_args.ep_size = 1
+            return server_args
 
-        # Some subsystems read global server args.
-        set_global_server_args_for_scheduler(server_args)
-        port_args = PortArgs.init_new(server_args)
-
-        sched = None
-        try:
-            sched = Scheduler(
-                server_args=server_args,
-                port_args=port_args,
-                gpu_id=0,
-                tp_rank=0,
-                moe_ep_rank=0,
-                pp_rank=0,
-                dp_rank=None,
+        def _mk_req(rid: str, max_new_tokens: int) -> TokenizedGenerateReqInput:
+            return TokenizedGenerateReqInput(
+                rid=rid,
+                http_worker_ipc=None,
+                input_text="",
+                input_ids=[1, 2, 3, 4],
+                mm_inputs=None,
+                sampling_params=SamplingParams(
+                    max_new_tokens=max_new_tokens,
+                    stop=[],
+                    stop_regex=[],
+                    temperature=0.0,
+                    top_p=1.0,
+                ),
+                return_logprob=False,
+                logprob_start_len=-1,
+                top_logprobs_num=0,
+                token_ids_logprob=[],
+                stream=False,
             )
 
-            # Enqueue three requests. r1 finishes first (max_new_tokens=1).
-            def _mk_req(rid: str, max_new_tokens: int):
-                return TokenizedGenerateReqInput(
-                    rid=rid,
-                    http_worker_ipc=None,
-                    input_text="",
-                    input_ids=[1, 2, 3, 4],
-                    mm_inputs=None,
-                    sampling_params=SamplingParams(
-                        max_new_tokens=max_new_tokens,
-                        stop=[],
-                        stop_regex=[],
-                        temperature=0.0,
-                        top_p=1.0,
-                    ),
-                    return_logprob=False,
-                    logprob_start_len=-1,
-                    top_logprobs_num=0,
-                    token_ids_logprob=[],
-                    stream=False,
+        def _run_scenario(*, dynamic_swap: bool) -> list[int]:
+            # Ensure a clean dist + model-parallel world per scenario (pytest runs multiple tests).
+            cleanup_dist_env_and_memory()
+            sched = None
+            try:
+                server_args = _make_server_args()
+                set_global_server_args_for_scheduler(server_args)
+                port_args = PortArgs.init_new(server_args)
+                sched = Scheduler(
+                    server_args=server_args,
+                    port_args=port_args,
+                    gpu_id=0,
+                    tp_rank=0,
+                    moe_ep_rank=0,
+                    pp_rank=0,
+                    dp_rank=None,
                 )
 
-            # Phase 1: enqueue r1/r2 first. We'll enqueue r3 later to exercise
-            # "continuous batching" dynamics (r3 arrives while decode is running).
-            for req in (_mk_req("r1", 2), _mk_req("r2", 6)):
-                sched.handle_generate_request(req)
+                if not dynamic_swap:
+                    # Baseline: run only r2 to completion.
+                    sched.handle_generate_request(_mk_req("r2", 6))
+                    rid_to_req = {r.rid: r for r in list(sched.waiting_queue)}
+                    assert {"r2"} <= set(rid_to_req.keys())
 
-            # Grab Req objects for completion checks.
-            rid_to_req = {r.rid: r for r in list(sched.waiting_queue)}
-            assert {"r1", "r2"} <= set(rid_to_req.keys())
+                    max_steps = 128
+                    for _ in range(max_steps):
+                        batch = sched.get_next_batch_to_run()
+                        sched.cur_batch = batch
+                        if batch is not None:
+                            result = sched.run_batch(batch)
+                            sched.process_batch_result(batch, result)
+                        sched.last_batch = batch
+                        if rid_to_req["r2"].finished():
+                            break
 
-            decode_rid_sets = []
-            max_steps = 128
-            enqueued_r3 = False
-            for _ in range(max_steps):
-                batch = sched.get_next_batch_to_run()
-                sched.cur_batch = batch
-                if batch is not None:
-                    if batch.forward_mode is not None and batch.forward_mode.is_decode():
-                        rid_set = frozenset(r.rid for r in batch.reqs)
-                        decode_rid_sets.append(rid_set)
-                        # Enqueue r3 after we have observed the first decode step of {r1,r2}.
-                        if (not enqueued_r3) and rid_set == frozenset({"r1", "r2"}):
-                            sched.handle_generate_request(_mk_req("r3", 4))
-                            # The new request should enter waiting_queue immediately.
-                            for r in list(sched.waiting_queue):
-                                if r.rid == "r3":
-                                    rid_to_req["r3"] = r
-                                    break
-                            assert "r3" in rid_to_req, "Failed to capture Req object for r3."
-                            enqueued_r3 = True
+                    out = list(rid_to_req["r2"].output_ids)
+                    assert len(out) == 6, f"Expected r2 to generate 6 tokens, got {len(out)}"
+                    return out
 
-                    result = sched.run_batch(batch)
-                    sched.process_batch_result(batch, result)
-                else:
-                    # idle
-                    pass
+                # Dynamic continuous batching: (r1,r2) -> enqueue r3 during decode -> (r2,r3).
+                for req in (_mk_req("r1", 2), _mk_req("r2", 6)):
+                    sched.handle_generate_request(req)
+                rid_to_req = {r.rid: r for r in list(sched.waiting_queue)}
+                assert {"r1", "r2"} <= set(rid_to_req.keys())
 
-                # Mirror the real scheduler event loop bookkeeping.
-                sched.last_batch = batch
+                decode_rid_sets = []
+                max_steps = 256
+                enqueued_r3 = False
+                for _ in range(max_steps):
+                    batch = sched.get_next_batch_to_run()
+                    sched.cur_batch = batch
+                    if batch is not None:
+                        if batch.forward_mode is not None and batch.forward_mode.is_decode():
+                            rid_set = frozenset(r.rid for r in batch.reqs)
+                            decode_rid_sets.append(rid_set)
+                            # Enqueue r3 after we have observed the first decode step of {r1,r2}.
+                            if (not enqueued_r3) and rid_set == frozenset({"r1", "r2"}):
+                                sched.handle_generate_request(_mk_req("r3", 4))
+                                for r in list(sched.waiting_queue):
+                                    if r.rid == "r3":
+                                        rid_to_req["r3"] = r
+                                        break
+                                assert "r3" in rid_to_req, "Failed to capture Req object for r3."
+                                enqueued_r3 = True
 
-                # Stop when all finished.
-                if enqueued_r3:
-                    if all(rid_to_req[rid].finished() for rid in ("r1", "r2", "r3")):
-                        break
-                else:
-                    if all(rid_to_req[rid].finished() for rid in ("r1", "r2")):
-                        break
+                        result = sched.run_batch(batch)
+                        sched.process_batch_result(batch, result)
 
-            _vprint("### scheduler continuous batching (decode rid sets)")
-            _vprint(decode_rid_sets)
+                    sched.last_batch = batch
 
-            assert decode_rid_sets, "No decode batch observed; scheduler did not run decode."
+                    if enqueued_r3:
+                        if all(rid_to_req[rid].finished() for rid in ("r1", "r2", "r3")):
+                            break
+                    else:
+                        if all(rid_to_req[rid].finished() for rid in ("r1", "r2")):
+                            break
 
-            # Must see replacement: {r1,r2} first, then later {r2,r3}.
-            i12 = next(
-                (i for i, s in enumerate(decode_rid_sets) if s == frozenset({"r1", "r2"})),
-                None,
-            )
-            i23 = next(
-                (i for i, s in enumerate(decode_rid_sets) if s == frozenset({"r2", "r3"})),
-                None,
-            )
-            assert i12 is not None, f"Did not observe decode batch {{r1,r2}} in {decode_rid_sets}"
-            assert i23 is not None, f"Did not observe decode batch {{r2,r3}} in {decode_rid_sets}"
-            assert i12 < i23, f"Expected {{r1,r2}} before {{r2,r3}} but got {i12=} {i23=}"
+                _vprint("### scheduler continuous batching (decode rid sets)")
+                _vprint(decode_rid_sets)
 
-            assert rid_to_req["r1"].finished()
-            assert rid_to_req["r2"].finished()
-            assert rid_to_req["r3"].finished()
-        finally:
-            # Ensure we don't leak global dist/model-parallel state across tests.
-            cleanup_dist_env_and_memory()
+                assert decode_rid_sets, "No decode batch observed; scheduler did not run decode."
+                i12 = next(
+                    (
+                        i
+                        for i, s in enumerate(decode_rid_sets)
+                        if s == frozenset({"r1", "r2"})
+                    ),
+                    None,
+                )
+                i23 = next(
+                    (
+                        i
+                        for i, s in enumerate(decode_rid_sets)
+                        if s == frozenset({"r2", "r3"})
+                    ),
+                    None,
+                )
+                assert i12 is not None, f"Did not observe decode batch {{r1,r2}} in {decode_rid_sets}"
+                assert i23 is not None, f"Did not observe decode batch {{r2,r3}} in {decode_rid_sets}"
+                assert i12 < i23, f"Expected {{r1,r2}} before {{r2,r3}} but got {i12=} {i23=}"
+
+                out = list(rid_to_req["r2"].output_ids)
+                assert len(out) == 6, f"Expected r2 to generate 6 tokens, got {len(out)}"
+                return out
+            finally:
+                cleanup_dist_env_and_memory()
+
+        # Correctness check: dynamic continuous batching should not change r2 outputs.
+        r2_out_single = _run_scenario(dynamic_swap=False)
+        r2_out_dynamic = _run_scenario(dynamic_swap=True)
+        assert (
+            r2_out_single == r2_out_dynamic
+        ), f"r2 outputs differ: single={r2_out_single} dynamic={r2_out_dynamic}"
 
