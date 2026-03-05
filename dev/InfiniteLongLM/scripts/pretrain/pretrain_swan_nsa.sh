@@ -1,6 +1,6 @@
 # export PYTHONPATH=./
-
-bash train_swan_nsa.sh tasks/ruler_sft.py configs/baselines/full_attn_tiny_cos.yaml \
+export PYTHONPATH="/root/VeOmni/.venv/lib/python3.11/site-packages:${PYTHONPATH}:/usr/local/lib/python3.11/site-packages"
+bash train.sh tasks/ruler_sft.py configs/baselines/full_attn_tiny_cos.yaml \
     --model.config_path configs/swan_nsa/config_swan_nsa.json \
     --data.train_path /apdcephfs_sh8/share_300719895/shared/data/dolma3_mix-6T-1025-partial-tokenized/ \
     --data.max_seq_len 8192 \
@@ -12,7 +12,7 @@ bash train_swan_nsa.sh tasks/ruler_sft.py configs/baselines/full_attn_tiny_cos.y
     --train.use_wandb true \
     --train.enable_gradient_checkpointing true \
     --train.rmpad false \
-    --train.wandb_name swan_nsa_nope \
+    --train.wandb_name swan_nsa_nope_ruler \
     --train.rmpad_with_pos_ids false \
     --train.enable_mixed_precision \
     --train.micro_batch_size 16 \
@@ -22,7 +22,7 @@ bash train_swan_nsa.sh tasks/ruler_sft.py configs/baselines/full_attn_tiny_cos.y
     --train.ulysses_parallel_size 1 \
     --train.save_steps 10000 \
     --train.max_steps 30000 \
-    --train.output_dir /apdcephfs_fsgm/share_303843174/user/qqzxywei/wxy/checkpoints/swan-nsa \
+    --train.output_dir /apdcephfs_fsgm/share_303843174/user/qqzxywei/wxy/checkpoints/swan-nsa-ruler \
     --train.wandb_project ruler_pretrain \
 
 # /apdcephfs_fsgm/share_303843174/shared/data/dolma3_long_tokenized

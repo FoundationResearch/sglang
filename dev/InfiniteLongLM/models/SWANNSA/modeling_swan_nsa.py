@@ -331,7 +331,7 @@ class NativeSparseAttention(nn.Module):
             )
         # print(f"[NSA Layer {self.layer_idx}] use_rope={self.use_rope}")
         batch_size, seq_len, _ = hidden_states.size()
-        
+        past_key_values = None # DEBUG for eval
         q = rearrange(self.q_proj(hidden_states), '... (h d) -> ... h d', d=self.head_dim)
         k = rearrange(self.k_proj(hidden_states), '... (h d) -> ... h d', d=self.head_dim)
         v = rearrange(self.v_proj(hidden_states), '... (h d) -> ... h d', d=self.head_dim)

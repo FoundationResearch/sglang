@@ -36,7 +36,7 @@ class RulerSynthesizer:
         self._mq_question = ' What are all the special magic numbers for {} mentioned in the provided text?'
         self._mq_answer = self.tokenizer.encode('. Answer: ')
 
-        self._fwe_tempalte = "[INST] Read the following coded text and track the frequency of each coded word. Find the three most frequently appeared coded words. {context}\nQuestion: Do not provide any explanation. Please ignore the dots '....'. What are the three most frequently appeared words in the above coded text? [/INST] Answer: According to the coded text above, the three most frequently appeared words are:"
+        self._fwe_tempalte = "[INST] Read the following coded text and track the frequency of each coded word. Find the three most frequently appeared coded words. {context}\nQuestion: Do not provide any explanation. Please ignore the dots '....'. What are the three most frequently appeared words in the above coded text? [/INST] Answer: According to the coded text above, the three most frequently appeared words are: "
         # self._fwe_wo_prefix_tempalte = "{context}\nQuestion: Do not provide any explanation. Please ignore the dots '....'. What are the three most frequently appeared words in the above coded text? [/INST] Answer: According to the coded text above, the three most frequently appeared words are:"
         self.task_id = task_id
         self.kwargs = kwargs

@@ -28,5 +28,6 @@
     "full_attn_interleave": 2,
     "chunk_size": 64,
     "hsa_topk": 32,
-    "_attn_implementation": "flash_attention_3"
+    "_attn_implementation": "flash_attention_3",
+    "retrieval_dim": 8192
 }

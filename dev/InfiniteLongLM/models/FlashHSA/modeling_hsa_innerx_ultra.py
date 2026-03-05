@@ -1,6 +1,8 @@
 from typing import Any, Callable, Optional, Tuple, Union
+from unittest import result
 
 import torch
+import random
 import math
 from torch import nn
 import torch.nn.functional as F
@@ -36,6 +38,7 @@ from veomni.utils.import_utils import (
 )
 from veomni.models.module_utils import GradientCheckpointingLayer
 from einops import rearrange, einsum
+from utils.landmark_utils import insert_special_tokens, create_position_ids_with_landmarks
 
 
 if is_torch_flex_attn_available():
@@ -65,27 +68,6 @@ def rms_norm(hidden_states, weight, variance_epsilon):
 
 def next_of_y(x, y):
     return (x + y - 1) // y * y
-
-
-def create_position_ids_with_landmarks(seq_length, chunk_size, device):
-    """
-    创建带有重复landmark位置的position_ids
-    
-    Args:
-        seq_length: 序列长度
-        chunk_size: chunk大小
-        device: 设备
-    
-    Returns:
-        position_ids: 每隔(chunk_size-1)个位置重复一次位置id的tensor
-    """
-    position_ids = torch.arange(0, seq_length, device=device)
-    # repeat lmk pos
-    position_ids = position_ids.view(-1, chunk_size - 1)  # (L // (chunk_size-1), chunk_size-1)
-    last_pos = position_ids[:, -1:]  # (L // (chunk_size-1), 1) - 取每个chunk的最后一个位置
-    position_ids = torch.cat([position_ids, last_pos], dim=-1)  # (L // (chunk_size-1), chunk_size) - 重复最后位置
-    position_ids = position_ids.view(-1)  # 展平回原始形状
-    return position_ids.unsqueeze(0)
 
 
 class Qwen3RMSNorm(nn.Module):
@@ -206,22 +188,27 @@ class HierarchicalSparseAttention(nn.Module):
         assert self.h_q % 4 == 0, "num_attention_heads must be divisible by 4"
         self.hsa_heads = getattr(config, "hsa_heads", self.h_q // 4)
         self.hsa_qk_ratio = getattr(config, "hsa_qk_ratio", 4)
-        assert self.hsa_qk_ratio > self.hsa_heads, "hsa_qk_ratio must be greater than hsa_heads"
+        assert self.hsa_heads % self.hsa_qk_ratio == 0, "hsa_heads must be divisible by hsa_qk_ratio"
         assert self.h_q % self.hsa_heads == 0, "num_attention_heads must be divisible by hsa_heads"
         self.hsa_denom = self.h_q // self.hsa_heads
 
+        assert self.hsa_denom > 1, "hsa_denom must be greater than 1"
         assert self.h_kv % self.hsa_denom == 0, "num_key_value_heads must be divisible by hsa_denom"
+
+        self.h_hsa_kv = self.hsa_heads // self.hsa_qk_ratio
+
 
         self.q_proj = nn.Linear(self.d_model, self.d_model * (self.hsa_denom - 1) // self.hsa_denom, bias=False)
         self.k_proj = nn.Linear(self.d_model, self.d_kv * (self.hsa_denom - 1) // self.hsa_denom, bias=False)
         self.v_proj = nn.Linear(self.d_model, self.d_kv * (self.hsa_denom - 1) // self.hsa_denom, bias=False)
         self.hsa_q_proj = nn.Linear(self.d_model, self.d_model // self.hsa_denom, bias=False)
-        self.hsa_k_proj = nn.Linear(self.d_model, self.d_model // self.hsa_denom // self.hsa_qk_ratio, bias=False)
-        self.hsa_v_proj = nn.Linear(self.d_model, self.d_model // self.hsa_denom // self.hsa_qk_ratio, bias=False)
+        self.hsa_k_proj = nn.Linear(self.d_model, self.h_hsa_kv * self.head_dim, bias=False)
+        self.hsa_v_proj = nn.Linear(self.d_model, self.h_hsa_kv * self.head_dim, bias=False)
 
         self.o_proj = nn.Linear(self.d_model, self.d_model, bias=False)
 
-        self.lmk_q_proj = nn.Linear(self.d_model, self.d_model // self.hsa_denom // self.hsa_qk_ratio, bias=False)
+        self.retrieval_dim = getattr(config, 'retrieval_dim', self.d_model // self.hsa_denom // self.hsa_qk_ratio)
+        self.lmk_q_proj = nn.Linear(self.d_model, self.retrieval_dim, bias=False)
         self.lmk_q_norm = Qwen3RMSNorm(self.head_dim)
 
         self.topk = config.hsa_topk
@@ -230,11 +217,11 @@ class HierarchicalSparseAttention(nn.Module):
         self.q_norm = Qwen3RMSNorm(self.head_dim)
         self.k_norm = Qwen3RMSNorm(self.head_dim)
 
-        self.enable_gate_attn = False
-        if getattr(config, "enable_gate", False):
-            self.enable_gate_attn = True
-            self.gate_proj = nn.Linear(self.d_model, self.d_model // self.hsa_denom, bias=False)
-
+        self.enable_stick_breaking = getattr(config, "enable_stick_breaking", False)
+        self.keep_kv_cache = getattr(config, "enable_kv_passing", False)
+        self.hsa_visible_window = getattr(config, "hsa_visible_window", -1)
+        if getattr(config, 'full_upper_hsa', False) and self.layer_idx >= config.num_hidden_layers // 2:
+            self.hsa_visible_window = -1
         self.scaling = self.head_dim ** -0.5
         self.sliding_window = config.sliding_window
         self.is_causal = True
@@ -246,8 +233,44 @@ class HierarchicalSparseAttention(nn.Module):
         self.hsa_func = HSA
         self.hsa_mode = hsa_mode
         
+        if self.keep_kv_cache:
+            self.register_buffer("prev_swa_k", None, persistent=False)
+            self.register_buffer("prev_swa_v", None, persistent=False)
+
+            self.register_buffer("prev_hsa_k", None, persistent=False)
+            self.register_buffer("prev_hsa_v", None, persistent=False)
+            self.register_full_backward_hook(
+                self._update_kv_cache,
+            )
 
         self.enable_softmax1 = config.enable_softmax1
+
+
+    def _update_kv_cache(self, module, grad_input, grad_output) -> None:
+        self.register_buffer("prev_swa_k", self.temp_swa_k, persistent=False)
+        self.register_buffer("prev_swa_v", self.temp_swa_v, persistent=False)
+
+        self.register_buffer("prev_hsa_k", self.temp_hsa_k, persistent=False)
+        self.register_buffer("prev_hsa_v", self.temp_hsa_v, persistent=False)
+    
+    def _compute_weights(self, scores, B, L, hidden_states):
+        # print(indices)
+        if not self.enable_stick_breaking:
+            if not self.enable_softmax1:
+                cat_scores = scores  # (B, L, h_q, K + 1)
+            else:
+                # softmax off by one
+                cat_scores = torch.cat([scores, torch.zeros(B, L, self.h_hsa_kv, 1, device=hidden_states.device)], dim=-1)
+            chunk_weights = F.softmax(cat_scores, dim=-1).to(hidden_states.dtype)
+        else:
+            scores_flipped = torch.flip(scores, dims=[-1]) 
+            softplus_x = F.softplus(scores_flipped, threshold=15.0)
+            assert not torch.any(torch.isnan(softplus_x))
+            softplus_x_cumsum = torch.cumsum(softplus_x, dim=-1)
+            chunk_weights_flipped = (scores_flipped - softplus_x_cumsum).exp()
+            chunk_weights = torch.flip(chunk_weights_flipped, dims=[-1])
+        
+        return chunk_weights
 
     def forward(self,
         hidden_states,
@@ -258,7 +281,7 @@ class HierarchicalSparseAttention(nn.Module):
         use_cache=False,
         cache_position=None,
         position_embeddings=None,
-        shared_kv=None,
+        kv_passing=False,
         **kwargs,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
         # x: (B, L, d)
@@ -269,6 +292,21 @@ class HierarchicalSparseAttention(nn.Module):
         swa_q = self.q_proj(hidden_states)  # (B, L, d)
         swa_q = rearrange(swa_q, 'B L (h d)->B L h d', d=self.head_dim)
         swa_q_norm = self.q_norm(swa_q)  # q_norm
+        swa_k = self.k_proj(hidden_states)
+        swa_k = rearrange(swa_k, 'B L (h d)->B L h d', d=self.head_dim)  # (B, L, h, d)
+        swa_k_norm = self.k_norm(swa_k)
+        swa_v = self.v_proj(hidden_states)
+        swa_v = rearrange(swa_v, 'B L (h d)->B L h d', d=self.head_dim)  # (B, L, h, d)
+
+        swa_q_norm = swa_q_norm.transpose(1, 2)
+        swa_k_norm = swa_k_norm.transpose(1, 2)
+        swa_v = swa_v.transpose(1, 2)  # (B, h, L, d)
+        cos, sin = position_embeddings
+
+        # The position embedding should be compatible with kv passing
+        assert swa_q_norm.shape[2] == swa_k_norm.shape[2], f'{swa_q_norm.shape} vs {swa_k_norm.shape}'
+        swa_q_norm, swa_k_norm = apply_rotary_pos_emb(swa_q_norm, swa_k_norm, cos, sin)
+
         hsa_q = self.hsa_q_proj(hidden_states)
         hsa_q = rearrange(hsa_q, 'B L (h d)->B L h d', d=self.head_dim)
         hsa_q_norm = self.q_norm(hsa_q)
@@ -276,19 +314,38 @@ class HierarchicalSparseAttention(nn.Module):
         lmk_q = rearrange(lmk_q, 'B L (h d)->B L h d', d=self.head_dim)
         lmk_q_norm = self.lmk_q_norm(lmk_q)  # (B, L, h_kv * d // 2)
 
-        swa_k = self.k_proj(hidden_states)
-        swa_k = rearrange(swa_k, 'B L (h d)->B L h d', d=self.head_dim)  # (B, L, h, d)
-        swa_k_norm = self.k_norm(swa_k)
-
         hsa_k = self.hsa_k_proj(hidden_states)
         hsa_k = rearrange(hsa_k, 'B L (h d)->B L h d', d=self.head_dim)
         hsa_k_norm = self.k_norm(hsa_k)
-        
-        swa_v = self.v_proj(hidden_states)
-        swa_v = rearrange(swa_v, 'B L (h d)->B L h d', d=self.head_dim)  # (B, L, h, d)
 
         hsa_v = self.hsa_v_proj(hidden_states)
         hsa_v = rearrange(hsa_v, 'B L (h d)->B L h d', d=self.head_dim)
+
+        q_offset = 0
+        if self.keep_kv_cache and self.training:
+            # randomly drop previous kv cache
+            if kv_passing:
+                if self.prev_swa_k is not None and self.prev_swa_v is not None:
+                    swa_k_norm = torch.cat([self.prev_swa_k, swa_k_norm], dim=2) # w/ rope, RMSNormed
+                    swa_v = torch.cat([self.prev_swa_v, swa_v], dim=2)
+
+                if self.prev_hsa_k is not None and self.prev_hsa_v is not None:
+                    hsa_k_norm = torch.cat([self.prev_hsa_k, hsa_k_norm], dim=1) # w/o rope, RMSNormed
+                    hsa_v = torch.cat([self.prev_hsa_v, hsa_v], dim=1)
+                    q_offset = self.prev_hsa_v.shape[1]
+                
+            trunc_swa_k = swa_k_norm[:, :, -self.sliding_window:, :].detach()
+            trunc_swa_v = swa_v[:, :, -self.sliding_window:, :].detach()
+
+            trunc_hsa_k = hsa_k_norm[:, -(self.chunk_size * self.topk):, :, :].detach()
+            trunc_hsa_v = hsa_v[:, -(self.chunk_size * self.topk):, :, :].detach()
+
+            self.register_buffer("temp_swa_k", trunc_swa_k, persistent=False)
+            self.register_buffer("temp_swa_v", trunc_swa_v, persistent=False)
+
+            self.register_buffer("temp_hsa_k", trunc_hsa_k, persistent=False)
+            self.register_buffer("temp_hsa_v", trunc_hsa_v, persistent=False)
+
 
         attention_interface: Callable = eager_attention_forward
         if self.config._attn_implementation != "eager":
@@ -299,12 +356,6 @@ class HierarchicalSparseAttention(nn.Module):
                 )
             else:
                 attention_interface = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
-
-        swa_q_norm = swa_q_norm.transpose(1, 2)
-        swa_k_norm = swa_k_norm.transpose(1, 2)
-        swa_v = swa_v.transpose(1, 2)  # (B, h, L, d)
-        cos, sin = position_embeddings
-        swa_q_norm, swa_k_norm = apply_rotary_pos_emb(swa_q_norm, swa_k_norm, cos, sin)
 
         swa_o, _ = attention_interface(
             self,
@@ -318,20 +369,26 @@ class HierarchicalSparseAttention(nn.Module):
             **kwargs,
         )  # (B, L, h_q // 2, d)
 
-        lmk_k: Any = hsa_k_norm[:, self.chunk_size - 1::self.chunk_size, : ,:]  # (B, L // S, h_kv // 2, d)
-        indices, scores = self.topk_func(lmk_q_norm, lmk_k, self.topk, block_size=self.chunk_size, window_size=0, is_causal=True)
-        if not self.enable_softmax1:
-            cat_scores = scores  # (B, L, h_q, K + 1)
-        else:
-            # softmax off by one
-            cat_scores = torch.cat([scores, torch.zeros(B, L, self.h_q // self.hsa_denom, 1, device=hidden_states.device)], dim=-1)
-        chunk_weights = F.softmax(cat_scores, dim=-1) 
+        lmk_k: Any = hsa_k_norm[:, self.chunk_size - 1::self.chunk_size, : ,:]  # (B, L // S, h_kv // 2, d
+        if L >= self.chunk_size:
+            hsa_visible_window = self.hsa_visible_window if self.training else -1
+            indices, scores = self.topk_func(
+                lmk_q_norm, 
+                lmk_k, 
+                self.topk, 
+                block_size=self.chunk_size, 
+                window_size=0,
+                memory_window_size=hsa_visible_window,
+                q_offset=q_offset,
+                is_causal=True
+            )
+            # print(f'scores shape: {scores.shape}, lmk q shape: {lmk_q_norm.shape}, kv_shape: {lmk_k.shape}')
 
-        hsa_o = self.hsa_func(hsa_q_norm, hsa_k_norm, hsa_v, weights=chunk_weights, indices=indices, block_size=self.chunk_size, mask_last_token=True)
-        if self.enable_gate_attn:
-            gate = self.gate_proj(hidden_states)
-            gate = rearrange(gate, 'B L (h d)-> B L h d', d=self.head_dim)
-            hsa_o = hsa_o * F.sigmoid(gate)
+            chunk_weights = self._compute_weights(scores, B, L, hidden_states)
+
+            hsa_o = self.hsa_func(hsa_q_norm, hsa_k_norm, hsa_v, weights=chunk_weights, indices=indices, block_size=self.chunk_size, mask_last_token=True)
+        else:
+            hsa_o = torch.zeros(B, L, self.hsa_heads, self.head_dim, device=hidden_states.device, dtype=hidden_states.dtype)
         o = torch.cat([swa_o, hsa_o], dim=2)
         o = rearrange(o, 'B L h d->B L (h d)')
         
@@ -671,8 +728,11 @@ class HSAModel(Qwen3PreTrainedModel):
 
         self.embed_tokens = nn.Embedding(self.vocab_size, config.hidden_size, self.padding_idx)
         self.full_attn_interleave = config.full_attn_interleave
+        self.num_swa_layers = getattr(config, "num_swa_layers", 0)
         def layer_type(layer_idx: int):
-            if self.full_attn_interleave > 0 and (layer_idx % self.full_attn_interleave == self.full_attn_interleave - 1):
+            if layer_idx < self.num_swa_layers:
+                return Qwen3Attention
+            if self.full_attn_interleave > 0 and ((layer_idx - self.num_swa_layers) % self.full_attn_interleave == self.full_attn_interleave - 1):
                 return HierarchicalSparseAttention
             else:
                 return Qwen3Attention
@@ -683,6 +743,11 @@ class HSAModel(Qwen3PreTrainedModel):
         self.rotary_emb = Qwen3RotaryEmbedding(config=config)
         self.gradient_checkpointing = False
         self.has_sliding_layers = "sliding_attention" in self.config.layer_types
+
+        self.enable_kv_passing = getattr(config, "enable_kv_passing", False)
+        if self.enable_kv_passing:
+            self.reset_interval = getattr(config, "reset_interval", 64)
+            self.accum_cnt = 0
 
         # Initialize weights and apply final processing
         self.post_init()
@@ -733,17 +798,23 @@ class HSAModel(Qwen3PreTrainedModel):
         if use_cache and past_key_values is None:
             past_key_values = DynamicCache()
 
-        # 打印cache_position用于debug
-        # print(f'Initial cache_position: {cache_position}')
         if cache_position is None:
             past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
             cache_position = torch.arange(
                 past_seen_tokens, past_seen_tokens + inputs_embeds.shape[1], device=inputs_embeds.device
             )
-        # 打印cache_position用于debug
-        # print(f'cache_position: {cache_position}')
+        
         if position_ids is None:
             position_ids = cache_position.unsqueeze(0)
+
+        # kv_passing only works in training
+        kv_passing = False
+        if self.training and self.enable_kv_passing:
+            offset = input_ids.shape[1] * self.accum_cnt
+            position_ids = position_ids + offset
+            if self.accum_cnt > 0:
+                kv_passing = True
+            self.accum_cnt = (self.accum_cnt + 1) % self.reset_interval
 
         # It may already have been prepared by e.g. `generate`
         if not isinstance(causal_mask_mapping := attention_mask, dict):
@@ -790,6 +861,7 @@ class HSAModel(Qwen3PreTrainedModel):
                 use_cache=use_cache,
                 cache_position=cache_position,
                 position_embeddings=position_embeddings,
+                kv_passing=kv_passing,
                 **flash_attn_kwargs,
             )
 
@@ -827,6 +899,8 @@ class HSAForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
         self.chunk_size = config.chunk_size
         self.lmk_id = config.vocab_size
         self.lm_head = nn.Linear(config.hidden_size, self.vocab_size, bias=False)
+        self.adjust_lmk_pos = getattr(config, "adjust_lmk_pos", False)
+        self.flatten_ids = getattr(config, 'flatten_ids', False)
 
         # Initialize weights and apply final processing
         self.post_init()
@@ -848,16 +922,7 @@ class HSAForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
 
     def get_decoder(self):
         return self.model
-
-    def _insert_special_tokens(self, input_ids, fill_id):
-        N = input_ids.shape[0]
-        input_ids_ = input_ids.view(N, -1, self.chunk_size - 1)  # (N, L / cz, cz)
-        chunk_num = input_ids_.shape[1]
-        chunk_id_padding = torch.ones(N, chunk_num, 1, device=input_ids.device, dtype=torch.long).fill_(fill_id)
-        # chunked_input_ids = torch.cat([input_ids_, chunk_id_padding], dim=2)  # (N, L / cz, cz+1)
-        chunked_input_ids = torch.cat([input_ids_, chunk_id_padding], dim=2)  # (N, L / cz, cz+1)
-        chunked_input_ids = chunked_input_ids.view(N, -1)  # (N, L // cz * (cz + 1))
-        return chunked_input_ids
+    
 
     @can_return_tuple
     @add_start_docstrings_to_model_forward(QWEN3_INPUTS_DOCSTRING)
@@ -914,12 +979,15 @@ class HSAForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
         )
 
         if self.training:
-            assert input_ids.shape[-1] % (self.chunk_size - 1) == 0, f'input length {input_ids.shape[-1]} not multiple of {self.chunk_size - 1} during training'
-            # position_ids = create_position_ids_with_landmarks(
-            #     input_ids.shape[1], self.chunk_size, input_ids.device
-            # )
+            if self.flatten_ids:
+                input_ids = input_ids.view(1, -1)
 
-            input_ids = self._insert_special_tokens(input_ids, self.lmk_id)
+            if self.adjust_lmk_pos:
+                position_ids = create_position_ids_with_landmarks(
+                    input_ids.shape[1], self.chunk_size, input_ids.device
+                )
+
+            input_ids = insert_special_tokens(input_ids, self.lmk_id, self.chunk_size)
             
             if labels is not None:
                 sp_enabled = get_parallel_state().sp_enabled
@@ -927,11 +995,11 @@ class HSAForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
                     # labels have not been shifted
                     labels = torch.roll(labels, shifts=-1, dims=-1)
                     labels[:, -1] = -100
-                    labels = self._insert_special_tokens(labels, -100)
+                    labels = insert_special_tokens(labels, -100, self.chunk_size)
                     labels = torch.roll(labels, shifts=1, dims=-1)
                 else:
                     # labels have been shifted
-                    labels = self._insert_special_tokens(labels, -100)
+                    labels = insert_special_tokens(labels, -100, self.chunk_size)
 
         # decoder outputs consists of (dec_features, layer_state, dec_hidden, dec_attn)
 

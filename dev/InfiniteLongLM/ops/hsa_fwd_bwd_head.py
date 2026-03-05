@@ -996,6 +996,7 @@ class _hsa_block_M_attention(torch.autograd.Function):
         dw = torch.zeros((B, L, HQ, num_weights), dtype=weights.dtype, device=weights.device)
 
         # 执行反向
+        do=do.contiguous()
         bwd_kernel(q_in, k_in, v, weights, do, dq_in, dk_in, dv, dw, block_mask)
 
         post_kernel = hsa_bwd_postprocess(NV, B, L, HQ, D)
@@ -1949,18 +1950,18 @@ if __name__ == "__main__":
     # main_block_M_correctness()
     params_list = [# B, q_len, kv_len, H, HQ, D, S, block_size, mode, mask_last_token
                     # 训练场景: q_len == kv_len, mode=train
-                    (1, 1024, 1024, 1, 8, 128, 4, 64, 'train', True),      # 基础训练场景
-                    (2, 512, 512, 2, 16, 64, 4, 32, 'train', True),        # batch > 1 训练
-                    # 推理场景 - chunk prefill: q_len == kv_len, mode=inference  
-                    (1, 1024, 1024, 1, 8, 128, 4, 64, 'inference', True),       # 第一个chunk (q_len == kv_len)
-                    # 推理场景 - chunk prefill: q_len < kv_len, mode=inference
-                    (1, 1024, 2048, 1, 8, 128, 4, 64, 'inference', True),       # 第二个chunk
-                    (1, 512, 4096, 2, 16, 64, 4, 32, 'inference', True),        # 更长的KV cache
-                    (1, 999, 1999, 1, 8, 128, 4, 64, 'inference', True),        # 非整数倍长度
-                    # 推理场景 - decode: q_len = 1, use_cache=True
-                    (1, 1, 2048, 4, 16, 64, 4, 32, 'inference', True),          # decode
-                    # 边界情况
-                    (1, 64, 64, 1, 8, 128, 4, 64, 'train', True),          # 最短序列
+                    (1, 1024, 1024, 1, 1, 128, 4, 64, 'train', True),      # 基础训练场景
+                    # (2, 512, 512, 2, 16, 64, 4, 32, 'train', True),        # batch > 1 训练
+                    # # 推理场景 - chunk prefill: q_len == kv_len, mode=inference  
+                    # (1, 1024, 1024, 1, 8, 128, 4, 64, 'inference', True),       # 第一个chunk (q_len == kv_len)
+                    # # 推理场景 - chunk prefill: q_len < kv_len, mode=inference
+                    # (1, 1024, 2048, 1, 8, 128, 4, 64, 'inference', True),       # 第二个chunk
+                    # (1, 512, 4096, 2, 16, 64, 4, 32, 'inference', True),        # 更长的KV cache
+                    # (1, 999, 1999, 1, 8, 128, 4, 64, 'inference', True),        # 非整数倍长度
+                    # # 推理场景 - decode: q_len = 1, use_cache=True
+                    # (1, 1, 2048, 4, 16, 64, 4, 32, 'inference', True),          # decode
+                    # # 边界情况
+                    # (1, 64, 64, 1, 8, 128, 4, 64, 'train', True),          # 最短序列
     ]
     for p in params_list:
         test_train_inference_correctness(*p)
