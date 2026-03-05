@@ -28,33 +28,18 @@ class KahanSum:
         return self.sum
 
 def insert_special_tokens(input_ids, fill_id, chunk_size):
-    """
-    每隔 chunk_size 个 token 插入一个特殊 token
-    支持 L 不能被 chunk_size 整除的情况
-    
-    Args:
-        input_ids: (N, L) 输入 token ids
-        fill_id: 要插入的特殊 token id
-        add_last: 是否在最后一个不完整的 chunk 后也插入特殊 token
-    
-    Returns:
-        chunked_input_ids: 插入特殊 token 后的 ids
-    """
     N, L = input_ids.shape
     chunk_size = chunk_size
     
-    # 计算完整的 chunk 数量和剩余的 token 数量
     full_chunks = L // (chunk_size - 1)
     remainder = L % (chunk_size - 1)
     
     result_parts = []
     
-    # 处理完整的 chunks
     if full_chunks > 0:
         full_part = input_ids[:, :full_chunks * (chunk_size - 1)]  # (N, full_chunks * (chunk_size - 1))
         full_part = full_part.view(N, full_chunks, chunk_size - 1)  # (N, full_chunks, chunk_size - 1)
         
-        # 在每个 chunk 后添加特殊 token
         chunk_id_padding = torch.full(
             (N, full_chunks, 1), fill_id, 
             device=input_ids.device, dtype=input_ids.dtype
@@ -63,7 +48,6 @@ def insert_special_tokens(input_ids, fill_id, chunk_size):
         full_part_with_special = full_part_with_special.view(N, -1)  # (N, full_chunks * (chunk_size+1))
         result_parts.append(full_part_with_special)
     
-    # 处理剩余部分（不完整的 chunk）
     if remainder > 0:
         remainder_part = input_ids[:, full_chunks * chunk_size:]  # (N, remainder)
         result_parts.append(remainder_part)
@@ -71,6 +55,32 @@ def insert_special_tokens(input_ids, fill_id, chunk_size):
     chunked_input_ids = torch.cat(result_parts, dim=1)
     
     return chunked_input_ids
+
+def create_position_ids_with_landmarks(seq_length, chunk_size, device):
+    L = seq_length
+    position_ids = torch.arange(0, seq_length, device=device)
+
+    full_chunks = L // (chunk_size - 1)
+    remainder = L % (chunk_size - 1)
+
+    result_parts = []
+
+    if full_chunks > 0:
+        full_part = position_ids[:full_chunks * (chunk_size - 1)]
+
+        # repeat lmk pos
+        full_part = full_part.view(-1, chunk_size - 1)
+        last_pos = full_part[:, -1:] + 1 
+        full_part = torch.cat([full_part, last_pos], dim=-1) 
+        full_part = full_part.view(-1)
+        result_parts.append(full_part)
+    
+    if remainder > 0:
+        remainder_part = position_ids[full_chunks * chunk_size:]  # (N, remainder)
+        result_parts.append(remainder_part)
+    
+    pos = torch.cat(result_parts, dim=0)
+    return pos.unsqueeze(0)
 
 def main(args):
 
@@ -124,32 +134,61 @@ def main(args):
 
         input_ids = inputs['input_ids']
         label_ids = input_ids
+        pos_ids = None
         if args.insert_lmk:
             input_ids = insert_special_tokens(input_ids, fill_id=tokenizer.vocab_size, chunk_size=64)
             label_ids = torch.roll(label_ids, shifts=-1, dims=-1)
             label_ids[:, -1] = -100
             label_ids = insert_special_tokens(label_ids, fill_id=-100, chunk_size=64)
             label_ids = torch.roll(label_ids, shifts=1, dims=-1)
+
+            if args.adjust_lmk_pos:
+                pos_ids = create_position_ids_with_landmarks(args.max_seq_len, chunk_size=args.chunk_size, device=device)
             
-            # label_ids = insert_special_tokens(, fill_id=-100, chunk_size=64)
+        # label_ids = insert_special_tokens(, fill_id=-100, chunk_size=64)
         # print(f'{input_ids.shape}')
         # print(input_ids[:, 63::64])
         # print(tokenizer.decode(input_ids[0,:20]))
+
+
+        # with torch.amp.autocast('cuda', dtype=torch.bfloat16), torch.no_grad():
+        #     result = model(input_ids, position_ids=pos_ids, use_cache=True)
+
+        # ce_fct = nn.CrossEntropyLoss()
+        # out_len = result.logits.shape[1]
+        # if args.last_k_tokens is not None:
+        #     out_len = min(out_len, args.last_k_tokens)
+        # loss = ce_fct(result.logits[:, -out_len :-1, :].view(-1, result.logits.shape[-1]), label_ids[:, -out_len + 1:].view(-1).to(torch.long))
+
+        # automatic logits_to_keep
+        kwargs = {}
+        if args.last_k_tokens > 0:
+            kwargs['logits_to_keep'] = args.last_k_tokens + 1
+
         with torch.amp.autocast('cuda', dtype=torch.bfloat16), torch.no_grad():
-            result = model(input_ids, use_cache=True)
+            result = model(input_ids, position_ids=pos_ids, use_cache=True, **kwargs)
 
         ce_fct = nn.CrossEntropyLoss()
         out_len = result.logits.shape[1]
-        if args.last_k_tokens is not None:
-            out_len = min(out_len, args.last_k_tokens)
+        
+        if args.last_k_tokens > 0:
+            out_len = min(out_len, args.last_k_tokens + 1)
+            
         loss = ce_fct(result.logits[:, -out_len :-1, :].view(-1, result.logits.shape[-1]), label_ids[:, -out_len + 1:].view(-1).to(torch.long))
+        
+
         # mean_loss += (loss - mean_loss) / steps
         loss_accum.add(loss.item())
-        if steps % 10 == 0:
+        if steps % 100 == 0:
             print(f'step: {steps}, mean_loss: {loss_accum.get() / steps}')
 
         if args.max_samples > 0 and steps >= args.max_samples:
             break
+    # final ppl
+    import math
+    final_mean_loss = loss_accum.get() / steps
+    ppl = math.exp(final_mean_loss)
+    print(f'Test Length: {args.max_seq_len}, Final Mean Loss: {final_mean_loss:.4f}, PPL: {ppl:.4f}')
 
 
 if __name__ == "__main__":
@@ -159,6 +198,7 @@ if __name__ == "__main__":
     cmd.add_argument('--data_path', required=True, type=str, help='path to the training corpus')
     # cmd.add_argument('--output_dir', default='/root/')
     cmd.add_argument('--max_seq_len', default=16384, type=int)
+    cmd.add_argument('--chunk_size', default=64, type=int)
     cmd.add_argument('--insert_lmk', action='store_true')
     cmd.add_argument('--checkpoint_path', required=False, type=str, help='directory of the checkpoints')
     cmd.add_argument('--use_cache', action='store_true')
@@ -166,6 +206,7 @@ if __name__ == "__main__":
     cmd.add_argument('--inference_segment', type=int, default=-1)
     cmd.add_argument('--max_samples', default=-1, type=int, help='max samples to eval')
     cmd.add_argument('--parallel_mode', default='fsdp1', type=str)
+    cmd.add_argument('--adjust_lmk_pos', action='store_true')
     args = cmd.parse_args(sys.argv[1:])
     print(args)
     main(args)

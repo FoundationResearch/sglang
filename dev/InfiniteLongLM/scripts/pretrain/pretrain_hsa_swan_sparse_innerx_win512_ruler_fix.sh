@@ -13,7 +13,7 @@ bash train.sh tasks/ruler_sft.py configs/baselines/full_attn_tiny_cos.yaml \
     --train.enable_gradient_checkpointing true \
     --train.rmpad false \
     --train.wandb_project ruler_pretrain \
-    --train.wandb_name hsa_swan_innerx_top32_win512_fix \
+    --train.wandb_name hsa_swan_innerx_top32_win512_fix2 \
     --train.rmpad_with_pos_ids false \
     --train.enable_mixed_precision \
     --train.micro_batch_size 16 \
@@ -24,7 +24,7 @@ bash train.sh tasks/ruler_sft.py configs/baselines/full_attn_tiny_cos.yaml \
     --train.save_steps 10000 \
     --train.max_steps 30000 \
     --train.load_checkpoint_path auto \
-    --train.output_dir /apdcephfs_sh8/share_300719895/shawnxxxhu/checkpoints/hsa-swan-innerx-top32-win512-ruler-fix
+    --train.output_dir /apdcephfs_sh8/share_300719895/shawnxxxhu/checkpoints/hsa-swan-innerx-top32-win512-ruler-fix2
 
 # /apdcephfs_fsgm/share_303843174/shared/data/dolma3_long_tokenized
 # --model.config_path configs/flash_hsa/config_nope_top16.json \

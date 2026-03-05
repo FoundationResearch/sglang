@@ -1,12 +1,12 @@
-# export PYTHONPATH=./
+export PYTHONPATH=./
 
-# python eval/eval_ppl.py \
-#     --config_path ./configs/swan_gpt_tiny/config_nope_full.json \
-#     --vocab_dir ./configs/olmo3_vocab/ \
-#     --checkpoint_path ../checkpoints/full-attn-nope-tiny-olmo3pt-8K/checkpoints/global_step_30000 \
-#     --data_path /apdcephfs_sh8/share_300719895/shared/data/dolma3_mix-6T-1025-partial-tokenized \
-#     --max_seq_len 8192 \
-#     --max_samples 1000
+python eval/eval_ppl.py \
+    --config_path ./configs/swan_gpt_tiny/config_nope_full.json \
+    --vocab_dir ./configs/olmo3_vocab/ \
+    --checkpoint_path /apdcephfs_fsgm/share_303843174/user/shawnxxxhu/checkpoints/full-attn-nope-tiny-olmo3pt-8K/checkpoints/global_step_30000 \
+    --data_path /apdcephfs_sh8/share_300719895/shared/data/dolma3_mix-6T-1025-partial-tokenized \
+    --max_seq_len 8192 \
+    --max_samples 1000
 
 # export MASTER_PORT=22341
 
@@ -35,15 +35,15 @@
 
 
 
-# torchrun --nproc_per_node=1  eval/eval_ruler.py \
-python eval/eval_ruler.py \
-    --config_path configs/swan_gpt_tiny/config_nope_full.json  \
-    --vocab_dir configs/olmo3_vocab/ \
-    --corpus_path /apdcephfs_sh8/share_300719895/shared/data/dolma3_mix-6T-1025-partial-tokenized/ \
-    --checkpoint_path /apdcephfs_fsgm/share_303843174/user/shawnxxxhu/checkpoints/full-attn-nope-ruler/checkpoints/global_step_3000 \
-    --task_id 2 \
-    --segment_size -1 \
-    --max_seq_len $((8*1024))  \
-    --max_samples 100 \
-    --tp_size 1 \
-    --verbose 
+# # torchrun --nproc_per_node=1  eval/eval_ruler.py \
+# python eval/eval_ruler.py \
+#     --config_path configs/swan_gpt_tiny/config_nope_full.json  \
+#     --vocab_dir configs/olmo3_vocab/ \
+#     --corpus_path /apdcephfs_sh8/share_300719895/shared/data/dolma3_mix-6T-1025-partial-tokenized/ \
+#     --checkpoint_path /apdcephfs_fsgm/share_303843174/user/shawnxxxhu/checkpoints/full-attn-nope-ruler/checkpoints/global_step_3000 \
+#     --task_id 2 \
+#     --segment_size -1 \
+#     --max_seq_len $((8*1024))  \
+#     --max_samples 100 \
+#     --tp_size 1 \
+#     --verbose 

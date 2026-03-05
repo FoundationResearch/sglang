@@ -606,6 +606,7 @@ class DRTForCausalLM(DRTPreTrainedModel, GenerationMixin):
         cache_params: Optional[DRTCache] = None,
         # total_seq_len: Optional[int] = None,
         output_whole_logits: Optional[bool] = False,
+        logits_to_keep: Union[int, torch.Tensor] = 0,
         **kwargs,  # for now we need this for generation
     ) -> Union[Tuple, DRTCausalLMOutput]:
         r"""
@@ -715,7 +716,14 @@ class DRTForCausalLM(DRTPreTrainedModel, GenerationMixin):
                 **kwargs,
             )
         else:
-            logits = self.lm_head(hidden_states.to(self.lm_head.weight.dtype)).float()
+            # logits = self.lm_head(hidden_states.to(self.lm_head.weight.dtype)).float()
+            # 根据 logits_to_keep 对 hidden_states 进行切片，只计算需要的 logits（参考 SWANGPT）
+            if isinstance(logits_to_keep, int) and logits_to_keep > 0:
+                hidden_states = hidden_states[:, -logits_to_keep:, :]
+            elif isinstance(logits_to_keep, torch.Tensor):
+                hidden_states = hidden_states[:, logits_to_keep, :]
+            logits = self.lm_head(hidden_states.to(self.lm_head.weight.dtype)).float() 
+
 
 
         if not return_dict:

@@ -43,6 +43,8 @@ import math
 def fused_topk_forward_kernel_insert(
     batch, seq_len, s_len, heads, head_dim, topk,
     block_size, window_size,is_causal,
+    memory_window_size=-1,
+    q_offset: int = 0,
     BLOCK_L=None, BLOCK_S=None, threads=None
 ):
     """
@@ -112,7 +114,9 @@ def fused_topk_forward_kernel_insert(
             loop_limit = num_s_blocks
             if is_causal:
                 tq_max = T.min(seq_len - 1, base_l + (BLOCK_L - 1))
-                block_q_max = tq_max // block_size  # int
+                # block_q_max = tq_max // block_size  # int
+                tq_max_global = q_offset + tq_max 
+                block_q_max = tq_max_global // block_size
                 loop_limit = T.min(loop_limit, tilelang.cdiv(block_q_max, BLOCK_S))
 
             for s_block in T.serial(loop_limit):
@@ -137,12 +141,21 @@ def fused_topk_forward_kernel_insert(
 
                 if (my_l < BLOCK_L) and (tq < seq_len):
                     # block_q = tq // block_size
-                    limit_chunk = (tq - window_size + 1) // block_size
+                    # limit_chunk = (tq - window_size + 1) // block_size
+                    tq_global = q_offset + tq
+                    limit_chunk = (tq_global - window_size + 1) // block_size
+
+                    # --- 新增: 下界计算 (Sliding Window Start) ---
+                    min_chunk = -1
+                    if memory_window_size > 0:
+                        min_chunk = (tq_global - memory_window_size) // block_size
+
                     for s_idx in T.serial(BLOCK_S):
                         ts = base_s + s_idx
                         if ts < s_len:
                             # if (not is_causal) or (ts < block_q):
-                            if (not is_causal) or (ts < limit_chunk):
+                            # if (not is_causal) or (ts < limit_chunk):
+                            if (ts >= min_chunk) and ((not is_causal) or (ts < limit_chunk)):
                                 cur = score_shared[my_l, s_idx] * sm_scale
 
                                 if cur > topk_scores[topk - 1]:
@@ -1201,6 +1214,7 @@ def sort_topk_indices_scores_kernel(
                                     if key_i < key_j:
                                         do_swap = True
 
+
                                 if do_swap:
                                     idx_shared[l_idx, i_idx] = val_j
                                     idx_shared[l_idx, ixj] = val_i
@@ -1222,7 +1236,7 @@ def sort_topk_indices_scores_kernel(
 
 class OnlineTopKFusedFn(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, q, lmks, topk: int, fwd_kernel, bwd_kernel, sort_kernel):
+    def forward(ctx, q, lmks, topk: int, fwd_kernel, sort_kernel):
         B, L, h_q, D = q.shape
         B2, S, h_kv, D2 = lmks.shape
         dtype = q.dtype
@@ -1242,7 +1256,6 @@ class OnlineTopKFusedFn(torch.autograd.Function):
         ctx.h_kv = h_kv
         ctx.G = G
         ctx.topk = topk
-        ctx.bwd_kernel = bwd_kernel
         ctx.shapes = (B, L, S, h_kv, D)
         
         return scores_sorted.to(dtype), indices_sorted
@@ -1299,20 +1312,22 @@ class OnlineTopKFusedFn(torch.autograd.Function):
         grad_q = grad_q * sm_scale
         grad_lmks = grad_lmks * sm_scale
         
-        return grad_q, grad_lmks, None, None, None, None
+        return grad_q, grad_lmks, None, None, None
 
 
 class OnlineTopK_Fused(torch.nn.Module):
-    def __init__(self, topk, block_size, window_size, is_causal):
+    def __init__(self, topk, block_size, window_size, is_causal, memory_window_size, q_offset: int = 0):
         super().__init__()
         self.topk = topk
         self.block_size = block_size
         self.window_size = window_size
+        self.q_offset = q_offset
         self.is_causal = is_causal
         self._cached_fwd = None
         self._cached_sort_kernel = None
         self._cached_bwd = None
         self._cached_shape = None
+        self.memory_window_size = memory_window_size
 
     def forward(self, q, lmks):
         B, L, h_q, D = q.shape
@@ -1321,34 +1336,32 @@ class OnlineTopK_Fused(torch.nn.Module):
         block_size = self.block_size
         window_size = self.window_size
         is_causal = self.is_causal
+        memory_window_size = self.memory_window_size
+        q_offset = self.q_offset
 
-        shape_key = (B, L, S, h_kv, D, topk, block_size, window_size, is_causal)
+        shape_key = (B, L, S, h_kv, D, topk, block_size, window_size, is_causal, memory_window_size, q_offset)
         if self._cached_fwd is None or self._cached_shape != shape_key:
             
             self._cached_fwd = fused_topk_forward_kernel_insert(
-                B, L, S, h_kv, D, topk, block_size, window_size, is_causal
+                B, L, S, h_kv, D, topk, block_size, window_size, is_causal, memory_window_size=memory_window_size, q_offset=q_offset
             )
-            print("using insert fused topk kernel")
-            
-            self._cached_bwd = fused_topk_backward_kernel(B, L, S, h_kv, D, topk)
             
             self._cached_sort_kernel = sort_topk_indices_scores_kernel(B, L, S, h_kv, topk)
             
             self._cached_shape = shape_key
 
         fwd_kernel = self._cached_fwd
-        bwd_kernel = self._cached_bwd
         sort_kernel = self._cached_sort_kernel
 
         scores, indices = OnlineTopKFusedFn.apply(
-            q, lmks, topk, fwd_kernel, bwd_kernel, sort_kernel,
+            q, lmks, topk, fwd_kernel, sort_kernel,
         )
         return indices, scores
 
 
 _MODULE_CACHE = {}
 
-def online_topk_group(q: torch.Tensor, lmks: torch.Tensor, topk: int, block_size: int, window_size: int, is_causal: bool = False):
+def online_topk_group(q: torch.Tensor, lmks: torch.Tensor, topk: int, block_size: int, window_size: int, is_causal: bool = False, memory_window_size: int = -1, q_offset: int = 0):
     """
     Functional API for OnlineTopK_Fused
     
@@ -1359,14 +1372,26 @@ def online_topk_group(q: torch.Tensor, lmks: torch.Tensor, topk: int, block_size
         block_size: int
         window_size: int
         is_causal: bool
+        memory_window_size: int, optional. If > 0, limits the memory retrieval to [current - memory_window_size, current].
+        q_offset: int, optional. The global offset of the first query in the kv cache.
 
     Returns:
         indices: [B, L, h_kv, topk]
         scores: [B, L, h_kv, topk]
     """
-    cache_key = (topk, block_size, window_size, is_causal)
+    if is_causal:
+        B, L, _, _ = q.shape
+        _, S, _, _ = lmks.shape
+        min_required_s = (q_offset + L - 1) // block_size
+        
+        assert S >= min_required_s, (
+            f"Input mismatch: lmks (S={S}) is too short for query (L={L}) with offset {q_offset}. "
+            f"Expected S >= {min_required_s} (calculated from (L + q_offset) / block_size)"
+        )
+
+    cache_key = (topk, block_size, window_size, is_causal, memory_window_size, q_offset)
     if cache_key not in _MODULE_CACHE:
-        _MODULE_CACHE[cache_key] = OnlineTopK_Fused(topk, block_size, window_size, is_causal)
+        _MODULE_CACHE[cache_key] = OnlineTopK_Fused(topk, block_size, window_size, is_causal, memory_window_size, q_offset)
 
     return _MODULE_CACHE[cache_key](q, lmks)
 
@@ -1375,7 +1400,32 @@ def online_topk_group(q: torch.Tensor, lmks: torch.Tensor, topk: int, block_size
 
 
 
-def ref_topk_forward_with_grad(q, lmks, topk, block_size, window_size, is_causal, dtype):
+# def ref_topk_forward_with_grad(q, lmks, topk, block_size, window_size, is_causal, dtype):
+#     B, L, h_q, D = q.shape
+#     _, S, h_kv, _ = lmks.shape
+#     sm_scale = 1.0 / math.sqrt(D)
+#     G = h_q // h_kv
+#     q_group_sum = q.view(B, L, h_kv, G, D).sum(dim=3)
+#     scores_ref = torch.einsum("blkd,bskd->blks", q_group_sum.to(dtype), lmks.to(dtype)) * sm_scale
+    
+#     if is_causal:
+#         i_idx = torch.arange(L, device=q.device).unsqueeze(1) # [L, 1]
+#         j_idx = torch.arange(S, device=q.device).unsqueeze(0) # [1, S]
+        
+#         # New Mask Logic
+#         limit_chunk_idx = (i_idx - window_size + 1).div(block_size, rounding_mode='floor')
+#         causal_mask = j_idx >= limit_chunk_idx
+        
+#         # scores_ref: [B, L, h_kv, S]
+#         # mask: [1, L, 1, S]
+#         scores_ref = scores_ref.masked_fill(causal_mask.unsqueeze(0).unsqueeze(2), float('-inf'))
+
+#     scores_topk, indices_topk = torch.topk(scores_ref, k=topk, dim=-1, sorted=False)
+#     indices_sorted, order = torch.sort(indices_topk, dim=-1)
+#     scores_sorted = torch.gather(scores_topk, -1, order)
+#     return indices_sorted, scores_sorted
+
+def ref_topk_forward_with_grad(q, lmks, topk, block_size, window_size, is_causal, dtype, memory_window_size=-1, q_offset: int = 0):
     B, L, h_q, D = q.shape
     _, S, h_kv, _ = lmks.shape
     sm_scale = 1.0 / math.sqrt(D)
@@ -1384,20 +1434,32 @@ def ref_topk_forward_with_grad(q, lmks, topk, block_size, window_size, is_causal
     scores_ref = torch.einsum("blkd,bskd->blks", q_group_sum.to(dtype), lmks.to(dtype)) * sm_scale
     
     if is_causal:
-        i_idx = torch.arange(L, device=q.device).unsqueeze(1) # [L, 1]
-        j_idx = torch.arange(S, device=q.device).unsqueeze(0) # [1, S]
-        
-        # New Mask Logic
-        limit_chunk_idx = (i_idx - window_size + 1).div(block_size, rounding_mode='floor')
-        causal_mask = j_idx >= limit_chunk_idx
-        
-        # scores_ref: [B, L, h_kv, S]
-        # mask: [1, L, 1, S]
-        scores_ref = scores_ref.masked_fill(causal_mask.unsqueeze(0).unsqueeze(2), float('-inf'))
+        i_idx = torch.arange(L, device=q.device).unsqueeze(1)
+        i_idx_global = i_idx + q_offset
+        j_idx = torch.arange(S, device=q.device).unsqueeze(0)
+
+        limit_chunk_idx = (i_idx_global - window_size + 1).div(block_size, rounding_mode='floor')
+        mask = j_idx >= limit_chunk_idx
+        if memory_window_size > 0:
+            min_chunk_idx = (i_idx_global - memory_window_size).div(block_size, rounding_mode='floor')
+            mask = mask | (j_idx < min_chunk_idx)
+        scores_ref = scores_ref.masked_fill(mask.unsqueeze(0).unsqueeze(2), float('-inf'))
+    
 
     scores_topk, indices_topk = torch.topk(scores_ref, k=topk, dim=-1, sorted=False)
-    indices_sorted, order = torch.sort(indices_topk, dim=-1)
+    
+    is_invalid = scores_topk == float('-inf')
+    
+    sort_keys = indices_topk.clone()
+    sort_keys[is_invalid] = S + 1
+    
+    _, order = torch.sort(sort_keys, dim=-1)
+    
+    indices_sorted = torch.gather(indices_topk, -1, order)
     scores_sorted = torch.gather(scores_topk, -1, order)
+    
+    indices_sorted[scores_sorted == float('-inf')] = -1
+    
     return indices_sorted, scores_sorted
 
 
@@ -1410,16 +1472,18 @@ def test_online_topk_fused_correctness():
     B, L, D = 64, 4096, 128
     h_q = 16
     h_kv = 2
-    S = 64
+    S = 64+2
     topk = 16
     is_causal =True
     block_size = 64
     window_size = 100
+    memory_window_size = 512
+    q_offset = 128
     
     dtype = torch.bfloat16
     device = "cuda"
     
-    print(f"Config: B={B}, L={L}, S={S}, h_q={h_q}, h_kv={h_kv}, D={D}, topk={topk}, is_causal={is_causal}, block_size={block_size}, window_size={window_size}")
+    print(f"Config: B={B}, L={L}, S={S}, h_q={h_q}, h_kv={h_kv}, D={D}, topk={topk}, is_causal={is_causal}, block_size={block_size}, window_size={window_size}, memory_window_size={memory_window_size}, q_offset={q_offset}")
     
     torch.manual_seed(42)
     q = torch.randn(B, L, h_q, D, dtype=dtype, device=device, requires_grad=True)
@@ -1428,11 +1492,16 @@ def test_online_topk_fused_correctness():
     # ============ Forward Correctness ============
     print("\n--- Forward Correctness ---")
     
-    indices_fused, scores_fused = online_topk_group(q, lmks, topk, block_size, window_size, is_causal)
-    indices_ref, scores_ref = ref_topk_forward_with_grad(q, lmks, topk, block_size, window_size, is_causal, dtype=torch.float32)
+    # 修改 1: 传入 q_offset
+    indices_fused, scores_fused = online_topk_group(q, lmks, topk, block_size, window_size, is_causal, memory_window_size=memory_window_size, q_offset=q_offset)
+    indices_ref, scores_ref = ref_topk_forward_with_grad(q, lmks, topk, block_size, window_size, is_causal, dtype=torch.float32, memory_window_size=memory_window_size, q_offset=q_offset)
     
-    # print("indices_fused sample:", indices_fused[0,500,0,:])
-    # print("indices_ref sample:  ", indices_ref[0,500,0,:])
+    print("indices_fused sample:", indices_fused[0,2500,0,:])
+    print("scores_fused sample:", scores_fused[0,2500,0,:])
+
+    print("indices_ref sample:", indices_ref[0,2500,0,:])
+    print("scores_ref sample:", scores_ref[0,2500,0,:])
+
 
     valid_mask = (scores_ref > -1e9) & (scores_fused.float() > -1e9)
     
@@ -1467,11 +1536,13 @@ def test_online_topk_fused_correctness():
     grad_output = torch.randn(B, L, h_kv, topk, dtype=dtype, device=device)
     
     with torch.no_grad():
-        _, scores_ref_check = ref_topk_forward_with_grad(q_ref, lmks_ref, topk, block_size, window_size, is_causal, dtype=torch.float32)
+        # 修改 2: Ref 前向检查也传入 q_offset
+        _, scores_ref_check = ref_topk_forward_with_grad(q_ref, lmks_ref, topk, block_size, window_size, is_causal, dtype=torch.float32, memory_window_size=memory_window_size, q_offset=q_offset)
         invalid_mask = (scores_ref_check < -1e9)
         grad_output[invalid_mask] = 0.0
 
-    indices_fused_bwd, scores_fused_bwd = online_topk_group(q_fused, lmks_fused, topk, block_size, window_size, is_causal)
+    # 修改 3: Fused 后向验证传入 q_offset
+    indices_fused_bwd, scores_fused_bwd = online_topk_group(q_fused, lmks_fused, topk, block_size, window_size, is_causal, memory_window_size=memory_window_size, q_offset=q_offset)
     loss_fused = (scores_fused_bwd * grad_output).sum()
     loss_fused.backward()
     grad_q_fused = q_fused.grad.clone()
@@ -1488,9 +1559,17 @@ def test_online_topk_fused_correctness():
         i_idx = torch.arange(L, device=device).unsqueeze(1)
         j_idx = torch.arange(S, device=device).unsqueeze(0)
         
+        # 修改 4: 手动构建 Mask 时加入 q_offset 偏移
+        i_idx_global = i_idx + q_offset 
+        
         # New Mask Logic
-        limit_chunk_idx = (i_idx - window_size + 1).div(block_size, rounding_mode='floor')
+        limit_chunk_idx = (i_idx_global - window_size + 1).div(block_size, rounding_mode='floor')
         causal_mask = j_idx >= limit_chunk_idx
+        
+        # 同时补全 memory_window_size 的逻辑
+        if memory_window_size > 0:
+            min_chunk_idx = (i_idx_global - memory_window_size).div(block_size, rounding_mode='floor')
+            causal_mask = causal_mask | (j_idx < min_chunk_idx)
 
         scores_full = scores_full.masked_fill(causal_mask.unsqueeze(0).unsqueeze(2), float('-inf'))
 
@@ -1537,25 +1616,25 @@ def test_online_topk_fused_correctness():
     else:
         print("❌ Fused Backward FAILED")
 
-
 def test_online_topk_fused_memory_and_speed():
     print("\n" + "=" * 70)
     print("=== Benchmark OnlineTopK_Fused Memory and Speed ===")
     print("=" * 70)
     
-    B, L, D = 64, 4096, 128
+    B, L, D = 64, 4096*2*8, 128
     h_q = 16
     h_kv = 2
     S = 64
-    topk = 16
+    topk = 32
     is_causal =True
     block_size = 64
     window_size = 64
+    memory_window_size = 4096
     
     dtype = torch.bfloat16
     device = "cuda"
     
-    print(f"Config: B={B}, L={L}, S={S}, h_q={h_q}, h_kv={h_kv}, D={D}, topk={topk}, is_causal={is_causal}, block_size={block_size}")
+    print(f"Config: B={B}, L={L}, S={S}, h_q={h_q}, h_kv={h_kv}, D={D}, topk={topk}, is_causal={is_causal}, block_size={block_size}, window_size={window_size}, memory_window_size={memory_window_size}")
     
     torch.manual_seed(42)
     q = torch.randn(B, L, h_q, D, dtype=dtype, device=device, requires_grad=True)
@@ -1571,25 +1650,22 @@ def test_online_topk_fused_memory_and_speed():
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats()
         
-        _, scores = online_topk_group(q_t, lmks_t, topk, block_size, window_size, is_causal)
-        loss = (scores * grad_output).sum()
-        loss.backward()
-        torch.cuda.synchronize()
-        
         # Warmup
         for _ in range(5):
             q_t.grad = None
             lmks_t.grad = None
-            _ = online_topk_group(q_t, lmks_t, topk, block_size, window_size, is_causal)
-            _, scores = online_topk_group(q_t, lmks_t, topk, block_size, window_size, is_causal)
+            # 修复点1: 确保每次前向的结果都被用来计算loss，不引用旧变量
+            _, scores = online_topk_group(q_t, lmks_t, topk, block_size, window_size, is_causal, memory_window_size=memory_window_size)
             loss = (scores * grad_output).sum()
             loss.backward()
         torch.cuda.synchronize()
         
+        # Memory Check
         torch.cuda.reset_peak_memory_stats()
         q_t.grad = None
         lmks_t.grad = None
-        _ = online_topk_group(q_t, lmks_t, topk, block_size, window_size, is_causal)
+        # 修复点2: 正确获取当前Graph的 scores
+        _, scores = online_topk_group(q_t, lmks_t, topk, block_size, window_size, is_causal, memory_window_size=memory_window_size)
         loss = (scores * grad_output).sum()
         loss.backward()
         peak_mem = torch.cuda.max_memory_allocated() / 1024**2
@@ -1604,7 +1680,11 @@ def test_online_topk_fused_memory_and_speed():
         for _ in range(n_iters):
             q_t.grad = None
             lmks_t.grad = None
-            _, scores = online_topk_group(q_t, lmks_t, topk, block_size, window_size, is_causal)
+            # 注意: 如果不做backward，PyTorch会累计计算图。对于测速来说，最好是在no_grad下测纯算子时间，
+            # 或者这里只是测建图+执行时间。为了避免OOM，这里不backward时就不保留Graph。
+            # 但由于online_topk_group是autograd function，不使用no_grad会建图。
+            # 对于20次迭代一般没事。
+            _, _ = online_topk_group(q_t, lmks_t, topk, block_size, window_size, is_causal, memory_window_size=memory_window_size)
         end_fwd.record()
         torch.cuda.synchronize()
         avg_fwd_ms = start_fwd.elapsed_time(end_fwd) / n_iters
@@ -1614,7 +1694,7 @@ def test_online_topk_fused_memory_and_speed():
         for _ in range(n_iters):
             q_t.grad = None
             lmks_t.grad = None
-            _, scores = online_topk_group(q_t, lmks_t, topk, block_size, window_size, is_causal)
+            _, scores = online_topk_group(q_t, lmks_t, topk, block_size, window_size, is_causal, memory_window_size=memory_window_size)
             loss = (scores * grad_output).sum()
             loss.backward()
         end_all.record()
@@ -1634,17 +1714,16 @@ def test_online_topk_fused_memory_and_speed():
         torch.cuda.reset_peak_memory_stats()
         
         def forward_only():
-            _ = ref_topk_forward_with_grad(q_t, lmks_t, topk, block_size, window_size, is_causal, dtype=torch.bfloat16)
+            _ = ref_topk_forward_with_grad(q_t, lmks_t, topk, block_size, window_size, is_causal, dtype=torch.bfloat16, memory_window_size=memory_window_size)
         
         def forward_backward():
-            _, scores = ref_topk_forward_with_grad(q_t, lmks_t, topk, block_size, window_size, is_causal, dtype=torch.bfloat16)
+            _, scores = ref_topk_forward_with_grad(q_t, lmks_t, topk, block_size, window_size, is_causal, dtype=torch.bfloat16, memory_window_size=memory_window_size)
             loss = (scores * grad_output).sum()
             loss.backward()
         
         for _ in range(5):
             q_t.grad = None
             lmks_t.grad = None
-            forward_only()
             forward_backward()
         torch.cuda.synchronize()
         
@@ -1693,43 +1772,45 @@ def test_online_topk_fused_memory_and_speed():
     print(f"  Avg Fwd+Bwd Latency: {all_fused:.2f} ms")
     print(f"  Derived Bwd Latency: {bwd_fused:.2f} ms")
     
-    try:
-        mem_ref, fwd_ref, all_ref, bwd_ref = run_ref()
-        print(f"\n[Reference (torch.topk)]")
-        print(f"  Peak Memory: {mem_ref:.2f} MB")
-        print(f"  Avg Fwd Latency: {fwd_ref:.2f} ms")
-        print(f"  Avg Fwd+Bwd Latency: {all_ref:.2f} ms")
-        print(f"  Derived Bwd Latency: {bwd_ref:.2f} ms")
+    # try:
+    #     mem_ref, fwd_ref, all_ref, bwd_ref = run_ref()
+    #     print(f"\n[Reference (torch.topk)]")
+    #     print(f"  Peak Memory: {mem_ref:.2f} MB")
+    #     print(f"  Avg Fwd Latency: {fwd_ref:.2f} ms")
+    #     print(f"  Avg Fwd+Bwd Latency: {all_ref:.2f} ms")
+    #     print(f"  Derived Bwd Latency: {bwd_ref:.2f} ms")
         
-    except RuntimeError as e:
-        if "out of memory" in str(e).lower():
-            print(f"\n[Reference (torch.topk)] OOM - Cannot run with this config")
-            print("\n" + "-" * 70)
-            print("Comparison (Reference OOM):")
-            print("-" * 70)
-            print(f"{'Method':<25} {'Memory (MB)':<15} {'Fwd (ms)':<12} {'Fwd+Bwd (ms)':<15} {'Bwd (ms)':<12}")
-            print("-" * 70)
-            print(f"{'OnlineTopK_Fused':<25} {mem_fused:<15.2f} {fwd_fused:<12.2f} {all_fused:<15.2f} {bwd_fused:<12.2f}")
-            print("-" * 70)
-        else:
-            raise e
-
+    # except RuntimeError as e:
+    #     if "out of memory" in str(e).lower():
+    #         print(f"\n[Reference (torch.topk)] OOM - Cannot run with this config")
+    #         print("\n" + "-" * 70)
+    #         print("Comparison (Reference OOM):")
+    #         print("-" * 70)
+    #         print(f"{'Method':<25} {'Memory (MB)':<15} {'Fwd (ms)':<12} {'Fwd+Bwd (ms)':<15} {'Bwd (ms)':<12}")
+    #         print("-" * 70)
+    #         print(f"{'OnlineTopK_Fused':<25} {mem_fused:<15.2f} {fwd_fused:<12.2f} {all_fused:<15.2f} {bwd_fused:<12.2f}")
+    #         print("-" * 70)
+    #     else:
+    #         raise e
 
 
 import pytest
-@pytest.mark.parametrize("B, L, S, h_kv, G, D, topk, block_size", [
-    (2, 4096, 64, 2, 8, 64, 16, 64),
+@pytest.mark.parametrize("B, L, S, h_kv, G, D, topk, block_size, window_size, memory_window_size, q_offset", [
+    (2, 4096, 64, 2, 8, 64, 16, 64, 64, -1, 0),       # 原始测试: 偏移 0
+    (2, 4096, 64, 2, 8, 64, 16, 64, 64, 512, 128),    # 新增测试: 带偏移和记忆窗口
+    (1, 2048, 64, 1, 8, 64, 16, 32, 32, 128, 1024),   # 窄窗口 + 大偏移
+    (1, 2500, 64, 1, 8, 64, 8, 32, 100, 2000, 64),    # 长记忆窗口 + 小偏移
 ])
-def test_topk_correctness_robust(B, L, S, h_kv, G, D, topk, block_size):
+def test_topk_correctness_robust(B, L, S, h_kv, G, D, topk, block_size, window_size, memory_window_size, q_offset):
     device = "cuda"
     dtype = torch.bfloat16
     is_causal = True
-    window_size = block_size # default robust test
+    # window_size = block_size # Removed: 使用参数传入的 window_size
     h_q = h_kv * G
     
     torch.manual_seed(42)
     
-    print(f"\nTesting Config: B={B}, L={L}, S={S}, h_kv={h_kv}, G={G} (h_q={h_q}), D={D}, topk={topk}, BS={block_size}")
+    print(f"\nTesting Config: B={B}, L={L}, S={S}, h_kv={h_kv}, G={G}, D={D}, topk={topk}, BS={block_size}, Win={window_size}, MemWin={memory_window_size}, q_offset={q_offset}")
 
     # 1.准备数据
     # Q: [B, L, h_q, D]
@@ -1745,17 +1826,15 @@ def test_topk_correctness_robust(B, L, S, h_kv, G, D, topk, block_size):
     lmks_ref = lmks_raw.clone().detach().requires_grad_(True)
 
     # 3.前向计算
-    # Fused Kernel
-    # indices: [B, L, h_kv, topk]
-    # scores:  [B, L, h_kv, topk]
-    indices_fused, scores_fused = online_topk_group(q_fused, lmks_fused, topk, block_size, window_size, is_causal)
+    # Fused Kernel - 传入 q_offset
+    indices_fused, scores_fused = online_topk_group(
+        q_fused, lmks_fused, topk, block_size, window_size, is_causal, memory_window_size=memory_window_size, q_offset=q_offset
+    )
 
-
-    # Reference
-    # indices: [B, L, h_kv, topk]
-    # scores:  [B, L, h_kv, topk]
-    # 注意：ref_topk_forward_with_grad 内部会对 indices 进行排序，fused kernel 也有排序步骤，因此可以直接对比
-    indices_ref, scores_ref = ref_topk_forward_with_grad(q_ref, lmks_ref, topk, block_size, window_size, is_causal, dtype=torch.float32)
+    # Reference - 传入 q_offset
+    indices_ref, scores_ref = ref_topk_forward_with_grad(
+        q_ref, lmks_ref, topk, block_size, window_size, is_causal, dtype=torch.float32, memory_window_size=memory_window_size, q_offset=q_offset
+    )
 
     # 4.辅助校验函数
     def get_abs_err(x, y):
@@ -1805,9 +1884,17 @@ def test_topk_correctness_robust(B, L, S, h_kv, G, D, topk, block_size):
         i_idx = torch.arange(L, device=device).unsqueeze(1)
         j_idx = torch.arange(S, device=device).unsqueeze(0)
         
-        # New Mask Logic
-        limit_chunk_idx = (i_idx - window_size + 1).div(block_size, rounding_mode='floor')
+        # New Mask Logic (Apply q_offset)
+        i_idx_global = i_idx + q_offset  # 全局索引
+        
+        limit_chunk_idx = (i_idx_global - window_size + 1).div(block_size, rounding_mode='floor')
         causal_mask = j_idx >= limit_chunk_idx
+        
+        # --- Memory Window Mask Logic ---
+        if memory_window_size > 0:
+             min_chunk_idx = (i_idx_global - memory_window_size).div(block_size, rounding_mode='floor')
+             causal_mask = causal_mask | (j_idx < min_chunk_idx)
+        # --------------------------------
         
         scores_full = scores_full.masked_fill(causal_mask.unsqueeze(0).unsqueeze(2), float('-inf'))
 
@@ -1830,15 +1917,17 @@ def test_topk_correctness_robust(B, L, S, h_kv, G, D, topk, block_size):
     assert_close("DQ", dq_ref.float(), dq_fused.float(), ratio=0.05)
     assert_close("DLmks", dlmks_ref.float(), dlmks_fused.float(), ratio=0.05)
 
-    print(f"Test Passed: B={B}, L={L}, S={S}, G={G}, topk={topk}")
+    print(f"Test Passed: B={B}, L={L}, S={S}, G={G}, topk={topk}, MemWin={memory_window_size}, q_offset={q_offset}")
 
 if __name__ == "__main__":
     test_online_topk_fused_correctness()
     # test_online_topk_fused_memory_and_speed()
     params_list = [
-        (2, 4096, 64, 2, 8, 64, 16, 64),
-        (1, 2048, 64, 1, 8, 64, 16, 32),
-        (3, 2048, 64, 1, 8, 64, 8, 32),
+        # (B, L, S, h_kv, G, D, topk, block_size, window_size, memory_window_size, q_offset)
+       (2, 4096, 64, 2, 8, 64, 16, 64, 64, -1, 0),         # (4096+0)/64 = 64
+        (2, 4096, 66, 2, 8, 64, 16, 64, 64, 512, 128),      # (4096+128)/64 = 66
+        (1, 2048, 96, 1, 8, 64, 16, 32, 32, 128, 1024),     # (2048+1024)/32 = 96
+        (1, 2500, 81, 1, 8, 64, 8, 32, 100, 2000, 64),      # (2500+64)/32 ≈ 80.125 -> 81
     ]
     for p in params_list:
         test_topk_correctness_robust(*p)

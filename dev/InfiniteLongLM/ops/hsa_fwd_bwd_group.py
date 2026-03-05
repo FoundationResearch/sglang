@@ -24,6 +24,7 @@ def hsa_torch_ref(q, k, v, weights, indices, *, chunk_size: int, sm_scale: float
     - 返回: o_ref: (B, L, HQ, D) float32
     """
     B, L, HQ, D = q.shape
+    _k, L_k, H, D_k = k.shape 
     H = k.shape[2]
     G = HQ // H
     q_blocks = L // block_q
@@ -38,7 +39,7 @@ def hsa_torch_ref(q, k, v, weights, indices, *, chunk_size: int, sm_scale: float
     safe_indices = indices_q.clamp_min(0)
 
     # 向下取整，只保留完整的 chunk
-    N = L // chunk_size
+    N = L_k // chunk_size 
     valid_L = N * chunk_size
 
     # 截断 k 和 v
@@ -1426,8 +1427,8 @@ def main_block_M_correctness():
 
     # 创建 requires_grad=True 的输入（这些是 leaf tensors）
     Q = torch.randn((B, SEQ_LEN, HQ, D), dtype=dtype, device=device, requires_grad=True)
-    K = torch.randn((B, SEQ_LEN, H, D), dtype=dtype, device=device, requires_grad=True)
-    V = torch.randn((B, SEQ_LEN, H, D), dtype=dtype, device=device, requires_grad=True)
+    K = torch.randn((B, SEQ_LEN+100, H, D), dtype=dtype, device=device, requires_grad=True)
+    V = torch.randn((B, SEQ_LEN+100, H, D), dtype=dtype, device=device, requires_grad=True)
     
     # 生成权重：仅在合法块上有非零概率，非法位置直接被置为非常小的 logit（softmax 后约为 0）
     # 这样 W 就天然在非法块上为 0，且仍为 leaf tensor（requires_grad=True）
@@ -2194,26 +2195,10 @@ def test_correctness_fp32(B, SEQ_LEN, H, HQ, D, S, block_size):
     
 
 if __name__ == "__main__":
-    ### 验证 HSA_block_M (TileLang) 的正确性
     main_block_M_correctness()
     
-    ### 对比 HSA_block_M (TileLang) 与 Triton HSA 的延迟
     # main_block_M_latency()
     
-    ### 验证 HSA_block_M_inverse (TileLang) 的正确性
-    # main_block_M_inverse_correctness()
-    
-    ### 对比 HSA_block_M_inverse (TileLang) 与 Triton HSA 的延迟
-    # main_block_M_inverse_latency()
-    
-    ### 对比 HSA_block_M (TileLang) 与 HSA_single (TileLang) 的延迟
-    # main_block_M_within_tilelang_latency()
-    
-    ### 对比 HSA_block_M_inverse (TileLang) 与 HSA_single (TileLang) 的延迟
-    # main_block_M_inverse_within_tilelang_latency()
-    
-    ### 对比 HSA_single, HSA_block_M, 和 HSA_block_M_inverse 三者的延迟
-    # main_block_M_vs_single_latency()
     
     # main_rope_correctness()
     

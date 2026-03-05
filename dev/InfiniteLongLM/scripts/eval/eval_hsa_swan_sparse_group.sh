@@ -14,7 +14,7 @@ python eval/eval_ruler.py \
     --corpus_path /apdcephfs_sh8/share_300719895/shared/data/dolma3_mix-6T-1025-partial-tokenized/ \
     --checkpoint_path /apdcephfs_fsgm/share_303843174/user/qqzxywei/wxy/checkpoints/hsa_sparse_swan_top32_win512_group-ruler/checkpoints/global_step_1000 \
     --task_id $TASK_ID \
-    --segment_size 1024 \
+    --segment_size -1 \
     --max_seq_len $((512*1024))  \
     --max_samples 100 \
     --print_every 10 \

@@ -70,6 +70,36 @@ def insert_special_tokens(input_ids, fill_id, chunk_size):
     
     return torch.cat(parts, dim=1)
 
+
+
+
+def create_position_ids_with_landmarks(seq_length, chunk_size, device):
+    L = seq_length
+    position_ids = torch.arange(0, seq_length, device=device)
+
+    full_chunks = L // (chunk_size - 1)
+    remainder = L % (chunk_size - 1)
+
+    result_parts = []
+
+    if full_chunks > 0:
+        full_part = position_ids[:full_chunks * (chunk_size - 1)]
+
+        # repeat lmk pos
+        full_part = full_part.view(-1, chunk_size - 1)
+        last_pos = full_part[:, -1:] + 1 
+        full_part = torch.cat([full_part, last_pos], dim=-1) 
+        full_part = full_part.view(-1)
+        result_parts.append(full_part)
+    
+    if remainder > 0:
+        remainder_part = position_ids[full_chunks * chunk_size:]  # (N, remainder)
+        result_parts.append(remainder_part)
+    
+    pos = torch.cat(result_parts, dim=0)
+    return pos.unsqueeze(0)
+
+
 def main(args):
     """
     RULER 任务评测主函数
@@ -207,6 +237,7 @@ def main(args):
             print(f"  Answer token ids: {labels[0].tolist()}")
             print(f"  Answer text: {answer_text}\n")
         if args.insert_lmk:
+            
             # 记录原始序列长度和 answer 起始位置
             orig_seq_len = input_ids.shape[1]
             orig_answer_start = orig_seq_len - answer_len  # answer 在原始序列中的起始位置
@@ -218,6 +249,9 @@ def main(args):
             label_ids[:, -1] = -100                                 # 最后一位设为 -100
             label_ids = insert_special_tokens(label_ids, fill_id=-100, chunk_size=chunk_size)  # 插入 lmk 位置用 -100 填充
             label_ids = torch.roll(label_ids, shifts=1, dims=-1)   # 再右移一位
+
+            if args.adjust_lmk_pos:
+                pos_ids = create_position_ids_with_landmarks(orig_seq_len, chunk_size=chunk_size, device=device)
             
             # 计算 answer 起始位置在插入 lmk 后的新位置
             # 每 (chunk_size-1) 个 token 后会插入 1 个 lmk
@@ -232,6 +266,14 @@ def main(args):
         
         seq_len = input_ids.shape[1]
         num_segments = (seq_len + segment_size - 1) // segment_size
+        # # [DEBUG] 打印输入序列末尾：答案前3个token + 答案
+        # if batch_idx < 3:
+        #     debug_start = max(0, seq_len - answer_len_with_lmk - 3)
+        #     debug_ids = input_ids[0, debug_start:].tolist()
+        #     print(f"\n[INPUT DEBUG] Sample {batch_idx + 1}: answer前3 + answer")
+        #     for i, tid in enumerate(debug_ids):
+        #         marker = " <-- answer start" if i == 3 else ""
+        #         print(f"  {tid:>8} | {repr(tokenizer.decode([tid]))}{marker}")
         
         # 计算 answer 部分的起始位置（用于判断哪些 segment 需要保留 logits）
         # logits[i] 预测 position i+1，所以预测 answer 需要 logits[answer_start-1:answer_end-1]
@@ -253,7 +295,9 @@ def main(args):
                 out = model(
                     input_ids=input_ids,
                     cache_position=cache_pos,
-                    use_cache=True,
+                    use_cache=False,
+                    logits_to_keep=answer_len_with_lmk + 1,
+                    position_ids=pos_ids if args.adjust_lmk_pos else None,
                 )
                 end_time.record()
                 torch.cuda.synchronize()
@@ -262,7 +306,7 @@ def main(args):
                     print(f"[Full] seq_len={seq_len}, time={elapsed_ms:.2f}ms")
                 # 只保留 answer 部分的 logits 并立即移到 CPU，释放 GPU 显存
                 # logits[i] 预测 position i+1 的 token，所以取 -(answer_len_with_lmk+1):-1
-                answer_logits_cpu = out.logits[:, -(answer_len_with_lmk+1):-1, :].cpu()
+                answer_logits_cpu = out.logits[:, :-1, :].cpu()
                 del out
                 torch.cuda.empty_cache()
             else:
@@ -280,11 +324,21 @@ def main(args):
                     seg_input_ids = input_ids[:, start_idx:end_idx]
                     seg_cache_pos = torch.arange(start_idx, end_idx, device=device)
                     
+                    # 计算这个 segment 需要保留多少 logits
+                    if i >= first_answer_segment:
+                        # 需要 logits 的 segment
+                        seg_logits_to_keep = end_idx - start_idx  # 保留全部
+                    else:
+                        # 不需要 logits 的 segment，只保留 1 个 token 的 logits 以最小化显存占用
+                        seg_logits_to_keep = 1
+                    
                     out = model(
                         input_ids=seg_input_ids,
                         cache_position=seg_cache_pos,
                         use_cache=True,
-                        past_key_values=past_key_values
+                        past_key_values=past_key_values,
+                        logits_to_keep=seg_logits_to_keep,
+                        position_ids=pos_ids if args.adjust_lmk_pos else None,
                     )
                     past_key_values = out.past_key_values
                     
@@ -336,6 +390,13 @@ def main(args):
         # 计算准确率
         correct = (valid_pred == valid_label).sum().item()
         total = valid_label.numel()
+        # # [DEBUG] 对比预测和真实答案
+        # if batch_idx < 3:
+        #     print(f"\n[PRED DEBUG] Sample {batch_idx + 1}:")
+        #     print(f"  {'Pred':>8} | {'Label':>8} | Pred Text       | Label Text")
+        #     for i, (p, l) in enumerate(zip(valid_pred.tolist(), valid_label.tolist())):
+        #         match = "✓" if p == l else "✗"
+        #         print(f"  {p:>8} | {l:>8} | {repr(tokenizer.decode([p])):15} | {repr(tokenizer.decode([l]))} {match}")
         total_correct_tokens += correct
         total_tokens += total
         total_samples += 1
@@ -388,6 +449,8 @@ if __name__ == "__main__":
     cmd.add_argument('--total_var', type=int, default=-1, help='Total variables for VT/MQ tasks')
     cmd.add_argument('--num_queries', type=int, default=-1, help='Number of queries for MQ task')
     cmd.add_argument('--tp_size', type=int, default=1, help='Tensor Parallel size (1=single GPU, >1=multi-GPU TP)')
+    cmd.add_argument('--adjust_lmk_pos', action='store_true', help='Adjust position ids for landmarks')
+    
     
     args = cmd.parse_args()
     main(args)
