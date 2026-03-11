@@ -55,6 +55,56 @@ def _torch_swa_decode_window_innerx(
     return out
 
 
+def _torch_internal_swa_decode(
+    *,
+    q: torch.Tensor,  # [B,HQ_hsa,D]
+    k_cache: torch.Tensor,  # [Nloc,H_hsa,D] (HSA kv heads only)
+    v_cache: torch.Tensor,  # [Nloc,H_hsa,D]
+    page_table_1: torch.Tensor,  # [B,MAX_T] int32
+    seq_lens: torch.Tensor,  # [B] int32
+    window_size: int,
+    page_size: int,
+    sm_scale: float,
+) -> tuple:
+    """Internal SWA on HSA heads: chunk-aligned window, LMK excluded.
+
+    Returns (swa_o [B,HQ,D] f32, lse_kv [B,H] f32).
+    """
+    B, HQ, D = q.shape
+    _, H, _ = k_cache.shape
+    assert HQ % H == 0
+    G = HQ // H
+    swa_o = torch.zeros((B, HQ, D), device=q.device, dtype=torch.float32)
+    lse_kv = torch.full((B, H), float("-inf"), device=q.device, dtype=torch.float32)
+    seq_lens_i64 = seq_lens.to(torch.int64)
+    for b in range(B):
+        seqlen = int(seq_lens_i64[b].item())
+        if seqlen <= 0:
+            continue
+        q_pos = seqlen - 1
+        raw_start = q_pos - window_size + 1
+        chunk_start = max(0, (raw_start // page_size) * page_size) if raw_start >= 0 else 0
+        tok_pos = torch.arange(chunk_start, seqlen, device=q.device, dtype=torch.int64)
+        keep = (tok_pos % page_size) != (page_size - 1)
+        tok_pos = tok_pos[keep]
+        if tok_pos.numel() == 0:
+            continue
+        token_locs = page_table_1[b, tok_pos].to(torch.int64)
+        q_hgd = q[b].view(H, G, D).to(torch.float32)
+        lse_per_q = torch.full((H, G), float("-inf"), device=q.device, dtype=torch.float32)
+        for kv_h in range(H):
+            k_win = k_cache[token_locs, kv_h, :].to(torch.float32)
+            v_win = v_cache[token_locs, kv_h, :].to(torch.float32)
+            logits = (q_hgd[kv_h] @ k_win.transpose(0, 1)) * sm_scale
+            lse_per_q[kv_h] = torch.logsumexp(logits, dim=-1)
+            p = torch.softmax(logits, dim=-1)
+            o = p @ v_win
+            hq_start = kv_h * G
+            swa_o[b, hq_start : hq_start + G, :] = o
+        lse_kv[b] = torch.logsumexp(lse_per_q, dim=-1)
+    return swa_o, lse_kv
+
+
 def _torch_hsa_decode_from_weights(
     *,
     q: torch.Tensor,  # [B,HQ,D]
@@ -449,12 +499,28 @@ def test_innerx_end_to_end_model_forward_extend_then_decode_matches_ultra_semant
             sm_scale=float(attn_mod.scaling),
         )  # [1,hq_swa,D] float32
 
-        # HSA selection (torch reference): recompute and verify it matches backend metadata.
+        hsa_window = int(cfg.sliding_window_merging_size)
+        k_cache_full = fb_dec.token_to_kv_pool.get_key_buffer(0)
+        v_cache_full = fb_dec.token_to_kv_pool.get_value_buffer(0)
+
+        # Internal SWA on HSA heads (LHSA semantics).
+        swa_o_inner, lse_kv = _torch_internal_swa_decode(
+            q=hsa_qn.to(dtype).view(1, attn_mod.hq_hsa, attn_mod.head_dim),
+            k_cache=k_cache_full[:, attn_mod.hk_swa : attn_mod.hk_swa + attn_mod.hk_hsa, :],
+            v_cache=v_cache_full[:, attn_mod.hk_swa : attn_mod.hk_swa + attn_mod.hk_hsa, :],
+            page_table_1=page_table_1,
+            seq_lens=seq_lens,
+            window_size=hsa_window,
+            page_size=page_size,
+            sm_scale=float(attn_mod.scaling),
+        )
+
+        # HSA selection with window exclusion (LHSA: SWA-covered chunks excluded).
         cand_page_ids, cand_mask = build_active_page_candidates(
             page_table_1=page_table_1,
             seq_lens=seq_lens,
             page_size=page_size,
-            window_size=0,
+            window_size=hsa_window,
         )
         completed_pages = torch.div(
             seq_lens.to(torch.int64), int(page_size), rounding_mode="floor"
@@ -463,7 +529,6 @@ def test_innerx_end_to_end_model_forward_extend_then_decode_matches_ultra_semant
         safe_page_ids = cand_page_ids.clamp_min(0).to(torch.int64)
         lmk_locs = safe_page_ids * int(page_size) + (int(page_size) - 1)
         flat_lmk = lmk_locs.reshape(-1)
-        k_cache_full = fb_dec.token_to_kv_pool.get_key_buffer(0)
         flat_repr = k_cache_full[flat_lmk][:, attn_mod.hk_swa : attn_mod.hk_swa + attn_mod.hk_hsa, :]
         cand_repr = flat_repr.view(1, cand_page_ids.shape[1], attn_mod.hk_hsa, attn_mod.head_dim)
 
@@ -482,10 +547,30 @@ def test_innerx_end_to_end_model_forward_extend_then_decode_matches_ultra_semant
         torch.testing.assert_close(md.hsa_selected_page_ids, sel.selected_page_ids)
         torch.testing.assert_close(md.hsa_selected_scores, sel.selected_scores, rtol=0, atol=0)
 
+        # Merged softmax: cat([chunk_scores, swa_lse]) → globally normalized.
         valid = sel.selected_page_ids >= 0
         scores = sel.selected_scores.masked_fill(~valid, float("-inf"))
-        w_kv = torch.softmax(scores, dim=-1)
-        w_kv = torch.nan_to_num(w_kv, nan=0.0)
+        enable_softmax1 = bool(getattr(cfg, "enable_softmax1", False))
+        if hsa_window > 0:
+            if not enable_softmax1:
+                cat_scores = torch.cat([scores, lse_kv.unsqueeze(-1)], dim=-1)
+                swa_weight_idx = -1
+            else:
+                cat_scores = torch.cat([
+                    scores,
+                    lse_kv.unsqueeze(-1),
+                    torch.zeros(1, attn_mod.hk_hsa, 1, device=device, dtype=scores.dtype),
+                ], dim=-1)
+                swa_weight_idx = -2
+            merged_w = torch.softmax(cat_scores, dim=-1)
+            merged_w = torch.nan_to_num(merged_w, nan=0.0)
+            w_kv = merged_w[:, :, :int(cfg.hsa_topk)]
+            swa_w_kv = merged_w[:, :, swa_weight_idx]
+        else:
+            w_kv = torch.softmax(scores, dim=-1)
+            w_kv = torch.nan_to_num(w_kv, nan=0.0)
+            swa_w_kv = None
+
         w_q = (
             w_kv[:, :, None, :]
             .expand(1, attn_mod.hk_hsa, G_hsa, int(cfg.hsa_topk))
@@ -493,10 +578,10 @@ def test_innerx_end_to_end_model_forward_extend_then_decode_matches_ultra_semant
             .contiguous()
         )
 
-        out_hsa = _torch_hsa_decode_from_weights(
+        out_hsa_chunks = _torch_hsa_decode_from_weights(
             q=hsa_qn.to(dtype).view(1, attn_mod.hq_hsa, attn_mod.head_dim),
-            k_cache=fb_dec.token_to_kv_pool.get_key_buffer(0)[:, attn_mod.hk_swa : attn_mod.hk_swa + attn_mod.hk_hsa, :],
-            v_cache=fb_dec.token_to_kv_pool.get_value_buffer(0)[:, attn_mod.hk_swa : attn_mod.hk_swa + attn_mod.hk_hsa, :],
+            k_cache=k_cache_full[:, attn_mod.hk_swa : attn_mod.hk_swa + attn_mod.hk_hsa, :],
+            v_cache=v_cache_full[:, attn_mod.hk_swa : attn_mod.hk_swa + attn_mod.hk_hsa, :],
             page_table_1=page_table_1,
             selected_page_ids=sel.selected_page_ids,
             hsa_weights=w_q.to(torch.float32),
@@ -504,6 +589,17 @@ def test_innerx_end_to_end_model_forward_extend_then_decode_matches_ultra_semant
             sm_scale=float(attn_mod.scaling),
             mask_last_token=True,
         )  # [1,hq_hsa,D] float32
+
+        # Weighted SWA fusion.
+        if swa_w_kv is not None:
+            swa_w_q = (
+                swa_w_kv[:, :, None]
+                .expand(1, attn_mod.hk_hsa, G_hsa)
+                .reshape(1, attn_mod.hq_hsa)
+            )
+            out_hsa = out_hsa_chunks + swa_o_inner * swa_w_q[:, :, None]
+        else:
+            out_hsa = out_hsa_chunks
 
         out_stitch = torch.cat([out_swa, out_hsa], dim=1).reshape(1, -1).to(dtype)
         out_ref = attn_mod.o_proj(out_stitch)[0]  # [1, hidden]
