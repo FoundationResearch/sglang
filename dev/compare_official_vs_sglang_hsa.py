@@ -127,7 +127,30 @@ def transfer_weights(official_model, sglang_model):
                 param.data.copy_(src)
                 loaded += 1
             else:
-                skipped.append(f"{name}: shape mismatch {src.shape} vs {param.shape}")
+                # Handle embed_tokens/lm_head vocab padding difference: copy min rows.
+                if "embed_tokens" in name or "lm_head" in name:
+                    min_rows = min(src.shape[0], param.shape[0])
+                    param.data[:min_rows].copy_(src[:min_rows])
+                    loaded += 1
+                else:
+                    skipped.append(f"{name}: shape mismatch {src.shape} vs {param.shape}")
+        elif "gate_up_proj" in name:
+            # sglang fuses gate_proj + up_proj → gate_up_proj.
+            # e.g. "model.layers.0.mlp.gate_up_proj.weight" →
+            #      "model.layers.0.mlp.gate_proj.weight" + "model.layers.0.mlp.up_proj.weight"
+            gate_name = name.replace("gate_up_proj", "gate_proj")
+            up_name = name.replace("gate_up_proj", "up_proj")
+            if gate_name in official_sd and up_name in official_sd:
+                gate_w = official_sd[gate_name]
+                up_w = official_sd[up_name]
+                fused = torch.cat([gate_w, up_w], dim=0)
+                if fused.shape == param.shape:
+                    param.data.copy_(fused)
+                    loaded += 1
+                else:
+                    skipped.append(f"{name}: fused shape mismatch {fused.shape} vs {param.shape}")
+            else:
+                skipped.append(f"{name}: gate/up not found in official model")
         else:
             skipped.append(f"{name}: not in official model")
 
@@ -229,6 +252,10 @@ def setup_sglang_model(config_dict, official_model):
     # Create sglang model & transfer weights.
     sglang_model = SglangHSAForCausalLM(cfg).to(device=device, dtype=dtype)
     sglang_model.eval()
+    # Debug: show official MLP weight names.
+    for n in official_model.state_dict():
+        if "mlp" in n:
+            print(f"  Official MLP weight: {n} {official_model.state_dict()[n].shape}")
     print("Transferring weights official → sglang...")
     transfer_weights(official_model, sglang_model)
 
@@ -497,7 +524,7 @@ def main():
     # Per-position breakdown.
     if off_l.shape[1] > 1:
         print(f"\n  Per-position max error:")
-        for t in range(min(off_l.shape[1], 20)):
+        for t in range(off_l.shape[1]):
             err = abs_diff[0, t].max().item()
             match = "OK" if off_argmax[0, t] == sg_argmax[0, t] else "MISMATCH"
             print(f"    pos {t:3d}: max_err={err:.6f}  argmax={match}")

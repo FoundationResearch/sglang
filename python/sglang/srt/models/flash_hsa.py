@@ -341,7 +341,9 @@ class FlashHSAInnerXHierarchicalSparseAttention(nn.Module):
         )
         self.q_norm = RMSNorm(self.head_dim, eps=rms_norm_eps, **norm_kwargs)
         self.k_norm = RMSNorm(self.head_dim, eps=rms_norm_eps, **norm_kwargs)
-        self.lmk_q_norm = RMSNorm(self.head_dim, eps=rms_norm_eps, **norm_kwargs)
+        # lmk_q_norm is only needed when enable_lmk_q_proj=True.
+        # Created conditionally below alongside lmk_q_proj.
+        self.lmk_q_norm = None
 
         # Projections (explicit matrices, matching ultra reference naming).
         self.q_proj = ColumnParallelLinear(
@@ -399,15 +401,20 @@ class FlashHSAInnerXHierarchicalSparseAttention(nn.Module):
             tp_size=attn_tp_size,
             prefix=add_prefix("hsa_v_proj", prefix),
         )
-        self.lmk_q_proj = ColumnParallelLinear(
-            self.hidden_size,
-            self.hk_hsa_total * self.head_dim,
-            bias=attention_bias,
-            quant_config=quant_config,
-            tp_rank=attn_tp_rank,
-            tp_size=attn_tp_size,
-            prefix=add_prefix("lmk_q_proj", prefix),
-        )
+        self.enable_lmk_q_proj = bool(getattr(config, "enable_lmk_q_proj", False))
+        if self.enable_lmk_q_proj:
+            self.lmk_q_norm = RMSNorm(self.head_dim, eps=rms_norm_eps, **norm_kwargs)
+            self.lmk_q_proj = ColumnParallelLinear(
+                self.hidden_size,
+                self.hk_hsa_total * self.head_dim,
+                bias=attention_bias,
+                quant_config=quant_config,
+                tp_rank=attn_tp_rank,
+                tp_size=attn_tp_size,
+                prefix=add_prefix("lmk_q_proj", prefix),
+            )
+        else:
+            self.lmk_q_proj = None
 
         self.enable_gate_attn = bool(getattr(config, "enable_gate", False))
         if self.enable_gate_attn:
@@ -485,22 +492,28 @@ class FlashHSAInnerXHierarchicalSparseAttention(nn.Module):
             alt_stream=self.alt_stream,
         )
 
-        # --- Selection query (LMK-Q, NO RoPE) ---
-        lmk_q, _ = self.lmk_q_proj(hidden_states)  # [T, hk_hsa*D]
-        lmk_q_3 = lmk_q.view(-1, self.hk_hsa, self.head_dim)
-        # RMSNorm expects 2D; apply over head_dim with flatten/unflatten.
-        lmk_q_norm = self.lmk_q_norm(lmk_q_3.reshape(-1, self.head_dim)).reshape(
-            lmk_q_3.shape[0], lmk_q_3.shape[1], lmk_q_3.shape[2]
-        )  # [T, hk_hsa, D]
-        # Expand to q-head space for selector: [T, hq_hsa, D]
-        assert self.hq_hsa % self.hk_hsa == 0
-        G = self.hq_hsa // self.hk_hsa
-        sel_q = (
-            lmk_q_norm[:, :, None, :]
-            .expand(lmk_q_norm.shape[0], self.hk_hsa, G, self.head_dim)
-            .reshape(lmk_q_norm.shape[0], self.hq_hsa, self.head_dim)
-            .contiguous()
-        )
+        # --- Selection query ---
+        if self.enable_lmk_q_proj and self.lmk_q_proj is not None:
+            # Separate lmk_q_proj for page selection (NO RoPE).
+            lmk_q, _ = self.lmk_q_proj(hidden_states)  # [T, hk_hsa*D]
+            lmk_q_3 = lmk_q.view(-1, self.hk_hsa, self.head_dim)
+            # RMSNorm expects 2D; apply over head_dim with flatten/unflatten.
+            lmk_q_norm = self.lmk_q_norm(lmk_q_3.reshape(-1, self.head_dim)).reshape(
+                lmk_q_3.shape[0], lmk_q_3.shape[1], lmk_q_3.shape[2]
+            )  # [T, hk_hsa, D]
+            # Expand to q-head space for selector: [T, hq_hsa, D]
+            assert self.hq_hsa % self.hk_hsa == 0
+            G = self.hq_hsa // self.hk_hsa
+            sel_q = (
+                lmk_q_norm[:, :, None, :]
+                .expand(lmk_q_norm.shape[0], self.hk_hsa, G, self.head_dim)
+                .reshape(lmk_q_norm.shape[0], self.hq_hsa, self.head_dim)
+                .contiguous()
+            )
+        else:
+            # No separate lmk_q_proj: use hsa_q directly for selection
+            # (matches official behavior when enable_lmk_q_proj=False).
+            sel_q = None
 
         # Concatenate heads into the single KV cache layout: [SWA | HSA].
         q_full = torch.cat([swa_q, hsa_q], dim=-1)
@@ -702,12 +715,14 @@ class HSAForCausalLM(_Qwen3ForCausalLM):
         padded_vocab_size = _get_flashhsa_padded_vocab_size(config)
 
         # Replace embedding with padded vocab so LMK row exists.
+        # Use padding_size=32 to match official FlashHSA's next_of_y(vocab+1, 32).
         if self.pp_group.is_first_rank:
             self.model.embed_tokens = VocabParallelEmbedding(
                 padded_vocab_size,
                 config.hidden_size,
                 quant_config=quant_config,
                 enable_tp=not is_dp_attention_enabled(),
+                padding_size=32,
                 prefix=add_prefix("embed_tokens", add_prefix("model", prefix)),
                 params_dtype=(
                     torch.float32
@@ -726,6 +741,7 @@ class HSAForCausalLM(_Qwen3ForCausalLM):
                     config.hidden_size,
                     quant_config=quant_config,
                     use_attn_tp_group=get_global_server_args().enable_dp_lm_head,
+                    padding_size=32,
                     prefix=add_prefix("lm_head", prefix),
                 )
         else:
