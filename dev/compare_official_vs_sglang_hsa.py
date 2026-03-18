@@ -283,6 +283,11 @@ def setup_sglang_model(config_dict, official_model):
 
     backend = HSAAttnBackend(model_runner)
 
+    # Ensure rotary embedding cos_sin_cache is float32 (required by sgl_kernel).
+    for module in sglang_model.modules():
+        if hasattr(module, "cos_sin_cache") and module.cos_sin_cache is not None:
+            module.cos_sin_cache = module.cos_sin_cache.to(torch.float32)
+
     return sglang_model, backend, model_runner, cfg, lmk_id, page_size
 
 
@@ -295,7 +300,10 @@ def main():
     dtype = torch.bfloat16
 
     # ---- Config (small model for fast testing) ----
-    # Use realistic dimensions — tilelang kernels require head_dim >= 16 and chunk_size >= 16.
+    # Config using realistic dimensions that satisfy both:
+    # - tilelang kernels (official): chunk_size >= 64, head_dim >= 64
+    # - sglang Triton kernels: any size works
+    # NOTE: First run may be slow due to Triton JIT compilation (~2-5 min).
     config_dict = dict(
         model_type="flash_hsa_innerx",
         vocab_size=256,
@@ -307,7 +315,7 @@ def main():
         head_dim=64,
         rms_norm_eps=1e-6,
         attention_bias=False,
-        chunk_size=64,             # realistic page size
+        chunk_size=64,
         hsa_topk=2,
         hsa_mode="sparse",
         full_attn_interleave=1,    # every layer is HSA
@@ -323,9 +331,8 @@ def main():
     page_size = config_dict["chunk_size"]
     lmk_id = config_dict["vocab_size"]
 
-    # ---- Prompt (need enough tokens for multiple completed pages) ----
-    # chunk_size=64 → page = 63 real tokens + 1 LMK. Need 3+ completed pages for topk=2.
-    real_tokens = list(range(5, 5 + 200))  # 200 tokens → ~3 full pages
+    # ---- Prompt: 200 real tokens → ~3 full pages ----
+    real_tokens = list(range(5, 5 + 200))
 
     print("=" * 60)
     print("OFFICIAL vs SGLANG HSA COMPARISON")
@@ -449,11 +456,14 @@ def main():
 
     with torch.no_grad():
         sglang_hidden = sglang_model.model(fb.input_ids, fb.positions, fb)
-    # sglang model returns hidden_states, get logits via lm_head
-    sglang_logits = sglang_model.logits_processor(
-        sglang_hidden, sglang_model.lm_head, fb
-    )
-    # logits_processor returns [B, T, V] but may be padded
+    # sglang model returns (hidden_states, residual) tuple from the last layer.
+    if isinstance(sglang_hidden, tuple):
+        sglang_hidden = sglang_hidden[0]
+    # Apply final norm + lm_head weight directly.
+    # (ParallelLMHead.forward() refuses direct calls; use the raw weight.)
+    sglang_hidden = sglang_model.model.norm(sglang_hidden)
+    lm_weight = sglang_model.lm_head.weight  # [padded_vocab, hidden]
+    sglang_logits = (sglang_hidden @ lm_weight.t()).unsqueeze(0)  # [1, T, padded_vocab]
     sglang_logits = sglang_logits[:, :, :config_dict["vocab_size"]]
     print(f"  Output logits: {sglang_logits.shape}")
 
