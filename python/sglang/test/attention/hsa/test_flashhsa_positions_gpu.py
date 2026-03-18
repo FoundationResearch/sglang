@@ -34,18 +34,21 @@ def test_flashhsa_extend_positions_landmark_cuda():
         enable_landmark_positions=True,
     )
     got = positions.to("cpu").tolist()
-    # indices g=0..4 => pos = g - floor((g+1)/4) => [0,1,2,2,3]
-    assert got == [0, 1, 2, 2, 3]
+    # indices g=0..4 => pos = g - floor(g/4) => [0,1,2,3,3]
+    # LMK at index 3 gets pos=3 (shares position with NEXT real token at index 4).
+    # This matches the official FlashHSA create_position_ids_with_landmarks().
+    assert got == [0, 1, 2, 3, 3]
     _vprint(f"extend positions (page_size={page_size}) = {got}")
 
 
 def test_flashhsa_decode_positions_landmark_cuda():
     page_size = 4
-    # seq_len=4 means the last token is LMK at g=3 => pos=2
+    # seq_len=4 means the last token is LMK at g=3 => pos = 3 - floor(3/4) = 3
+    # LMK gets position equal to last_real_pos + 1 (matching official FlashHSA).
     seq_lens = torch.tensor([4], device="cuda", dtype=torch.int32)
     pos = compute_decode_positions_landmark(seq_lens, page_size=page_size)
     got = int(pos.item())
-    assert got == 2
+    assert got == 3
     _vprint(f"decode position (seq_len=4, page_size={page_size}) = {got}")
 
 
