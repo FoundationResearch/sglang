@@ -1036,13 +1036,18 @@ def compute_decode_positions_landmark(seq_lens: torch.Tensor, *, page_size: int)
     """Compute decode positions with FlashHSA landmark semantics.
 
     seq_lens are engine-visible lengths (including LMKs).
+
+    Position formula: pos(g) = g - floor(g / page_size)
+    This matches the official FlashHSA create_position_ids_with_landmarks():
+      - Real tokens get sequential positions (0, 1, 2, ...)
+      - LMK tokens share position with the NEXT real token (not the previous one)
     """
     page_size = int(page_size)
     if page_size <= 0:
         raise ValueError("page_size must be > 0")
     # last token index g = seq_len - 1; handle seq_len==0 safely.
     g = torch.clamp(seq_lens.to(torch.int64) - 1, min=0)
-    return g - torch.div((g + 1), page_size, rounding_mode="floor")
+    return g - torch.div(g, page_size, rounding_mode="floor")
 
 
 def compute_position_triton(
@@ -1124,13 +1129,19 @@ def compute_position_landmark_torch(
     *,
     page_size: int,
 ):
-    """Torch reference for FlashHSA landmark position ids (extend)."""
+    """Torch reference for FlashHSA landmark position ids (extend).
+
+    Position formula: pos(g) = g - floor(g / page_size)
+    This matches the official FlashHSA create_position_ids_with_landmarks():
+      - Real tokens get sequential positions (0, 1, 2, ...)
+      - LMK tokens share position with the NEXT real token (not the previous one)
+    """
     page_size = int(page_size)
     positions = torch.cat(
         [
             (
                 (g := torch.arange(prefix_len, prefix_len + extend_len, device=extend_prefix_lens.device))
-                - torch.div((g + 1), page_size, rounding_mode="floor")
+                - torch.div(g, page_size, rounding_mode="floor")
             )
             for prefix_len, extend_len in zip(extend_prefix_lens.to(torch.int64), extend_seq_lens.to(torch.int64))
         ],

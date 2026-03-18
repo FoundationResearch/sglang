@@ -1245,8 +1245,8 @@ class OnlineTopKFusedFn(torch.autograd.Function):
 
         q_group_sum = q.view(B, L, h_kv, G, D).sum(dim=3)  # [B, L, h_kv, D]
 
-        q_in = q_group_sum.to(dtype).contiguous()
-        k_in = lmks.contiguous()
+        q_in = torch.empty(q_group_sum.shape, dtype=dtype, device=q_group_sum.device).copy_(q_group_sum)
+        k_in = torch.empty(lmks.shape, dtype=lmks.dtype, device=lmks.device).copy_(lmks)
         
         best_scores_buf, best_indices_buf = fwd_kernel(q_in, k_in)  
         
