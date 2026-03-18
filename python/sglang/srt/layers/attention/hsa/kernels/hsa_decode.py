@@ -1,5 +1,5 @@
 """
-FlashHSA-style Triton kernels (decode).
+FlashHSA-style Triton kernels (decode + extend).
 
 This file intentionally mirrors the *shape conventions* of FlashHSA:
 - LMK token participates in KV cache, but should be masked from attention reads.
@@ -10,12 +10,15 @@ We provide:
 
 Inputs:
   q:              [B, HQ, D] (query for a single decode step per sequence)
+                  OR [T, HQ, D] for extend (T = total extend tokens)
   k_cache/v_cache:[Nloc, H, D] (KV cache for a single layer, paged by page_size)
   selected_page_ids: [B, H, K] int32, page ids, padded with -1
   hsa_weights:    [B, HQ, K] float16/float32 (per-q-head weights for each selected page)
+  token_to_seq_id: Optional[T] int32 — for extend, maps token index → sequence index.
+                   When provided, page_table_1 is indexed by seq_id instead of token index.
 
 Output:
-  out:            [B, HQ, D]
+  out:            [B, HQ, D] or [T, HQ, D]
 
 Notes:
 - This kernel implements the per-page block attention (within a page) using a
@@ -60,6 +63,7 @@ def hsa_decode_paged_fwd_kernel(
     PAGE_IDS_ptr,
     W_ptr,
     OUT_ptr,
+    SEQ_ID_MAP_ptr,  # [T] int32, token_idx -> seq_idx (or dummy when USE_SEQ_MAP=False)
     stride_qb: tl.constexpr,
     stride_qh: tl.constexpr,
     stride_qd: tl.constexpr,
@@ -89,11 +93,18 @@ def hsa_decode_paged_fwd_kernel(
     PAGE_SIZE: tl.constexpr,
     MAX_T: tl.constexpr,
     mask_last_token: tl.constexpr,
+    USE_SEQ_MAP: tl.constexpr,
 ):
     pid_b = tl.program_id(0)
     pid_hq = tl.program_id(1)
     if pid_b >= B or pid_hq >= HQ:
         return
+
+    # For extend: page_table_1 is indexed by seq_id, not token index.
+    if USE_SEQ_MAP:
+        seq_b = tl.load(SEQ_ID_MAP_ptr + pid_b).to(tl.int64)
+    else:
+        seq_b = pid_b
 
     G = HQ // H
     kv_h = pid_hq // G
@@ -126,8 +137,9 @@ def hsa_decode_paged_fwd_kernel(
         tok_in_range = tok < MAX_T
 
         # token_loc (KV slot id): [PAGE_SIZE]
+        # Use seq_b (not pid_b) for page_table_1 lookup — critical for extend.
         token_loc = tl.load(
-            PAGE_TABLE_ptr + pid_b * stride_pt_b + tok * stride_pt_t,
+            PAGE_TABLE_ptr + seq_b * stride_pt_b + tok * stride_pt_t,
             mask=tok_in_range,
             other=0,
         ).to(tl.int64)
@@ -179,34 +191,43 @@ def hsa_decode_paged_fwd(
     sm_scale: Optional[float] = None,
     mask_last_token: bool = True,
     out: Optional[torch.Tensor] = None,
+    token_to_seq_id: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    """Paged-KV decode kernel (FlashHSA semantics).
+    """Paged-KV kernel (FlashHSA semantics) for decode and extend.
 
-    page_table_1: [B, MAX_T] token->slot mapping (token_loc).
+    page_table_1: [B_seq, MAX_T] token->slot mapping (token_loc).
+    token_to_seq_id: Optional [T] int32 — for extend, maps each token in q's
+        first dimension to the sequence index in page_table_1. When None (decode),
+        q's first dimension directly indexes page_table_1.
     """
     _require_triton()
     if q.dim() != 3:
-        raise ValueError(f"q must be [B,HQ,D], got {tuple(q.shape)}")
+        raise ValueError(f"q must be [B/T,HQ,D], got {tuple(q.shape)}")
     if k_cache.dim() != 3 or v_cache.dim() != 3:
         raise ValueError("k_cache/v_cache must be [Nloc,H,D]")
     if page_table_1.dim() != 2:
         raise ValueError("page_table_1 must be [B,MAX_T]")
     if selected_page_ids.dim() != 3:
-        raise ValueError("selected_page_ids must be [B,H,K]")
+        raise ValueError("selected_page_ids must be [B/T,H,K]")
     if hsa_weights.dim() != 3:
-        raise ValueError("hsa_weights must be [B,HQ,K]")
+        raise ValueError("hsa_weights must be [B/T,HQ,K]")
 
-    B, HQ, D = q.shape
+    N, HQ, D = q.shape  # N = B (decode) or T (extend)
     Nloc, H, Dk = k_cache.shape
     assert v_cache.shape == (Nloc, H, Dk)
     assert Dk == D
-    assert page_table_1.shape[0] == B
     MAX_T = int(page_table_1.shape[1])
-    assert selected_page_ids.shape[0] == B and selected_page_ids.shape[1] == H
+    assert selected_page_ids.shape[0] == N and selected_page_ids.shape[1] == H
     TOPK = int(selected_page_ids.shape[2])
-    assert hsa_weights.shape == (B, HQ, TOPK)
+    assert hsa_weights.shape == (N, HQ, TOPK)
     assert HQ % H == 0
     assert int(page_size) > 0
+
+    use_seq_map = token_to_seq_id is not None
+    if use_seq_map:
+        assert token_to_seq_id.shape[0] == N, (
+            f"token_to_seq_id length {token_to_seq_id.shape[0]} != q batch dim {N}"
+        )
 
     if sm_scale is None:
         sm_scale = float(D) ** -0.5
@@ -218,12 +239,18 @@ def hsa_decode_paged_fwd(
     page_ids_ = selected_page_ids.to(torch.int32).contiguous()
     w_ = hsa_weights.contiguous()
 
-    if out is None:
-        out = torch.empty((B, HQ, D), device=q.device, dtype=torch.bfloat16)
+    # For the seq_id_map, use the real tensor or a dummy scalar placeholder.
+    if use_seq_map:
+        seq_map_ = token_to_seq_id.to(torch.int32).contiguous()
     else:
-        assert out.shape == (B, HQ, D)
+        seq_map_ = torch.zeros(1, dtype=torch.int32, device=q.device)
 
-    grid = (B, HQ)
+    if out is None:
+        out = torch.empty((N, HQ, D), device=q.device, dtype=torch.bfloat16)
+    else:
+        assert out.shape == (N, HQ, D)
+
+    grid = (N, HQ)
     hsa_decode_paged_fwd_kernel[grid](
         q_,
         k_,
@@ -232,6 +259,7 @@ def hsa_decode_paged_fwd(
         page_ids_,
         w_,
         out,
+        seq_map_,
         q_.stride(0),
         q_.stride(1),
         q_.stride(2),
@@ -253,7 +281,7 @@ def hsa_decode_paged_fwd(
         out.stride(1),
         out.stride(2),
         sm_scale=float(sm_scale),
-        B=B,
+        B=N,
         HQ=HQ,
         H=H,
         D=D,
@@ -261,6 +289,7 @@ def hsa_decode_paged_fwd(
         PAGE_SIZE=int(page_size),
         MAX_T=MAX_T,
         mask_last_token=bool(mask_last_token),
+        USE_SEQ_MAP=use_seq_map,
         num_warps=4,
     )
     return out

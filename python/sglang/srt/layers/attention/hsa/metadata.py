@@ -43,4 +43,14 @@ class HSAMetadata:
     hsa_selected_page_ids: Optional[torch.Tensor] = None  # [B, H, K] int32 padded -1
     hsa_selected_scores: Optional[torch.Tensor] = None  # [B, H, K] float32
 
+    # ---- Extend-specific fields ----
+    token_positions: Optional[torch.Tensor] = None  # [total_extend_tokens] global pos
+    token_to_seq_id: Optional[torch.Tensor] = None  # [total_extend_tokens] -> batch idx
+    extend_seq_lens: Optional[torch.Tensor] = None  # [B] extend lengths
+    extend_prefix_lens: Optional[torch.Tensor] = None  # [B] prefix lengths
+
+    # Per-token selection results (extend path)
+    hsa_ext_selected_page_ids: Optional[torch.Tensor] = None  # [T, H, K] int32
+    hsa_ext_selected_scores: Optional[torch.Tensor] = None  # [T, H, K] float32
+
 
