@@ -551,84 +551,37 @@ class HSAAttnBackend(AttentionBackend):
             q_swa = q3[:, :HQ_swa, :]
             q_hsa = q3[:, HQ_swa:, :]
 
-            # SWA branch (best-effort flex_attention, optional LMK exclusion).
+            # SWA branch: sliding-window attention on upper (SWA) heads.
             out_swa = torch.zeros((B, HQ_swa, D), device=q3.device, dtype=torch.float32)
             if window_size is not None and int(window_size) > 0 and HQ_swa > 0 and H_swa > 0:
+                seq_lens_i64 = md.cache_seqlens_int32.to(torch.int64)
+                assert HQ_swa % H_swa == 0
+                Gs = HQ_swa // H_swa
                 k_cache_all = pool.get_key_buffer(layer.layer_id)
                 v_cache_all = pool.get_value_buffer(layer.layer_id)
-                try:
-                    from torch.nn.attention.flex_attention import create_block_mask
-
-                    flex_attn = _get_compiled_flex_attention()
-                    seq_lens_i64 = md.cache_seqlens_int32.to(torch.int64)
-                    for b in range(B):
-                        seqlen = int(seq_lens_i64[b].item())
-                        if seqlen <= 0:
-                            continue
-                        q_idx_global = seqlen - 1
-                        start_global = max(0, q_idx_global - int(window_size) + 1)
-                        kv_pos_global = start_global + torch.arange(
-                            int(window_size), device=q3.device, dtype=torch.int64
-                        )
-                        kv_pos_clamped = kv_pos_global.clamp_min(0).clamp_max(seqlen - 1)
-                        token_locs = page_table_1[b, kv_pos_clamped].to(torch.int64)
-                        k_win = (
-                            k_cache_all[token_locs, :H_swa, :].transpose(0, 1).unsqueeze(0)
-                        )  # [1,H_swa,W,D]
-                        v_win = (
-                            v_cache_all[token_locs, :H_swa, :].transpose(0, 1).unsqueeze(0)
-                        )  # [1,H_swa,W,D]
-                        q_b = q_swa[b].unsqueeze(0).unsqueeze(2)  # [1,HQ_swa,1,D]
-
-                        def block_causal_mask(_bb, _hh, _q_idx, kv_idx):
-                            kv_global = kv_idx + start_global
-                            ok = (kv_global >= start_global) & (kv_global <= q_idx_global)
-                            if swa_exclude_lmk:
-                                ok = ok & (((kv_global + 1) % int(self.page_size)) != 0)
-                            return ok
-
-                        block_mask = create_block_mask(
-                            block_causal_mask, B=None, H=None, Q_LEN=1, KV_LEN=int(window_size)
-                        )
-                        o = flex_attn(
-                            q_b,
-                            k_win,
-                            v_win,
-                            block_mask=block_mask,
-                            enable_gqa=True,
-                        )[0]
-                        out_swa[b] = o.squeeze(0).squeeze(1).to(torch.float32)
-                except Exception:
-                    # Slow torch fallback (kept small; correctness-first).
-                    seq_lens_i64 = md.cache_seqlens_int32.to(torch.int64)
-                    assert HQ_swa % H_swa == 0
-                    Gs = HQ_swa // H_swa
-                    k_cache_all = pool.get_key_buffer(layer.layer_id)
-                    v_cache_all = pool.get_value_buffer(layer.layer_id)
-                    for b in range(B):
-                        seqlen = int(seq_lens_i64[b].item())
-                        if seqlen <= 0:
-                            continue
-                        w = min(seqlen, int(window_size))
-                        start = seqlen - w
-                        tok_pos = torch.arange(start, seqlen, device=q3.device, dtype=torch.int64)
-                        if swa_exclude_lmk:
-                            keep = (tok_pos % int(self.page_size)) != (int(self.page_size) - 1)
-                            tok_pos = tok_pos[keep]
-                        if tok_pos.numel() == 0:
-                            continue
-                        token_locs = page_table_1[b, tok_pos].to(torch.int64)
-                        q_hgd = q_swa[b].view(H_swa, Gs, D).to(torch.float32)
-                        for kv_h in range(H_swa):
-                            k_win = k_cache_all[token_locs, kv_h, :].to(torch.float32)
-                            v_win = v_cache_all[token_locs, kv_h, :].to(torch.float32)
-                            logits = (q_hgd[kv_h] @ k_win.transpose(0, 1)) * float(
-                                getattr(layer, "scaling", 1.0)
-                            )
-                            p = torch.softmax(logits, dim=-1)
-                            o = p @ v_win
-                            hq_start = kv_h * Gs
-                            out_swa[b, hq_start : hq_start + Gs, :] = o
+                sm_scale = float(getattr(layer, "scaling", 1.0))
+                for b in range(B):
+                    seqlen = int(seq_lens_i64[b].item())
+                    if seqlen <= 0:
+                        continue
+                    w = min(seqlen, int(window_size))
+                    start = seqlen - w
+                    tok_pos = torch.arange(start, seqlen, device=q3.device, dtype=torch.int64)
+                    if swa_exclude_lmk:
+                        keep = (tok_pos % int(self.page_size)) != (int(self.page_size) - 1)
+                        tok_pos = tok_pos[keep]
+                    if tok_pos.numel() == 0:
+                        continue
+                    token_locs = page_table_1[b, tok_pos].to(torch.int64)
+                    q_hgd = q_swa[b].view(H_swa, Gs, D).to(torch.float32)
+                    for kv_h in range(H_swa):
+                        k_win = k_cache_all[token_locs, kv_h, :].to(torch.float32)
+                        v_win = v_cache_all[token_locs, kv_h, :].to(torch.float32)
+                        logits = (q_hgd[kv_h] @ k_win.transpose(0, 1)) * sm_scale
+                        p = torch.softmax(logits, dim=-1)
+                        o = p @ v_win
+                        hq_start = kv_h * Gs
+                        out_swa[b, hq_start : hq_start + Gs, :] = o
 
             # Internal SWA on HSA heads (LHSA semantics).
             swa_o_inner, lse_kv = self._compute_internal_swa_decode(
