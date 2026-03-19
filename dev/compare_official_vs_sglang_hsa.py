@@ -358,8 +358,8 @@ def main():
     page_size = config_dict["chunk_size"]
     lmk_id = config_dict["vocab_size"]
 
-    # ---- Prompt: 200 real tokens → ~3 full pages ----
-    real_tokens = list(range(5, 5 + 200))
+    # ---- Prompt: 65 real tokens → 1 full page + 2 extra tokens ----
+    real_tokens = list(range(5, 5 + 65))
 
     print("=" * 60)
     print("OFFICIAL vs SGLANG HSA COMPARISON")
@@ -534,6 +534,119 @@ def main():
     else:
         print(f"\n  WARN: large difference detected (max_err={max_abs:.6f})")
         print("  This may indicate weight mapping or computation differences.")
+
+    # ============================================================
+    # DECODE COMPARISON
+    # ============================================================
+    print(f"\n{'='*60}")
+    print("DECODE COMPARISON (1 token after prefill)")
+    print(f"{'='*60}")
+
+    next_token_id = 42  # arbitrary decode token
+    vocab_size = config_dict["vocab_size"]
+
+    # ---- Official decode ----
+    print("\n--- Official Decode ---")
+    # official_out.past_key_values has the KV cache from prefill.
+    # Feed one token, get next logits.
+    decode_input = torch.tensor([[next_token_id]], device=device, dtype=torch.long)
+    # Position for this token: it's at engine-visible index = prefill_len (0-based).
+    # pos = prefill_len - floor(prefill_len / page_size)
+    decode_engine_pos = prefill_len
+    decode_pos = decode_engine_pos - (decode_engine_pos // page_size)
+    decode_position_ids = torch.tensor([[decode_pos]], device=device, dtype=torch.long)
+    decode_mask = torch.ones((1, prefill_len + 1), dtype=torch.long, device=device)
+
+    with torch.no_grad():
+        official_dec_out = official_model(
+            input_ids=decode_input,
+            position_ids=decode_position_ids,
+            attention_mask=decode_mask,
+            past_key_values=official_out.past_key_values,
+            use_cache=True,
+        )
+    official_dec_logits = official_dec_out.logits[:, -1:, :vocab_size]  # [1, 1, V]
+    print(f"  Decode position: {decode_pos}")
+    print(f"  Output logits: {official_dec_logits.shape}")
+
+    # ---- sglang decode ----
+    print("\n--- sglang Decode ---")
+    from sglang.srt.model_executor.forward_batch_info import compute_decode_positions_landmark
+
+    # Register the new token slot in req_to_token.
+    decode_seq_len = prefill_len + 1
+    decode_token_loc = torch.tensor([prefill_len], device=device, dtype=torch.int32)
+    model_runner.req_to_token_pool.req_to_token[0, prefill_len] = decode_token_loc[0]
+
+    # Compute decode position.
+    dec_pos = compute_decode_positions_landmark(
+        torch.tensor([decode_seq_len], device=device, dtype=torch.int32),
+        page_size=page_size,
+    )
+    print(f"  Decode position: {int(dec_pos.item())}")
+
+    # Verify positions match.
+    assert int(dec_pos.item()) == decode_pos, (
+        f"Decode position mismatch: official={decode_pos}, sglang={int(dec_pos.item())}"
+    )
+    print("  Decode positions match!")
+
+    out_cache_loc_dec = decode_token_loc[:1].to(torch.int64)
+    fb_dec = ForwardBatch(
+        forward_mode=ForwardMode.DECODE,
+        batch_size=1,
+        input_ids=torch.tensor([next_token_id], device=device, dtype=torch.int64),
+        req_pool_indices=torch.tensor([0], device=device, dtype=torch.int32),
+        seq_lens=torch.tensor([decode_seq_len], device=device, dtype=torch.int32),
+        out_cache_loc=out_cache_loc_dec,
+        seq_lens_sum=decode_seq_len,
+        seq_lens_cpu=torch.tensor([decode_seq_len], device="cpu", dtype=torch.int32),
+        positions=dec_pos,
+        req_to_token_pool=model_runner.req_to_token_pool,
+        token_to_kv_pool=model_runner.token_to_kv_pool,
+        attn_backend=backend,
+    )
+
+    backend.init_forward_metadata(fb_dec)
+    with torch.no_grad():
+        sglang_dec_hidden = sglang_model.model(fb_dec.input_ids, fb_dec.positions, fb_dec)
+    if isinstance(sglang_dec_hidden, tuple):
+        sglang_dec_hidden = sglang_dec_hidden[0]
+    sglang_dec_hidden = sglang_model.model.norm(sglang_dec_hidden)
+    sglang_dec_logits = (sglang_dec_hidden @ lm_weight.t()).unsqueeze(0)  # [1, 1, padded_V]
+    sglang_dec_logits = sglang_dec_logits[:, :, :vocab_size]
+    print(f"  Output logits: {sglang_dec_logits.shape}")
+
+    # ---- Compare decode ----
+    print("\n--- Decode Comparison ---")
+    off_dec = official_dec_logits.float()
+    sg_dec = sglang_dec_logits.float()
+
+    dec_abs_diff = (off_dec - sg_dec).abs()
+    dec_max = dec_abs_diff.max().item()
+    dec_mean = dec_abs_diff.mean().item()
+    off_dec_argmax = off_dec.argmax(dim=-1)
+    sg_dec_argmax = sg_dec.argmax(dim=-1)
+    dec_argmax_match = (off_dec_argmax == sg_dec_argmax).all().item()
+
+    print(f"  Max absolute error:  {dec_max:.6f}")
+    print(f"  Mean absolute error: {dec_mean:.6f}")
+    print(f"  Official argmax: {int(off_dec_argmax.item())}")
+    print(f"  sglang  argmax:  {int(sg_dec_argmax.item())}")
+    print(f"  Argmax match: {'YES' if dec_argmax_match else 'NO'}")
+
+    # Top-5 comparison.
+    off_top5_vals, off_top5_ids = off_dec.squeeze().topk(5)
+    sg_top5_vals, sg_top5_ids = sg_dec.squeeze().topk(5)
+    print(f"\n  Official top-5: {list(zip(off_top5_ids.tolist(), [f'{v:.3f}' for v in off_top5_vals.tolist()]))}")
+    print(f"  sglang  top-5:  {list(zip(sg_top5_ids.tolist(), [f'{v:.3f}' for v in sg_top5_vals.tolist()]))}")
+
+    if dec_max < 0.1:
+        print(f"\n  DECODE PASS: outputs match within tolerance (max_err={dec_max:.6f})")
+    elif dec_max < 2.0:
+        print(f"\n  DECODE CLOSE: small difference (max_err={dec_max:.6f})")
+    else:
+        print(f"\n  DECODE WARN: large difference (max_err={dec_max:.6f})")
 
 
 if __name__ == "__main__":
