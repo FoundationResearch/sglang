@@ -513,7 +513,7 @@ class FlashHSAInnerXHierarchicalSparseAttention(nn.Module):
         else:
             # No separate lmk_q_proj: use hsa_q directly for selection
             # (matches official behavior when enable_lmk_q_proj=False).
-            sel_q = None
+            sel_q = hsa_q.view(-1, self.hq_hsa, self.head_dim)
 
         # Concatenate heads into the single KV cache layout: [SWA | HSA].
         q_full = torch.cat([swa_q, hsa_q], dim=-1)
