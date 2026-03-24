@@ -1,0 +1,187 @@
+[
+  {
+    "num_real_tokens": 10,
+    "num_engine_tokens": 10,
+    "completed_pages": 0,
+    "prefill_max_err": 0.0234375,
+    "prefill_mean_err": 0.003901941003277898,
+    "prefill_argmax_match": 1.0,
+    "page_errors": [
+      {
+        "page": 0,
+        "pos_range": "0-9",
+        "max_err": 0.0234375,
+        "mean_err": 0.003901941003277898,
+        "argmax_match": 1.0
+      }
+    ],
+    "decode_max_err": 2.58984375,
+    "decode_mean_err": 0.6962751746177673,
+    "decode_argmax_match": false,
+    "off_argmax": 6,
+    "sg_argmax": 222
+  },
+  {
+    "num_real_tokens": 63,
+    "num_engine_tokens": 64,
+    "completed_pages": 1,
+    "prefill_max_err": 0.03125,
+    "prefill_mean_err": 0.004577417857944965,
+    "prefill_argmax_match": 0.96875,
+    "page_errors": [
+      {
+        "page": 0,
+        "pos_range": "0-63",
+        "max_err": 0.03125,
+        "mean_err": 0.004577417857944965,
+        "argmax_match": 0.96875
+      }
+    ],
+    "decode_max_err": 3.09375,
+    "decode_mean_err": 0.7058442234992981,
+    "decode_argmax_match": false,
+    "off_argmax": 6,
+    "sg_argmax": 226
+  },
+  {
+    "num_real_tokens": 65,
+    "num_engine_tokens": 66,
+    "completed_pages": 1,
+    "prefill_max_err": 0.31223487854003906,
+    "prefill_mean_err": 0.00618172250688076,
+    "prefill_argmax_match": 0.9696969985961914,
+    "page_errors": [
+      {
+        "page": 0,
+        "pos_range": "0-63",
+        "max_err": 0.03125,
+        "mean_err": 0.0045766523107886314,
+        "argmax_match": 0.96875
+      },
+      {
+        "page": 1,
+        "pos_range": "64-65",
+        "max_err": 0.31223487854003906,
+        "mean_err": 0.05754395201802254,
+        "argmax_match": 1.0
+      }
+    ],
+    "decode_max_err": 3.15625,
+    "decode_mean_err": 0.6965940594673157,
+    "decode_argmax_match": false,
+    "off_argmax": 6,
+    "sg_argmax": 226
+  },
+  {
+    "num_real_tokens": 126,
+    "num_engine_tokens": 128,
+    "completed_pages": 2,
+    "prefill_max_err": 1.3134765625,
+    "prefill_mean_err": 0.025044769048690796,
+    "prefill_argmax_match": 0.9453125,
+    "page_errors": [
+      {
+        "page": 0,
+        "pos_range": "0-63",
+        "max_err": 0.03125,
+        "mean_err": 0.004577417857944965,
+        "argmax_match": 0.96875
+      },
+      {
+        "page": 1,
+        "pos_range": "64-127",
+        "max_err": 1.3134765625,
+        "mean_err": 0.0455121174454689,
+        "argmax_match": 0.921875
+      }
+    ],
+    "decode_max_err": 3.3046875,
+    "decode_mean_err": 0.7205461263656616,
+    "decode_argmax_match": false,
+    "off_argmax": 6,
+    "sg_argmax": 230
+  },
+  {
+    "num_real_tokens": 130,
+    "num_engine_tokens": 132,
+    "completed_pages": 2,
+    "prefill_max_err": 1.83984375,
+    "prefill_mean_err": 0.02926596812903881,
+    "prefill_argmax_match": 0.9166666865348816,
+    "page_errors": [
+      {
+        "page": 0,
+        "pos_range": "0-63",
+        "max_err": 0.03125,
+        "mean_err": 0.0045766523107886314,
+        "argmax_match": 0.96875
+      },
+      {
+        "page": 1,
+        "pos_range": "64-127",
+        "max_err": 1.31396484375,
+        "mean_err": 0.04551919177174568,
+        "argmax_match": 0.921875
+      },
+      {
+        "page": 2,
+        "pos_range": "128-131",
+        "max_err": 1.83984375,
+        "mean_err": 0.16424347460269928,
+        "argmax_match": 0.0
+      }
+    ],
+    "decode_max_err": 2.796875,
+    "decode_mean_err": 0.745118260383606,
+    "decode_argmax_match": false,
+    "off_argmax": 6,
+    "sg_argmax": 239
+  },
+  {
+    "num_real_tokens": 200,
+    "num_engine_tokens": 203,
+    "completed_pages": 3,
+    "prefill_max_err": 1.83984375,
+    "prefill_mean_err": 0.0504939928650856,
+    "prefill_argmax_match": 0.842364490032196,
+    "page_errors": [
+      {
+        "page": 0,
+        "pos_range": "0-63",
+        "max_err": 0.03125,
+        "mean_err": 0.0045766523107886314,
+        "argmax_match": 0.96875
+      },
+      {
+        "page": 1,
+        "pos_range": "64-127",
+        "max_err": 1.31396484375,
+        "mean_err": 0.04551834613084793,
+        "argmax_match": 0.921875
+      },
+      {
+        "page": 2,
+        "pos_range": "128-191",
+        "max_err": 1.83984375,
+        "mean_err": 0.08032603561878204,
+        "argmax_match": 0.6875
+      },
+      {
+        "page": 3,
+        "pos_range": "192-202",
+        "max_err": 1.7529296875,
+        "mean_err": 0.1730303317308426,
+        "argmax_match": 0.5454545617103577
+      }
+    ],
+    "decode_max_err": 2.765625,
+    "decode_mean_err": 0.7443857192993164,
+    "decode_argmax_match": false,
+    "off_argmax": 6,
+    "sg_argmax": 33
+  },
+  {
+    "num_real_tokens": 400,
+    "error": "CUDA error: device-side assert triggered\nSearch for `cudaErrorAssert' in https://docs.nvidia.com/cuda/cuda-runtime-api/group__CUDART__TYPES.html for more information.\nCUDA kernel errors might be asynchronously reported at some other API call, so the stacktrace below might be incorrect.\nFor debugging consider passing CUDA_LAUNCH_BLOCKING=1\nCompile with `TORCH_USE_CUDA_DSA` to enable device-side assertions.\n"
+  }
+]
