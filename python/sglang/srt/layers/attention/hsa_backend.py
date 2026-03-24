@@ -150,10 +150,12 @@ class HSAAttnBackend(AttentionBackend):
         kv_head_offset: int = 0,
         kv_head_count: Optional[int] = None,
     ) -> None:
-        """Step 4 (Torch reference): SWA→HSA selection for decode.
+        """Top-k page selection for decode.
 
-        For now this populates debug fields on HSAMetadata; compute is still delegated
-        to dense backend. This keeps future kernel integration straightforward.
+        Uses logical token positions (not KV slot indices) for candidate
+        building and window exclusion, matching the official FlashHSA semantics:
+          limit_chunk = (query_pos - window_size + 1) // page_size
+          valid candidates: completed pages with page_id < limit_chunk
         """
         md = self.forward_metadata
         if md is None:
@@ -165,16 +167,19 @@ class HSAAttnBackend(AttentionBackend):
         if pool is None or not hasattr(pool, "get_key_buffer"):
             return
 
-        window = 0
+        hsa_window = 0
         if window_size_override is not None:
-            window = int(window_size_override)
-        # InnerX ultra: selection candidates are built without window exclusion (window=0).
-        # Robustness: in decode, some codepaths/tests may not have updated req_to_token yet.
-        # Overlay out_cache_loc into a temporary token->slot table at position (seq_len - 1).
+            hsa_window = int(window_size_override)
+
+        page_size = int(self.page_size)
+        B = int(forward_batch.batch_size)
+        H_sel = int(kv_head_count) if kv_head_count is not None else int(layer.tp_k_head_num)
+        device = q.device
+
+        # Overlay out_cache_loc into page_table_1 at position (seq_len - 1).
         page_table_1 = md.page_table_1
         if getattr(forward_batch, "out_cache_loc", None) is not None:
             seq_lens_i64 = md.cache_seqlens_int32.to(torch.int64)
-            B = int(forward_batch.batch_size)
             if B > 0:
                 page_table_1 = page_table_1.clone()
                 out_locs = forward_batch.out_cache_loc[:B].to(torch.int32)
@@ -183,50 +188,58 @@ class HSAAttnBackend(AttentionBackend):
                     if seqlen > 0 and seqlen <= page_table_1.shape[1]:
                         page_table_1[b, seqlen - 1] = out_locs[b]
 
-        cand_page_ids, cand_mask = build_active_page_candidates(
-            page_table_1=page_table_1,
-            seq_lens=md.cache_seqlens_int32,
-            page_size=md.page_size,
-            window_size=window,
-        )
+        seq_lens_i64 = md.cache_seqlens_int32.to(torch.int64)
 
-        # Flatten candidates for repr lookup.
-        B, C = cand_page_ids.shape
-        if C == 0:
-            # Still populate for observability.
-            md.hsa_cand_page_ids = cand_page_ids
-            md.hsa_cand_mask = cand_mask
-            H_sel = int(kv_head_count) if kv_head_count is not None else int(layer.tp_k_head_num)
-            md.hsa_selected_page_ids = cand_page_ids.new_full(
-                (B, H_sel, self.hsa_topk), -1, dtype=torch.int32
+        # Compute per-request candidate pages using logical positions.
+        # completed_pages = seq_len // page_size
+        # limit_chunk = (query_pos - window_size + 1) // page_size
+        #   where query_pos = seq_len - 1
+        # Valid candidates: page_id in [0, min(completed_pages, limit_chunk))
+        completed_pages = seq_lens_i64 // page_size  # [B]
+
+        if hsa_window > 0:
+            query_pos = seq_lens_i64 - 1  # [B]
+            limit_chunk = (query_pos - hsa_window + 1) // page_size  # [B]
+            limit_chunk = limit_chunk.clamp(min=0)
+            effective_cands = torch.min(completed_pages, limit_chunk)  # [B]
+        else:
+            effective_cands = completed_pages  # [B]
+
+        effective_cands = effective_cands.clamp(min=0)
+        C_max = int(effective_cands.max().item())
+
+        if C_max == 0:
+            md.hsa_cand_page_ids = page_table_1.new_full((B, 0), -1, dtype=torch.int32)
+            md.hsa_cand_mask = page_table_1.new_zeros((B, 0), dtype=torch.bool)
+            md.hsa_selected_page_ids = page_table_1.new_full(
+                (B, H_sel, int(self.hsa_topk)), -1, dtype=torch.int32
             )
             md.hsa_selected_scores = q.new_full(
-                (B, H_sel, self.hsa_topk), float("-inf"), dtype=torch.float32
+                (B, H_sel, int(self.hsa_topk)), float("-inf"), dtype=torch.float32
             )
             return
 
-        # FlashHSA semantics:
-        # E_i is K(LMK) for each page, where LMK is the last slot in a page:
-        #   lmk_loc = page_id * page_size + (page_size - 1)
-        #
-        # Only *completed* pages (LMK already written into KV) may participate.
-        seq_lens_i64 = md.cache_seqlens_int32.to(torch.int64)
-        completed_pages = torch.div(
-            seq_lens_i64, int(self.page_size), rounding_mode="floor"
-        )  # [B]
+        # Build padded candidate page_ids [B, C_max] using logical page indices.
+        cand_range = torch.arange(C_max, device=device, dtype=torch.int32)
+        cand_page_ids = cand_range.unsqueeze(0).expand(B, C_max).contiguous()
+        cand_mask = cand_page_ids < effective_cands.unsqueeze(1).to(torch.int32)
+        cand_page_ids = cand_page_ids.masked_fill(~cand_mask, -1)
 
-        cand_completed = cand_mask & (cand_page_ids.to(torch.int64) < completed_pages[:, None])
-
-        safe_page_ids = cand_page_ids.clamp_min(0).to(torch.int64)
-        lmk_locs = safe_page_ids * int(self.page_size) + (int(self.page_size) - 1)  # [B,C]
-        flat_lmk_locs = lmk_locs.reshape(-1)
+        # Load LMK keys via page_table_1 (logical page → KV slot).
+        safe_page_ids = cand_page_ids.clamp(min=0).to(torch.int64)
+        lmk_token_pos = safe_page_ids * page_size + (page_size - 1)  # [B, C_max]
+        lmk_token_pos_safe = lmk_token_pos.clamp(max=page_table_1.shape[1] - 1)
+        lmk_locs = torch.gather(
+            page_table_1.to(torch.int64), 1, lmk_token_pos_safe
+        )  # [B, C_max]
 
         k_cache = pool.get_key_buffer(layer.layer_id)  # [num_locs, H_total, D]
-        flat_repr = k_cache[flat_lmk_locs]  # [B*C, H_total, D]
+        D = int(k_cache.shape[2])
+        flat_lmk_locs = lmk_locs.reshape(-1)
+        flat_repr = k_cache[flat_lmk_locs]  # [B*C_max, H_total, D]
         if kv_head_count is not None:
-            flat_repr = flat_repr[:, int(kv_head_offset) : int(kv_head_offset) + int(kv_head_count), :]
-        cand_repr = flat_repr.view(B, C, flat_repr.shape[1], flat_repr.shape[2])
-        cand_repr_valid = cand_completed
+            flat_repr = flat_repr[:, int(kv_head_offset):int(kv_head_offset) + int(kv_head_count), :]
+        cand_repr = flat_repr.view(B, C_max, H_sel, D)
 
         q_sel = selection_q if selection_q is not None else q
         sel = select_topk_pages_decode(
@@ -234,7 +247,7 @@ class HSAAttnBackend(AttentionBackend):
             cand_page_ids=cand_page_ids,
             cand_mask=cand_mask,
             cand_chunk_repr=cand_repr,
-            cand_chunk_repr_valid=cand_repr_valid,
+            cand_chunk_repr_valid=cand_mask,
             topk=int(self.hsa_topk),
             selection_strategy=str(self.hsa_selection_strategy),
             sm_scale=getattr(layer, "scaling", None),

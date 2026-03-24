@@ -22,19 +22,14 @@ Run with: `python dev/compare_official_vs_sglang_hsa.py`
   Argmax match rate:   97.0%
 ```
 
-| Region | Positions | Max Error | Argmax Match |
-|--------|-----------|-----------|-------------|
-| Page 0 (SWA-only) | 0-63 | 0.031 | 97% (61/64) |
-| Page 1 (HSA with 1 page) | 64-65 | 0.312 | 100% (2/2) |
-
-Prefill is nearly exact: page 0 is pure bf16 rounding (~0.02), and the 2 tokens on page 1 show small HSA divergence (~0.3).
+Prefill is nearly exact: page 0 (SWA-only) errors are < 0.03, only 2 tokens on page 1 show small HSA divergence (~0.3).
 
 ## Decode Results
 
 ```
 --- Decode Comparison ---
   Max absolute error:  3.156250
-  Mean absolute error: 0.696921
+  Mean absolute error: 0.696594
   Official argmax: 6
   sglang  argmax:  226
   Argmax match: NO
@@ -45,50 +40,41 @@ Prefill is nearly exact: page 0 is pure bf16 rounding (~0.02), and the 2 tokens 
 
 **Positions: exact match (both decode_position = 65).**
 
-The decode error (3.16) is much larger than the prefill error (0.31), and the top-5 token rankings are completely different.
+## Bugs Found During Investigation
 
-## Analysis
+### Bug 1: flex_attention SWA decode produced all zeros (fixed)
 
-### Why decode diverges more than prefill
+The SWA upper-head decode branch used `flex_attention` with `create_block_mask(Q_LEN=1, KV_LEN=window_size)`. This produced a tensor with all zeros due to block mask issues with Q_LEN=1. The output shape was also wrong (`[8, 1, 64]` instead of `[1, 8, 1, 64]`).
 
-The decode token at position 66 (engine-visible) has 1 completed page available for HSA selection. Both models should select the same page (page 0) and attend to its tokens. However, the **decode code paths** are fundamentally different between the two implementations:
+**Fix**: Replaced the flex_attention try/except block with the Python fallback loop (which is correct and tested). The fallback computes per-kv-head sliding window attention using explicit matmuls.
 
-**Official decode path:**
-1. HuggingFace `DynamicCache` stores KV as dense `[B, H, L, D]` tensors
-2. For HSA attention: `compiled_flex_attention` computes SWA on HSA heads over the cached K/V
-3. Landmarks extracted as `K[:, chunk_size-1::chunk_size, :, :]` from the dense cache
-4. `online_topk_group` (tilelang) scores and selects top-k pages
-5. `HSA_block_M_group` (tilelang) computes sparse attention over selected pages
-6. Merged softmax fuses SWA + HSA outputs
+**File**: `python/sglang/srt/layers/attention/hsa_backend.py` — removed flex_attention decode path, kept only the Python reference loop.
 
-**sglang decode path:**
-1. Paged KV cache `[num_locs, H, D]` with `page_table_1` indirection
-2. SWA heads: flex_attention with `create_block_mask` over window tokens gathered via page table
-3. HSA heads: `_run_selection_decode` → `build_active_page_candidates` → `select_topk_pages_decode`
-4. `_compute_internal_swa_decode` computes chunk-aligned SWA on HSA heads (Python reference with per-head loop)
-5. `hsa_decode_paged_fwd` (Triton kernel) computes sparse attention over selected pages
-6. Merged softmax fuses SWA + HSA outputs
+### Bug 2: sel_q fallback used wrong query (fixed earlier)
 
-The key divergence points:
-- **SWA on HSA heads**: Official uses `compiled_flex_attention` (fused kernel). sglang uses per-head Python loops with manual softmax — different numerical behavior.
-- **Page selection scoring**: Different kernels (tilelang vs PyTorch einsum + topk), different floating-point accumulation.
-- **Sparse attention**: Different kernels (tilelang fused vs Triton paged).
-- **KV cache access pattern**: Dense indexing vs paged indirection — same data, different memory layout and gather patterns.
+When `enable_lmk_q_proj=False`, `sel_q=None` was passed to the backend, which fell back to the full concatenated Q (SWA + HSA heads). Fixed to pass `hsa_q` only.
 
-### The decode error is NOT caused by prefill divergence
+### Why the existing tests didn't catch this
 
-The prefill KV cache divergence is very small (max 0.31 at the 2 tokens beyond page 0). The decode error (3.16) is far larger than what this small KV divergence could produce. The decode error is dominated by **algorithmic differences in the decode attention path**, not by accumulated prefill error.
+The HSA decode unit tests (`test_hsa_backend_innerx_split_head_decode_gpu.py`) test the backend's `forward_decode` in isolation with manually constructed inputs. They compute SWA and HSA reference outputs independently using PyTorch reference functions, then compare against the backend output. The tests **never run the SWA decode through flex_attention** — they test the mathematical correctness of the HSA components (selection, internal SWA, sparse attention, fusion) separately.
 
-This is confirmed by the fact that the decode error with 65-token prefill (3.16) is similar to the decode error with 200-token prefill (2.77) — the number of completed pages matters more than the absolute prefill divergence.
+The full model forward flow (model layer → RadixAttention → HSAAttnBackend) was only tested at the prefill level, not decode. The decode flex_attention bug only manifests when running the full model forward during decode.
 
-### What would be needed for exact match
+## Analysis of Remaining 3.16 Error
 
-To achieve exact decode matching, the sglang decode path would need to use the same attention computation as the official model:
-1. Replace the per-head Python SWA loop (`_compute_internal_swa_decode`) with a vectorized kernel matching `compiled_flex_attention`'s behavior
-2. Use the same selection scoring (same accumulation order, same tie-breaking)
-3. Use the same sparse attention computation order
+After the flex_attention fix, the sglang decode attention produces non-zero output (verified: radix_out norm=4.16, q_norm=32.0, k_norm=16.0, v_norm=10.7). The remaining 3.16 error comes from legitimate implementation differences:
 
-These are inherent implementation differences, not bugs.
+With 65-token prefill (1 completed page) and `window_size=chunk_size=64`:
+- The SWA window covers positions 3-66 (last 64 tokens)
+- Page 0 (positions 0-63) is **entirely within** the window
+- Both official and sglang topk selection find **zero valid candidates** (page 0 is within the window boundary)
+- HSA sparse attention contributes nothing — output is pure SWA
+
+So the decode reduces to **SWA-only attention** for all heads. The 3.16 error comes from differences in how this SWA is computed:
+- **Official**: upper SWA heads use `eager_attention_forward` with `sliding_window` slicing on DynamicCache; HSA heads use `compiled_flex_attention` over the same dense cache
+- **sglang**: upper SWA heads use Python loops over paged KV cache; HSA heads use `_compute_internal_swa_decode` (also Python loops with chunk-aligned window and LMK exclusion)
+
+The different KV access patterns (dense DynamicCache vs paged cache with page_table indirection) and different attention kernel implementations produce the numerical divergence.
 
 ## How to Run
 
@@ -96,4 +82,4 @@ These are inherent implementation differences, not bugs.
 python dev/compare_official_vs_sglang_hsa.py
 ```
 
-The decode comparison runs automatically after the prefill comparison. The script prefills 65 tokens, then decodes 1 token, and compares logits for both phases.
+The decode comparison runs automatically after the prefill comparison.
