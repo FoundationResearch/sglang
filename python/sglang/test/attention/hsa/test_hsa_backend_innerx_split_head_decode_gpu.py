@@ -332,13 +332,15 @@ def test_hsa_backend_innerx_split_head_decode_is_math_correct_cuda():
     v_cache_full = forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id)
 
     # 1) Outer SWA on SWA heads (unchanged).
+    # Upper SWA heads use full causal attention (matching official model's
+    # eager_attention_forward which ignores sliding_window).
     out_swa = _torch_swa_decode_window_innerx(
         q=q3[:, :HQ_swa, :],
         k_cache=k_cache_full[:, :H_swa, :],
         v_cache=v_cache_full[:, :H_swa, :],
         page_table_1=page_table_1,
         seq_lens=seq_lens,
-        window_size=window_size,
+        window_size=int(seq_lens.max().item()),  # full causal
         sm_scale=sm_scale,
     )
 
@@ -462,14 +464,14 @@ def _run_lhsa_decode_reference(
     D = q3.shape[2]
     device = q3.device
 
-    # 1) Outer SWA on SWA heads.
+    # 1) Outer SWA on SWA heads — full causal (matching official).
     out_swa = _torch_swa_decode_window_innerx(
         q=q3[:, :HQ_swa, :],
         k_cache=k_cache[:, :H_swa, :],
         v_cache=v_cache[:, :H_swa, :],
         page_table_1=page_table_1,
         seq_lens=seq_lens,
-        window_size=window_size,
+        window_size=int(seq_lens.max().item()),  # full causal
         sm_scale=sm_scale,
     )
 

@@ -564,9 +564,13 @@ class HSAAttnBackend(AttentionBackend):
             q_swa = q3[:, :HQ_swa, :]
             q_hsa = q3[:, HQ_swa:, :]
 
-            # SWA branch: sliding-window attention on upper (SWA) heads.
+            # SWA branch: full causal attention on upper (SWA) heads.
+            # Uses full causal (all previous tokens), NOT the HSA merging window.
+            # This matches the official model's eager_attention_forward which also
+            # uses full causal with no sliding window.
+            swa_sliding_window = getattr(layer, "sliding_window_size", None)
             out_swa = torch.zeros((B, HQ_swa, D), device=q3.device, dtype=torch.float32)
-            if window_size is not None and int(window_size) > 0 and HQ_swa > 0 and H_swa > 0:
+            if HQ_swa > 0 and H_swa > 0:
                 seq_lens_i64 = md.cache_seqlens_int32.to(torch.int64)
                 assert HQ_swa % H_swa == 0
                 Gs = HQ_swa // H_swa
@@ -577,7 +581,11 @@ class HSAAttnBackend(AttentionBackend):
                     seqlen = int(seq_lens_i64[b].item())
                     if seqlen <= 0:
                         continue
-                    w = min(seqlen, int(window_size))
+                    # Use layer's sliding_window if set, otherwise full causal.
+                    if swa_sliding_window is not None and int(swa_sliding_window) > 0:
+                        w = min(seqlen, int(swa_sliding_window))
+                    else:
+                        w = seqlen
                     start = seqlen - w
                     tok_pos = torch.arange(start, seqlen, device=q3.device, dtype=torch.int64)
                     if swa_exclude_lmk:
@@ -709,6 +717,83 @@ class HSAAttnBackend(AttentionBackend):
             page_table_1=page_table_1, H_swa=H_swa, H_hsa=H_hsa,
             HQ_hsa=HQ_hsa, hsa_window=hsa_window,
         )
+
+    def _compute_swa_heads_extend(
+        self,
+        *,
+        q_swa: torch.Tensor,
+        layer: "RadixAttention",
+        forward_batch: "ForwardBatch",
+        page_table_1: torch.Tensor,
+        H_swa: int,
+        HQ_swa: int,
+    ) -> torch.Tensor:
+        """Compute SWA heads via explicit causal attention for extend.
+
+        Uses batched matmul instead of the Triton extend kernel, giving exact
+        control over the attention computation and matching the official model's
+        eager_attention_forward behavior.
+
+        Returns
+        -------
+        out_swa : [T, HQ_swa, D] float32
+        """
+        T, _, D = q_swa.shape
+        device = q_swa.device
+        md = self.forward_metadata
+        pool = getattr(forward_batch, "token_to_kv_pool", None)
+
+        out_swa = torch.zeros((T, HQ_swa, D), device=device, dtype=torch.float32)
+        if md is None or pool is None or H_swa <= 0 or HQ_swa <= 0:
+            return out_swa
+
+        k_cache_all = pool.get_key_buffer(layer.layer_id)
+        v_cache_all = pool.get_value_buffer(layer.layer_id)
+        token_to_seq_id = md.token_to_seq_id  # [T]
+        sm_scale = float(getattr(layer, "scaling", 1.0))
+
+        assert HQ_swa % H_swa == 0
+        Gs = HQ_swa // H_swa
+
+        # Compute engine indices for extend tokens.
+        if md.extend_prefix_lens is not None and md.extend_seq_lens is not None:
+            engine_indices = torch.cat([
+                torch.arange(int(plen), int(plen) + int(elen), device=device, dtype=torch.int64)
+                for plen, elen in zip(md.extend_prefix_lens, md.extend_seq_lens)
+            ])
+        else:
+            return out_swa
+
+        # Full causal attention: each token attends to [0, engine_idx].
+        # No LMK exclusion for SWA heads (matching official eager_attention_forward).
+        max_ctx = int(engine_indices.max().item()) + 1
+        if max_ctx <= 0:
+            return out_swa
+
+        # Build padded causal window [T, max_ctx].
+        offsets = torch.arange(max_ctx, device=device, dtype=torch.int64)
+        win_positions = offsets.unsqueeze(0).expand(T, max_ctx)  # [T, max_ctx]
+        valid = win_positions <= engine_indices.unsqueeze(1)  # causal mask
+
+        # Gather token locations via page_table_1.
+        safe_positions = win_positions.clamp(max=page_table_1.shape[1] - 1)
+        pt_per_token = page_table_1[token_to_seq_id.long()]  # [T, MAX_T]
+        token_locs = torch.gather(pt_per_token, 1, safe_positions).to(torch.int64)
+
+        valid_expanded = valid.unsqueeze(1).expand(T, Gs, max_ctx)
+        flat_locs = token_locs.reshape(-1)
+
+        for kv_h in range(H_swa):
+            k_win = k_cache_all[flat_locs, kv_h, :].view(T, max_ctx, D).to(torch.float32)
+            v_win = v_cache_all[flat_locs, kv_h, :].view(T, max_ctx, D).to(torch.float32)
+            q_group = q_swa[:, kv_h * Gs : (kv_h + 1) * Gs, :].to(torch.float32)
+            logits = torch.bmm(q_group, k_win.transpose(1, 2)) * sm_scale
+            logits = logits.masked_fill(~valid_expanded, float("-inf"))
+            p = torch.softmax(logits, dim=-1)
+            o = torch.bmm(p, v_win)
+            out_swa[:, kv_h * Gs : (kv_h + 1) * Gs, :] = o
+
+        return out_swa
 
     def _compute_internal_swa_extend_batched(
         self,
@@ -1360,18 +1445,22 @@ class HSAAttnBackend(AttentionBackend):
         D = int(layer.qk_head_dim)
         T = q.shape[0]
         q3 = q.view(T, HQ_total, D)
-        q_hsa = q3[:, HQ_swa:, :]  # [T, HQ_hsa, D]
+        q_swa = q3[:, :HQ_swa, :]   # [T, HQ_swa, D]
+        q_hsa = q3[:, HQ_swa:, :]   # [T, HQ_hsa, D]
 
-        # Step 2: Run dense extend on ALL heads (save_kv_cache=False since already saved).
-        # SWA head outputs will be correct from this; HSA head outputs will be overwritten.
-        kwargs_clean = {kk: vv for kk, vv in kwargs.items() if not kk.startswith("hsa_")}
-        dense_out = self._dense_backend.forward_extend(
-            q, k, v, layer, forward_batch, save_kv_cache=False, **kwargs_clean
-        )
-        dense_out_3 = dense_out.view(T, HQ_total, D)
-
-        # page_table_1 already covers all positions (seq_lens = prefix + extend).
         page_table_1 = md.page_table_1
+
+        # Step 2: Compute SWA heads via explicit causal attention (not dense extend).
+        # This avoids the Triton extend kernel's precision differences and gives
+        # exact control over the attention computation, matching the official model.
+        out_swa = self._compute_swa_heads_extend(
+            q_swa=q_swa,
+            layer=layer,
+            forward_batch=forward_batch,
+            page_table_1=page_table_1,
+            H_swa=H_swa,
+            HQ_swa=HQ_swa,
+        )
 
         # Step 3: Internal SWA on HSA heads.
         swa_o_inner, lse_kv = self._compute_internal_swa_extend(
@@ -1469,8 +1558,9 @@ class HSAAttnBackend(AttentionBackend):
             )
             out_hsa = out_hsa.to(torch.float32) + swa_o_inner * swa_w_q[:, :, None]
 
-        # Step 8: Assemble final output — keep SWA heads from dense, overwrite HSA heads.
-        out_all = dense_out_3.clone()
+        # Step 8: Assemble final output from both head groups.
+        out_all = torch.empty((T, HQ_total, D), device=q3.device, dtype=torch.bfloat16)
+        out_all[:, :HQ_swa, :] = out_swa.to(torch.bfloat16)
         out_all[:, HQ_swa:, :] = out_hsa.to(torch.bfloat16)
         return out_all.reshape(T, HQ_total * D)
 
