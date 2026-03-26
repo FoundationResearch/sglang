@@ -240,9 +240,11 @@ def main():
     test_cases = [
         (10, "10 tokens, 0 pages"),
         (61, "61 tokens, 0 pages"),
-        (62, "62 tokens, 0 pages (FAIL case)"),
+        (62, "62 tokens, 0 pages"),
         (63, "63 tokens, 1 page"),
         (65, "65 tokens, 1 page + 2"),
+        (126, "126 tokens, 2 pages"),
+        (130, "130 tokens, 2 pages + 4"),
     ]
 
     for n_tokens, desc in test_cases:
