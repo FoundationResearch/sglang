@@ -748,7 +748,6 @@ class HSAAttnBackend(AttentionBackend):
 
         k_cache_all = pool.get_key_buffer(layer.layer_id)
         v_cache_all = pool.get_value_buffer(layer.layer_id)
-        token_positions = md.token_positions  # [T] int64
         token_to_seq_id = md.token_to_seq_id  # [T] int32
 
         assert HQ_hsa % H_hsa == 0
@@ -756,8 +755,23 @@ class HSAAttnBackend(AttentionBackend):
         page_size = int(self.page_size)
         sm_scale = float(getattr(layer, "scaling", 1.0))
 
-        # Compute per-token chunk-aligned window start.
-        raw_starts = token_positions - hsa_window + 1  # [T]
+        # Compute engine indices for each extend token.
+        # Engine index = position in the engine-visible token sequence (includes LMK).
+        # For extend tokens: engine_idx = prefix_len + offset_within_extend.
+        # We reconstruct these from extend_prefix_lens and token_to_seq_id.
+        if md.extend_prefix_lens is not None and md.extend_seq_lens is not None:
+            # Build per-token engine indices from prefix_lens + local offset.
+            engine_indices = torch.cat([
+                torch.arange(int(plen), int(plen) + int(elen), device=device, dtype=torch.int64)
+                for plen, elen in zip(md.extend_prefix_lens, md.extend_seq_lens)
+            ])  # [T]
+        else:
+            # Fallback: use seq_lens - 1 for decode-like scenarios
+            engine_indices = md.cache_seqlens_int32.to(torch.int64) - 1
+
+        # Compute per-token chunk-aligned window start using ENGINE indices.
+        # Official mask: chunk_start = ((q_engine_idx - window_size + 1) // chunk_size) * chunk_size
+        raw_starts = engine_indices - hsa_window + 1  # [T]
         chunk_starts = torch.where(
             raw_starts >= 0,
             (raw_starts // page_size) * page_size,
@@ -765,18 +779,20 @@ class HSAAttnBackend(AttentionBackend):
         ).clamp(min=0)  # [T]
 
         # Window length (before LMK exclusion).
-        win_lens = token_positions - chunk_starts + 1  # [T]
+        win_lens = engine_indices - chunk_starts + 1  # [T]
         max_win = int(win_lens.max().item())
         if max_win <= 0:
             return swa_o, lse_kv
 
-        # Build padded window positions [T, max_win].
+        # Build padded window ENGINE indices [T, max_win].
         offsets = torch.arange(max_win, device=device, dtype=torch.int64)  # [max_win]
         win_positions = chunk_starts.unsqueeze(1) + offsets.unsqueeze(0)  # [T, max_win]
 
-        # Validity: position <= pos_t AND not LMK position.
-        valid = (win_positions <= token_positions.unsqueeze(1))
-        valid = valid & ((win_positions % page_size) != (page_size - 1))
+        # Validity: engine_idx <= current token's engine_idx AND not LMK position.
+        # LMK exclusion uses ENGINE indices: (engine_idx + 1) % page_size == 0
+        # i.e., engine indices page_size-1, 2*page_size-1, ... are LMK slots.
+        valid = (win_positions <= engine_indices.unsqueeze(1))
+        valid = valid & (((win_positions + 1) % page_size) != 0)
 
         # Gather token_locs via page_table_1[seq_id, position].
         safe_positions = win_positions.clamp(min=0, max=page_table_1.shape[1] - 1)
@@ -861,7 +877,6 @@ class HSAAttnBackend(AttentionBackend):
 
         k_cache_all = pool.get_key_buffer(layer.layer_id)
         v_cache_all = pool.get_value_buffer(layer.layer_id)
-        token_positions = md.token_positions
         token_to_seq_id = md.token_to_seq_id
 
         assert HQ_hsa % H_hsa == 0
@@ -869,17 +884,27 @@ class HSAAttnBackend(AttentionBackend):
         page_size = int(self.page_size)
         sm_scale = float(getattr(layer, "scaling", 1.0))
 
+        # Compute engine indices for extend tokens.
+        if md.extend_prefix_lens is not None and md.extend_seq_lens is not None:
+            engine_indices = torch.cat([
+                torch.arange(int(plen), int(plen) + int(elen), device=device, dtype=torch.int64)
+                for plen, elen in zip(md.extend_prefix_lens, md.extend_seq_lens)
+            ])
+        else:
+            engine_indices = md.token_positions  # fallback
+
         for t in range(T):
-            pos_t = int(token_positions[t].item())
+            eng_idx = int(engine_indices[t].item())
             b = int(token_to_seq_id[t].item())
 
-            # Chunk-aligned window start (same as decode _compute_internal_swa_decode).
-            raw_start = pos_t - hsa_window + 1
+            # Chunk-aligned window start using ENGINE index.
+            raw_start = eng_idx - hsa_window + 1
             chunk_start = max(0, (raw_start // page_size) * page_size) if raw_start >= 0 else 0
 
-            # Positions [chunk_start, pos_t], excluding LMK slots.
-            tok_pos = torch.arange(chunk_start, pos_t + 1, device=device, dtype=torch.int64)
-            keep = (tok_pos % page_size) != (page_size - 1)
+            # Engine indices [chunk_start, eng_idx], excluding LMK slots.
+            # LMK exclusion: (engine_idx + 1) % page_size == 0
+            tok_pos = torch.arange(chunk_start, eng_idx + 1, device=device, dtype=torch.int64)
+            keep = ((tok_pos + 1) % page_size) != 0
             tok_pos = tok_pos[keep]
             if tok_pos.numel() == 0:
                 continue
@@ -980,18 +1005,26 @@ class HSAAttnBackend(AttentionBackend):
             HQ_sel = int(q_sel_3.shape[1])
 
         # 1. Compute per-token completed page count and exclusion boundary.
-        completed_pages = token_positions // page_size  # [T]
+        # Use ENGINE indices (not position_ids) to match official topk semantics:
+        #   limit_chunk = (engine_idx - window_size + 1) // block_size
+        if md.extend_prefix_lens is not None and md.extend_seq_lens is not None:
+            engine_indices = torch.cat([
+                torch.arange(int(plen), int(plen) + int(elen), device=device, dtype=torch.int64)
+                for plen, elen in zip(md.extend_prefix_lens, md.extend_seq_lens)
+            ])
+        else:
+            engine_indices = token_positions
+
+        completed_pages = engine_indices // page_size  # [T]
 
         if hsa_window > 0:
-            raw_starts = token_positions - hsa_window + 1
-            chunk_starts = torch.where(
+            raw_starts = engine_indices - hsa_window + 1
+            limit_chunks = torch.where(
                 raw_starts >= 0,
-                (raw_starts // page_size) * page_size,
+                raw_starts // page_size,
                 torch.zeros_like(raw_starts),
-            ).clamp(min=0)
-            window_start_pages = chunk_starts // page_size  # [T]
-            # Effective candidate count: pages before the SWA window.
-            effective_cands = torch.min(completed_pages, window_start_pages)
+            ).clamp(min=0)  # [T]
+            effective_cands = torch.min(completed_pages, limit_chunks)
         else:
             effective_cands = completed_pages
 
@@ -1099,12 +1132,21 @@ class HSAAttnBackend(AttentionBackend):
         all_page_ids = []
         all_scores = []
 
+        # Compute engine indices for extend tokens.
+        if md.extend_prefix_lens is not None and md.extend_seq_lens is not None:
+            _engine_indices = torch.cat([
+                torch.arange(int(plen), int(plen) + int(elen), device=device, dtype=torch.int64)
+                for plen, elen in zip(md.extend_prefix_lens, md.extend_seq_lens)
+            ])
+        else:
+            _engine_indices = token_positions
+
         for t in range(T):
-            pos_t = int(token_positions[t].item())
+            eng_idx = int(_engine_indices[t].item())
             b = int(token_to_seq_id[t].item())
 
-            # Completed pages: page ids 0 .. (pos_t // page_size - 1).
-            completed = pos_t // page_size
+            # Completed pages using engine index.
+            completed = eng_idx // page_size
             if completed <= 0:
                 all_page_ids.append(
                     torch.full((1, H_sel, self.hsa_topk), -1, device=device, dtype=torch.int32)
@@ -1116,12 +1158,12 @@ class HSAAttnBackend(AttentionBackend):
 
             cand_pages = torch.arange(completed, device=device, dtype=torch.int32)
 
-            # Exclude pages within the SWA window (chunk-aligned).
+            # Exclude pages within the SWA window using engine index.
+            # Official: limit_chunk = (engine_idx - window_size + 1) // block_size
             if hsa_window > 0:
-                raw_start = pos_t - hsa_window + 1
-                chunk_start = max(0, (raw_start // page_size) * page_size) if raw_start >= 0 else 0
-                window_start_page = chunk_start // page_size
-                cand_pages = cand_pages[cand_pages < window_start_page]
+                raw_start = eng_idx - hsa_window + 1
+                limit_chunk = max(0, raw_start // page_size) if raw_start >= 0 else 0
+                cand_pages = cand_pages[cand_pages < limit_chunk]
 
             C = int(cand_pages.numel())
             if C == 0:
