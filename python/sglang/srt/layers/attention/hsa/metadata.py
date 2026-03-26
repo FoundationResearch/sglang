@@ -49,6 +49,11 @@ class HSAMetadata:
     extend_seq_lens: Optional[torch.Tensor] = None  # [B] extend lengths
     extend_prefix_lens: Optional[torch.Tensor] = None  # [B] prefix lengths
 
+    # Engine indices: engine-visible token index for each extend token.
+    # Unlike token_positions (which are position_ids with LMK sharing),
+    # engine_indices are monotonically increasing and unique per token.
+    engine_indices: Optional[torch.Tensor] = None  # [total_extend_tokens] int64
+
     # Per-token selection results (extend path)
     hsa_ext_selected_page_ids: Optional[torch.Tensor] = None  # [T, H, K] int32
     hsa_ext_selected_scores: Optional[torch.Tensor] = None  # [T, H, K] float32
