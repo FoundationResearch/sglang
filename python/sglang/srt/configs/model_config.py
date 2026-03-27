@@ -309,6 +309,17 @@ class ModelConfig:
         # Use self.context_len after it has been initialized to prevent using context_len which may be None.
         self.is_hybrid_swa = is_hybrid_swa_model(self.hf_config.architectures)
 
+        # HSA models only use hybrid SWA when SWA layers have an eviction window.
+        if self.is_hybrid_swa and "HSAForCausalLM" in self.hf_config.architectures:
+            has_swa_window = bool(
+                getattr(self.hf_text_config, "use_sliding_window_attention", False)
+            ) and (
+                getattr(self.hf_text_config, "sliding_window_attention_size", None)
+                is not None
+            )
+            if not has_swa_window:
+                self.is_hybrid_swa = False
+
         if self.is_hybrid_swa:
             self.swa_attention_layer_ids, self.full_attention_layer_ids = (
                 get_hybrid_layer_ids(
@@ -1203,6 +1214,7 @@ def is_hybrid_swa_model(model_architectures: List[str]):
         "GptOssForCausalLM",
         "MiMoV2FlashForCausalLM",
         "MiMoV2MTP",
+        "HSAForCausalLM",
     }
     return any(arch in hybrid_swa_archs for arch in model_architectures)
 
