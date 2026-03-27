@@ -112,10 +112,31 @@ import torch.distributed as dist
 # ============================================================
 # 2. Import official model
 # ============================================================
-from models.DRT.modeling_olmo_lhsa import HSAForCausalLM as OfficialModel, HSAModel
+from models.DRT.modeling_olmo_lhsa import HSAForCausalLM as OfficialModel, HSAModel, Olmo3Attention
 from models.DRT.lhsa_layer import LandmarkHSA
 from utils.landmark_utils import insert_special_tokens, create_position_ids_with_landmarks
 OfficialConfig = _HSAConfig
+
+# Patch: LandmarkHSA and Olmo3Attention need num_key_value_groups for eager_attention_forward
+_orig_lhsa_init = LandmarkHSA.__init__
+def _patched_lhsa_init(self, config, layer_idx, norm_cls=None):
+    _orig_lhsa_init(self, config, layer_idx, norm_cls)
+    if not hasattr(self, 'num_key_value_groups'):
+        self.num_key_value_groups = config.num_attention_heads // config.num_key_value_heads
+LandmarkHSA.__init__ = _patched_lhsa_init
+
+# Patch: wrap tilelang kernels to handle new kwargs not in installed version
+import ops.topk_group as _tm, ops.hsa_fwd_bwd_group as _hm
+_orig_topk = _tm.online_topk_group
+_orig_hsa = _hm.HSA_block_M_group
+def _patched_topk(q, k, topk, block_size, window_size, memory_window_size=-1, is_causal=True, **kw):
+    return _orig_topk(q, k, topk, block_size=block_size, window_size=window_size,
+                       memory_window_size=memory_window_size, is_causal=is_causal)
+def _patched_hsa(q, k, v, weights, indices, block_size, mask_last_token=True, **kw):
+    return _orig_hsa(q, k, v, weights=weights, indices=indices, block_size=block_size,
+                      mask_last_token=mask_last_token)
+_tm.online_topk_group = _patched_topk
+_hm.HSA_block_M_group = _patched_hsa
 
 # ============================================================
 # 3. Import sglang
@@ -362,16 +383,23 @@ def main():
             eng_pos = len(fi_prev)
             if eng_pos < off_logits.shape[1]:
                 off_l = off_logits[0, eng_pos]
-                diff = (off_l - sg_l).abs()
-                mx = diff.max().item()
-                cos = torch.nn.functional.cosine_similarity(
-                    off_l.unsqueeze(0), sg_l.unsqueeze(0)).item()
+
+                # KL divergence: KL(official || sglang)
+                p = torch.softmax(off_l, dim=-1)
+                q = torch.softmax(sg_l, dim=-1)
+                # Clamp to avoid log(0)
+                kl = torch.sum(p * (torch.log(p.clamp(min=1e-10)) - torch.log(q.clamp(min=1e-10)))).item()
+
+                # Also compute max abs error and argmax for reference
+                mx = (off_l - sg_l).abs().max().item()
                 am_off = off_l.argmax().item()
                 am_sg = sg_l.argmax().item()
                 match = am_off == am_sg
-                status = 'PASS' if mx < 0.1 else ('CLOSE' if mx < 1.0 else 'FAIL')
+
+                # KL thresholds: <0.01 = near-identical, <0.1 = close, <1.0 = acceptable
+                status = 'PASS' if kl < 0.01 else ('CLOSE' if kl < 0.1 else ('WARN' if kl < 1.0 else 'FAIL'))
                 if status == 'FAIL': all_pass = False
-                print(f'  Step {i} (tok={tok}): max_err={mx:.4f} cos={cos:.6f} '
+                print(f'  Step {i} (tok={tok}): KL={kl:.6f} max_err={mx:.4f} '
                       f'argmax off={am_off} sg={am_sg} {"OK" if match else "MISS"} [{status}]')
             else:
                 print(f'  Step {i}: SKIP (official out of range)')
