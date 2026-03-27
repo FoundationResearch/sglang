@@ -340,12 +340,42 @@ class HSAAttnBackend(AttentionBackend):
 
         return swa_o, lse_kv
 
+    def _build_hsa_lmk_excluded_indices(self, forward_batch: ForwardBatch):
+        """Build KV indices with LMK positions excluded (for HSA layers only).
+
+        FlashHSA mask semantics: LMK tokens are written to KV cache but never
+        attended as KV.  We build a separate kv_indptr/kv_indices pair that
+        skips LMK slots so HSA layers see only real tokens.
+        """
+        bs = forward_batch.batch_size
+        device = self.device
+        page_size = int(self.page_size)
+
+        max_seqlen = int(forward_batch.seq_lens.max().item())
+        pos = torch.arange(max_seqlen, device=device, dtype=torch.int64)
+        page_table = forward_batch.req_to_token_pool.req_to_token[
+            forward_batch.req_pool_indices, :max_seqlen
+        ]
+        valid = pos[None, :] < forward_batch.seq_lens.to(torch.int64)[:, None]
+        keep = valid & ((pos[None, :] + 1) % page_size != 0)
+        kv_lens = keep.sum(dim=1, dtype=torch.int32)
+
+        kv_indptr = torch.zeros(bs + 1, device=device, dtype=torch.int32)
+        kv_indptr[1:] = torch.cumsum(kv_lens, dim=0)
+        kv_indices = page_table[keep].to(torch.int64)
+
+        dense_backend = self._dense_backend
+        num_kv_splits = torch.empty((bs,), dtype=torch.int32, device=device)
+        dense_backend.get_num_kv_splits(num_kv_splits, kv_lens)
+
+        return kv_indptr, kv_indices, kv_lens, num_kv_splits
+
     def init_forward_metadata(self, forward_batch: ForwardBatch):
-        # First, initialize dense backend metadata so decode/extend remains runnable.
+        # First, initialize dense backend metadata (standard indices, no LMK exclusion).
+        # SWA layers will use these indices directly.
         self._dense_backend.init_forward_metadata(forward_batch)
 
         # Build HSA metadata scaffold (paged-KV-first).
-        # We intentionally mirror the "page_table_1 -> real_page_table" idea used by NSA.
         if forward_batch.seq_lens_cpu is not None:
             max_seqlen_k = int(forward_batch.seq_lens_cpu.max().item())
         else:
@@ -362,6 +392,16 @@ class HSAAttnBackend(AttentionBackend):
         window_kv_indptr = getattr(dense_md, "window_kv_indptr", None)
         window_kv_indices = getattr(dense_md, "window_kv_indices", None)
 
+        # Build HSA-specific LMK-excluded indices for decode.
+        hsa_kv_indptr = None
+        hsa_kv_indices = None
+        hsa_kv_lens = None
+        hsa_num_kv_splits = None
+        if forward_batch.forward_mode.is_decode_or_idle():
+            hsa_kv_indptr, hsa_kv_indices, hsa_kv_lens, hsa_num_kv_splits = (
+                self._build_hsa_lmk_excluded_indices(forward_batch)
+            )
+
         # Build extend-specific fields when in extend mode.
         token_positions = None
         token_to_seq_id = None
@@ -369,16 +409,14 @@ class HSAAttnBackend(AttentionBackend):
         extend_prefix_lens = None
         engine_indices = None
         if forward_batch.forward_mode.is_extend():
-            token_positions = forward_batch.positions  # [total_extend_tokens]
-            extend_seq_lens = forward_batch.extend_seq_lens  # [B] int32
-            extend_prefix_lens = forward_batch.extend_prefix_lens  # [B] int32
+            token_positions = forward_batch.positions
+            extend_seq_lens = forward_batch.extend_seq_lens
+            extend_prefix_lens = forward_batch.extend_prefix_lens
             if extend_seq_lens is not None:
                 token_to_seq_id = torch.repeat_interleave(
                     torch.arange(len(extend_seq_lens), device=self.device, dtype=torch.int32),
                     extend_seq_lens.to(torch.int64),
                 )
-                # Precompute engine indices (unique per token, unlike position_ids
-                # which have LMK sharing). Used by HSA internal SWA and selection.
                 engine_indices = torch.cat([
                     torch.arange(int(plen), int(plen) + int(elen),
                                  device=self.device, dtype=torch.int64)
@@ -395,6 +433,10 @@ class HSAAttnBackend(AttentionBackend):
             kv_indices=kv_indices,
             window_kv_indptr=window_kv_indptr,
             window_kv_indices=window_kv_indices,
+            hsa_kv_indptr=hsa_kv_indptr,
+            hsa_kv_indices=hsa_kv_indices,
+            hsa_kv_lens=hsa_kv_lens,
+            hsa_num_kv_splits=hsa_num_kv_splits,
             token_positions=token_positions,
             token_to_seq_id=token_to_seq_id,
             extend_seq_lens=extend_seq_lens,

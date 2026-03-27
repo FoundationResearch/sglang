@@ -28,13 +28,21 @@ class HSAMetadata:
     # page_id table (page_size>1); for page_size==1, this may alias page_table_1
     real_page_table: torch.Tensor
 
-    # Paged attention indices used by dense backends (decode/extend)
+    # Paged attention indices from the dense backend (standard, no LMK exclusion).
+    # Used by non-HSA (SWA) layers when delegated to the dense backend.
     kv_indptr: Optional[torch.Tensor] = None
     kv_indices: Optional[torch.Tensor] = None
 
-    # Sliding-window variants (optional; only when enabled)
+    # Sliding-window variants from dense backend (standard, no LMK exclusion)
     window_kv_indptr: Optional[torch.Tensor] = None
     window_kv_indices: Optional[torch.Tensor] = None
+
+    # HSA-specific decode indices with LMK positions excluded.
+    # Used by HSA layers only. Built by HSAAttnBackend.init_forward_metadata.
+    hsa_kv_indptr: Optional[torch.Tensor] = None
+    hsa_kv_indices: Optional[torch.Tensor] = None
+    hsa_kv_lens: Optional[torch.Tensor] = None  # [B] int32, per-seq non-LMK length
+    hsa_num_kv_splits: Optional[torch.Tensor] = None
 
     # ---- Step 4+ (selection) optional debug fields (decode path) ----
     # These are populated by HSAAttnBackend for observability and unit tests.
