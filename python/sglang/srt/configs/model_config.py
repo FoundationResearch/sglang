@@ -706,6 +706,10 @@ class ModelConfig:
         sliding_window_size = getattr(self.hf_text_config, "sliding_window_size", None)
         if sliding_window_size is None:
             sliding_window_size = getattr(self.hf_text_config, "sliding_window", None)
+        if sliding_window_size is None:
+            sliding_window_size = getattr(
+                self.hf_text_config, "sliding_window_attention_size", None
+            )
         return sliding_window_size
 
     def _validate_quantize_and_serve_config(self):
@@ -1233,6 +1237,34 @@ def get_hybrid_layer_ids(
         ]
     elif "MiMoV2MTP" in model_architectures:
         return [0], []
+    elif "HSAForCausalLM" in model_architectures:
+        layer_types = getattr(hf_text_config, "layer_types", None)
+        if layer_types is not None:
+            swa_attention_layer_ids = [
+                i for i, x in enumerate(layer_types) if x == "sliding_attention"
+            ]
+            full_attention_layer_ids = [
+                i for i, x in enumerate(layer_types) if x == "full_attention"
+            ]
+        else:
+            # Fallback: compute from full_attn_interleave
+            interleave = int(
+                getattr(hf_text_config, "full_attn_interleave", 0) or 0
+            )
+            if interleave > 0:
+                full_attention_layer_ids = [
+                    i
+                    for i in range(num_hidden_layers)
+                    if (i + 1) % interleave == 0
+                ]
+                swa_attention_layer_ids = [
+                    i
+                    for i in range(num_hidden_layers)
+                    if (i + 1) % interleave != 0
+                ]
+            else:
+                full_attention_layer_ids = list(range(num_hidden_layers))
+                swa_attention_layer_ids = []
     else:
         swa_attention_layer_ids = None
         full_attention_layer_ids = None

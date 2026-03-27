@@ -471,17 +471,21 @@ def test_innerx_end_to_end_model_forward_extend_then_decode_matches_ultra_semant
         hsa_qn = _rmsnorm(hsa_q, attn_mod.q_norm.weight, attn_mod.q_norm.variance_epsilon)
         hsa_kn = _rmsnorm(hsa_k, attn_mod.k_norm.weight, attn_mod.k_norm.variance_epsilon)
 
-        # Selection query (LMK-Q norm), expanded to q-head space.
-        lmk_q = attn_mod.lmk_q_proj(hs_in)[0].view(1, attn_mod.hk_hsa, attn_mod.head_dim)
-        lmk_qn = _rmsnorm(lmk_q, attn_mod.lmk_q_norm.weight, attn_mod.lmk_q_norm.variance_epsilon)
+        # Selection query: use lmk_q_proj if enabled, otherwise hsa_qn directly.
         assert attn_mod.hq_hsa % attn_mod.hk_hsa == 0
         G_hsa = attn_mod.hq_hsa // attn_mod.hk_hsa
-        sel_q = (
-            lmk_qn[:, :, None, :]
-            .expand(1, attn_mod.hk_hsa, G_hsa, attn_mod.head_dim)
-            .reshape(1, attn_mod.hq_hsa, attn_mod.head_dim)
-            .contiguous()
-        )
+        if attn_mod.lmk_q_proj is not None:
+            lmk_q = attn_mod.lmk_q_proj(hs_in)[0].view(1, attn_mod.hk_hsa, attn_mod.head_dim)
+            lmk_qn = _rmsnorm(lmk_q, attn_mod.lmk_q_norm.weight, attn_mod.lmk_q_norm.variance_epsilon)
+            sel_q = (
+                lmk_qn[:, :, None, :]
+                .expand(1, attn_mod.hk_hsa, G_hsa, attn_mod.head_dim)
+                .reshape(1, attn_mod.hq_hsa, attn_mod.head_dim)
+                .contiguous()
+            )
+        else:
+            # When lmk_q_proj is disabled, selection uses hsa_q directly (matches model code)
+            sel_q = hsa_qn.to(dtype).view(1, attn_mod.hq_hsa, attn_mod.head_dim)
 
         md = backend.forward_metadata
         assert md is not None
