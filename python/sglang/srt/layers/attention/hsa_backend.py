@@ -39,7 +39,7 @@ def _get_compiled_flex_attention():
     from torch.nn.attention.flex_attention import flex_attention
 
     # Compiling the base entrypoint (as recommended by PyTorch) avoids the unfused slow path.
-    _COMPILED_FLEX_ATTN = torch.compile(flex_attention, dynamic=False)
+    _COMPILED_FLEX_ATTN = torch.compile(flex_attention, dynamic=True)
     return _COMPILED_FLEX_ATTN
 
 
@@ -574,23 +574,23 @@ class HSAAttnBackend(AttentionBackend):
             q_hsa = q3[:, HQ_swa:, :]
 
             # SWA branch: full causal attention on upper (SWA) heads.
-            # Uses full causal (all previous tokens), NOT the HSA merging window.
-            # This matches the official model's eager_attention_forward which also
-            # uses full causal with no sliding window.
-            swa_sliding_window = getattr(layer, "sliding_window_size", None)
+            # For decode (Q_LEN=1), causal = attend to all KV. Use SDPA for speed.
             out_swa = torch.zeros((B, HQ_swa, D), device=q3.device, dtype=torch.float32)
             if HQ_swa > 0 and H_swa > 0:
+                import torch.nn.functional as F
+
                 seq_lens_i64 = md.cache_seqlens_int32.to(torch.int64)
-                assert HQ_swa % H_swa == 0
-                Gs = HQ_swa // H_swa
                 k_cache_all = pool.get_key_buffer(layer.layer_id)
                 v_cache_all = pool.get_value_buffer(layer.layer_id)
+                swa_sliding_window = getattr(layer, "sliding_window_size", None)
                 sm_scale = float(getattr(layer, "scaling", 1.0))
+                assert HQ_swa % H_swa == 0
+                Gs = HQ_swa // H_swa
+
                 for b in range(B):
                     seqlen = int(seq_lens_i64[b].item())
                     if seqlen <= 0:
                         continue
-                    # Use layer's sliding_window if set, otherwise full causal.
                     if swa_sliding_window is not None and int(swa_sliding_window) > 0:
                         w = min(seqlen, int(swa_sliding_window))
                     else:
@@ -603,15 +603,22 @@ class HSAAttnBackend(AttentionBackend):
                     if tok_pos.numel() == 0:
                         continue
                     token_locs = page_table_1[b, tok_pos].to(torch.int64)
-                    q_hgd = q_swa[b].view(H_swa, Gs, D).to(torch.float32)
-                    for kv_h in range(H_swa):
-                        k_win = k_cache_all[token_locs, kv_h, :].to(torch.float32)
-                        v_win = v_cache_all[token_locs, kv_h, :].to(torch.float32)
-                        logits = (q_hgd[kv_h] @ k_win.transpose(0, 1)) * sm_scale
-                        p = torch.softmax(logits, dim=-1)
-                        o = p @ v_win
-                        hq_start = kv_h * Gs
-                        out_swa[b, hq_start : hq_start + Gs, :] = o
+
+                    # Gather K/V: [H_swa, S, D]
+                    k_win = k_cache_all[token_locs, :H_swa, :].transpose(0, 1)
+                    v_win = v_cache_all[token_locs, :H_swa, :].transpose(0, 1)
+                    # Expand for GQA: [HQ_swa, S, D]
+                    k_win = k_win.repeat_interleave(Gs, dim=0)
+                    v_win = v_win.repeat_interleave(Gs, dim=0)
+                    # Q: [HQ_swa, 1, D]
+                    q_b = q_swa[b].unsqueeze(1)
+
+                    # SDPA: no mask needed for decode (Q_LEN=1, attend to all)
+                    o = F.scaled_dot_product_attention(
+                        q_b.to(torch.float32), k_win.to(torch.float32),
+                        v_win.to(torch.float32), scale=sm_scale,
+                    )  # [HQ_swa, 1, D]
+                    out_swa[b] = o.squeeze(1)
 
             # Internal SWA on HSA heads (LHSA semantics).
             swa_o_inner, lse_kv = self._compute_internal_swa_decode(
