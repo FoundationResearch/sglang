@@ -33,9 +33,8 @@ from sglang.srt.layers.dp_attention import (
     get_attention_tp_size,
     is_dp_attention_enabled,
 )
-from sglang.srt.layers.communicator import LayerCommunicator, LayerScatterModes
 from sglang.srt.layers.layernorm import RMSNorm
-from sglang.srt.layers.linear import ColumnParallelLinear, RowParallelLinear
+from sglang.srt.layers.linear import ColumnParallelLinear, MergedColumnParallelLinear, RowParallelLinear
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
@@ -47,11 +46,10 @@ from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
     maybe_remap_kv_scale_name,
 )
-from sglang.srt.models.qwen2 import Qwen2MLP, Qwen2Model
-from sglang.srt.models.utils import apply_qk_norm
+from sglang.srt.models.olmo2 import Olmo2MLP
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.models.qwen3 import Qwen3ForCausalLM as _Qwen3ForCausalLM
 from sglang.srt.server_args import get_global_server_args
+from sglang.srt.utils.common import make_layers
 from sglang.srt.utils import add_prefix
 
 logger = logging.getLogger(__name__)
@@ -129,7 +127,7 @@ def _get_innerx_split_counts_total(config) -> Dict[str, int]:
 
 
 class FlashHSAInnerXAttention(nn.Module):
-    """Qwen3-style attention with explicit q/k/v projections (InnerX reference)."""
+    """OLMo3-style SWA attention with full-tensor QK norm."""
 
     def __init__(
         self,
@@ -160,7 +158,6 @@ class FlashHSAInnerXAttention(nn.Module):
         assert self.total_num_heads % attn_tp_size == 0
         self.num_heads = self.total_num_heads // attn_tp_size
 
-        # Match Qwen3Attention kv-head partition/replication semantics.
         if self.total_num_kv_heads >= attn_tp_size:
             assert self.total_num_kv_heads % attn_tp_size == 0
         else:
@@ -174,16 +171,9 @@ class FlashHSAInnerXAttention(nn.Module):
         self.layer_id = int(layer_id)
         self.alt_stream = alt_stream
 
-        norm_kwargs = (
-            dict(
-                weight_dtype=torch.float32,
-                cast_x_before_out_mul=True,
-            )
-            if get_global_server_args().rl_on_policy_target is not None
-            else {}
-        )
-        self.q_norm = RMSNorm(self.head_dim, eps=rms_norm_eps, **norm_kwargs)
-        self.k_norm = RMSNorm(self.head_dim, eps=rms_norm_eps, **norm_kwargs)
+        # OLMo3: RMSNorm on full projected tensor
+        self.q_norm = RMSNorm(self.total_num_heads * self.head_dim, eps=rms_norm_eps)
+        self.k_norm = RMSNorm(self.total_num_kv_heads * self.head_dim, eps=rms_norm_eps)
 
         # Explicit q/k/v projections (weight names match HF-style checkpoints).
         self.q_proj = ColumnParallelLinear(
@@ -251,14 +241,9 @@ class FlashHSAInnerXAttention(nn.Module):
         k, _ = self.k_proj(hidden_states)
         v, _ = self.v_proj(hidden_states)
 
-        q, k = apply_qk_norm(
-            q=q,
-            k=k,
-            q_norm=self.q_norm,
-            k_norm=self.k_norm,
-            head_dim=self.head_dim,
-            alt_stream=self.alt_stream,
-        )
+        # OLMo3: norm on full projected tensor, then RoPE
+        q = self.q_norm(q)
+        k = self.k_norm(k)
         q, k = self.rotary_emb(positions, q, k)
 
         attn_output = self.attn(q, k, v, forward_batch)
@@ -319,6 +304,8 @@ class FlashHSAInnerXHierarchicalSparseAttention(nn.Module):
         self.hq_hsa = self.hq_hsa_total // attn_tp_size
         self.hk_swa = self.hk_swa_total // attn_tp_size
         self.hk_hsa = self.hk_hsa_total // attn_tp_size
+        self.unified_retrieval = bool(getattr(config, "unified_retrieval", False))
+        self.retrieval_head_num = 1 if self.unified_retrieval else self.hk_hsa
         if self.hq_swa + self.hq_hsa != self.num_heads:
             raise AssertionError("InnerX: local q split mismatch")
         if self.hk_swa + self.hk_hsa != self.num_kv_heads:
@@ -404,11 +391,15 @@ class FlashHSAInnerXHierarchicalSparseAttention(nn.Module):
             prefix=add_prefix("hsa_v_proj", prefix),
         )
         self.enable_lmk_q_proj = bool(getattr(config, "enable_lmk_q_proj", False))
+        retrieval_head_num_total = 1 if self.unified_retrieval else self.hk_hsa_total
+        default_retrieval_dim = self.hk_hsa_total * self.head_dim
+        self.retrieval_dim = int(getattr(config, "retrieval_dim", None) or default_retrieval_dim)
         if self.enable_lmk_q_proj:
-            self.lmk_q_norm = RMSNorm(self.head_dim, eps=rms_norm_eps, **norm_kwargs)
+            norm_dim = self.retrieval_dim // retrieval_head_num_total
+            self.lmk_q_norm = RMSNorm(norm_dim, eps=rms_norm_eps, **norm_kwargs)
             self.lmk_q_proj = ColumnParallelLinear(
                 self.hidden_size,
-                self.hk_hsa_total * self.head_dim,
+                self.retrieval_dim,
                 bias=attention_bias,
                 quant_config=quant_config,
                 tp_rank=attn_tp_rank,
@@ -444,6 +435,7 @@ class FlashHSAInnerXHierarchicalSparseAttention(nn.Module):
         )
 
         # RoPE is applied ONLY to the SWA branch in the ultra reference.
+        # When apply_hsa_rope=True (e.g. OLMo3), RoPE is also applied to the HSA branch.
         self.rotary_emb = get_rope(
             self.head_dim,
             rotary_dim=self.head_dim,
@@ -451,6 +443,7 @@ class FlashHSAInnerXHierarchicalSparseAttention(nn.Module):
             base=rope_theta,
             rope_scaling=rope_scaling,
         )
+        self.apply_hsa_rope = bool(getattr(config, "apply_hsa_rope", False))
 
         self.attn = RadixAttention(
             self.num_heads,
@@ -467,51 +460,52 @@ class FlashHSAInnerXHierarchicalSparseAttention(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
-        # --- SWA branch ---
+        # --- SWA branch (per-head QK norm + RoPE) ---
         swa_q, _ = self.q_proj(hidden_states)
         swa_k, _ = self.k_proj(hidden_states)
         swa_v, _ = self.v_proj(hidden_states)
-        swa_q, swa_k = apply_qk_norm(
-            q=swa_q,
-            k=swa_k,
-            q_norm=self.q_norm,
-            k_norm=self.k_norm,
-            head_dim=self.head_dim,
-            alt_stream=self.alt_stream,
-        )
+        # Per-head RMSNorm: reshape to [..., head_dim], norm, reshape back
+        swa_q = self.q_norm(swa_q.view(-1, self.head_dim)).view(swa_q.shape)
+        swa_k = self.k_norm(swa_k.view(-1, self.head_dim)).view(swa_k.shape)
         swa_q, swa_k = self.rotary_emb(positions, swa_q, swa_k)
 
-        # --- HSA branch (NO RoPE, ultra reference) ---
+        # --- HSA branch (per-head QK norm; RoPE only when apply_hsa_rope=True) ---
         hsa_q, _ = self.hsa_q_proj(hidden_states)
         hsa_k, _ = self.hsa_k_proj(hidden_states)
         hsa_v, _ = self.hsa_v_proj(hidden_states)
-        hsa_q, hsa_k = apply_qk_norm(
-            q=hsa_q,
-            k=hsa_k,
-            q_norm=self.q_norm,
-            k_norm=self.k_norm,
-            head_dim=self.head_dim,
-            alt_stream=self.alt_stream,
-        )
+        hsa_q = self.q_norm(hsa_q.view(-1, self.head_dim)).view(hsa_q.shape)
+        hsa_k = self.k_norm(hsa_k.view(-1, self.head_dim)).view(hsa_k.shape)
+        if self.apply_hsa_rope:
+            hsa_q, hsa_k = self.rotary_emb(positions, hsa_q, hsa_k)
 
         # --- Selection query ---
         if self.enable_lmk_q_proj and self.lmk_q_proj is not None:
             # Separate lmk_q_proj for page selection (NO RoPE).
-            lmk_q, _ = self.lmk_q_proj(hidden_states)  # [T, hk_hsa*D]
-            lmk_q_3 = lmk_q.view(-1, self.hk_hsa, self.head_dim)
-            # RMSNorm expects 2D; apply over head_dim with flatten/unflatten.
-            lmk_q_norm = self.lmk_q_norm(lmk_q_3.reshape(-1, self.head_dim)).reshape(
+            lmk_q, _ = self.lmk_q_proj(hidden_states)  # [T, retrieval_dim]
+            rhn = self.retrieval_head_num  # 1 for unified, hk_hsa for standard
+            retrieval_head_num_total = 1 if self.unified_retrieval else self.hk_hsa_total
+            norm_dim = self.retrieval_dim // retrieval_head_num_total
+            lmk_q_3 = lmk_q.view(-1, rhn, norm_dim)
+            # RMSNorm expects 2D; apply over norm_dim with flatten/unflatten.
+            lmk_q_norm = self.lmk_q_norm(lmk_q_3.reshape(-1, norm_dim)).reshape(
                 lmk_q_3.shape[0], lmk_q_3.shape[1], lmk_q_3.shape[2]
-            )  # [T, hk_hsa, D]
-            # Expand to q-head space for selector: [T, hq_hsa, D]
-            assert self.hq_hsa % self.hk_hsa == 0
-            G = self.hq_hsa // self.hk_hsa
-            sel_q = (
-                lmk_q_norm[:, :, None, :]
-                .expand(lmk_q_norm.shape[0], self.hk_hsa, G, self.head_dim)
-                .reshape(lmk_q_norm.shape[0], self.hq_hsa, self.head_dim)
-                .contiguous()
-            )
+            )  # [T, rhn, norm_dim]
+            if self.unified_retrieval:
+                # unified_retrieval: single retrieval head, expand to hq_hsa heads
+                sel_q = lmk_q_norm.repeat_interleave(self.hq_hsa, dim=1)
+                # Trim or pad to head_dim if norm_dim != head_dim
+                if norm_dim != self.head_dim:
+                    sel_q = sel_q[:, :, :self.head_dim].contiguous()
+            else:
+                # Standard: expand kv heads to q-head space for selector: [T, hq_hsa, D]
+                assert self.hq_hsa % self.hk_hsa == 0
+                G = self.hq_hsa // self.hk_hsa
+                sel_q = (
+                    lmk_q_norm[:, :, None, :]
+                    .expand(lmk_q_norm.shape[0], self.hk_hsa, G, self.head_dim)
+                    .reshape(lmk_q_norm.shape[0], self.hq_hsa, self.head_dim)
+                    .contiguous()
+                )
         else:
             # No separate lmk_q_proj: use hsa_q directly for selection
             # (matches official behavior when enable_lmk_q_proj=False).
@@ -522,9 +516,14 @@ class FlashHSAInnerXHierarchicalSparseAttention(nn.Module):
         k_full = torch.cat([swa_k, hsa_k], dim=-1)
         v_full = torch.cat([swa_v, hsa_v], dim=-1)
 
-        window = None
-        if bool(getattr(self.config, "use_sliding_window_merging", False)):
+        # Use hsa_sliding_window if configured, else fall back to merging window
+        hsa_sw = getattr(self.config, "hsa_sliding_window", None)
+        if hsa_sw is not None:
+            window = int(hsa_sw)
+        elif bool(getattr(self.config, "use_sliding_window_merging", False)):
             window = _get_sliding_window_merging_size(self.config)
+        else:
+            window = None
 
         hsa_split_head_info = dict(
             hq_swa=int(self.hq_swa),
@@ -576,7 +575,12 @@ class FlashHSAInnerXDecoderLayer(nn.Module):
         head_dim = getattr(config, "head_dim", None)
 
         interleave = int(getattr(config, "full_attn_interleave", 0) or 0)
-        is_hsa_layer = bool(interleave > 0 and (self.layer_id % interleave) == (interleave - 1))
+        num_swa_layers = int(getattr(config, "num_swa_layers", 0))
+        if self.layer_id < num_swa_layers:
+            is_hsa_layer = False
+        else:
+            adjusted_idx = self.layer_id - num_swa_layers
+            is_hsa_layer = bool(interleave > 0 and (adjusted_idx % interleave) == (interleave - 1))
 
         if is_hsa_layer:
             self.self_attn = FlashHSAInnerXHierarchicalSparseAttention(
@@ -587,7 +591,6 @@ class FlashHSAInnerXDecoderLayer(nn.Module):
                 alt_stream=alt_stream,
             )
         else:
-            # SWA layers: use sliding_window_attention_size for KV eviction
             swa_window = -1
             if bool(getattr(config, "use_sliding_window_attention", False)):
                 swa_window = int(
@@ -610,112 +613,110 @@ class FlashHSAInnerXDecoderLayer(nn.Module):
                 alt_stream=alt_stream,
             )
 
-        self.mlp = Qwen2MLP(
-            hidden_size=self.hidden_size,
-            intermediate_size=int(getattr(config, "intermediate_size")),
-            hidden_act=str(getattr(config, "hidden_act", "silu")),
+        rms_norm_eps = float(getattr(config, "rms_norm_eps", 1e-6))
+
+        # OLMo3 post-norm: norm AFTER attention/MLP output
+        self.mlp = Olmo2MLP(
+            config=config,
             quant_config=quant_config,
             prefix=add_prefix("mlp", prefix),
         )
-
-        norm_kwargs = (
-            dict(
-                weight_dtype=torch.float32,
-                cast_x_before_out_mul=True,
-                override_orig_dtype=torch.float32,
-                fp32_residual=True,
-            )
-            if get_global_server_args().rl_on_policy_target is not None
-            else {}
-        )
-        self.input_layernorm = RMSNorm(
-            self.hidden_size, eps=float(getattr(config, "rms_norm_eps", 1e-6)), **norm_kwargs
-        )
-        self.post_attention_layernorm = RMSNorm(
-            self.hidden_size, eps=float(getattr(config, "rms_norm_eps", 1e-6)), **norm_kwargs
-        )
-
-        self.layer_scatter_modes = LayerScatterModes.init_new(
-            layer_id=self.layer_id,
-            num_layers=int(getattr(config, "num_hidden_layers")),
-            is_layer_sparse=False,
-            is_previous_layer_sparse=False,
-            is_next_layer_sparse=False,
-        )
-        self.layer_communicator = LayerCommunicator(
-            layer_scatter_modes=self.layer_scatter_modes,
-            input_layernorm=self.input_layernorm,
-            post_attention_layernorm=self.post_attention_layernorm,
-        )
+        self.post_attention_layernorm = RMSNorm(self.hidden_size, eps=rms_norm_eps)
+        self.post_feedforward_layernorm = RMSNorm(self.hidden_size, eps=rms_norm_eps)
 
     def forward(
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
-        residual: Optional[torch.Tensor],
-        post_residual_addition: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        hidden_states, residual = self.layer_communicator.prepare_attn(
-            hidden_states,
-            residual,
-            forward_batch,
-            post_residual_addition=post_residual_addition,
+    ) -> torch.Tensor:
+        # OLMo3 post-norm
+        residual = hidden_states
+        hidden_states = self.self_attn(
+            positions=positions,
+            hidden_states=hidden_states,
+            forward_batch=forward_batch,
         )
-        if hidden_states.shape[0] != 0:
-            hidden_states = self.self_attn(
-                positions=positions,
-                hidden_states=hidden_states,
-                forward_batch=forward_batch,
-            )
+        hidden_states = self.post_attention_layernorm(hidden_states)
+        hidden_states = hidden_states + residual
 
-        hidden_states, residual = self.layer_communicator.prepare_mlp(
-            hidden_states,
-            residual,
-            forward_batch,
-        )
+        residual = hidden_states
         hidden_states = self.mlp(hidden_states)
-        hidden_states, residual = self.layer_communicator.postprocess_layer(
-            hidden_states, residual, forward_batch
-        )
-        return hidden_states, residual
+        hidden_states = self.post_feedforward_layernorm(hidden_states)
+        hidden_states = residual + hidden_states
+        return hidden_states
 
 
-class FlashHSAInnerXModel(Qwen2Model):
-    """Qwen2Model skeleton but with InnerX decoder layers."""
-
-    def __init__(self, config, quant_config=None, prefix: str = "") -> None:
-        alt_stream = torch.cuda.Stream() if torch.cuda.is_available() else None
-        super().__init__(
-            config=config,
-            quant_config=quant_config,
-            prefix=prefix,
-            decoder_layer_type=FlashHSAInnerXDecoderLayer,
-            alt_stream=alt_stream,
-        )
-
-class HSAForCausalLM(_Qwen3ForCausalLM):
-    """
-    FlashHSA entry class for SGLang.
-
-    We inherit Qwen3ForCausalLM to reuse:
-      - logits processor / pooler plumbing
-      - Qwen3 weight loading remaps
-      - PP weight tying logic (we override sizes where necessary)
-    """
+class FlashHSAInnerXModel(nn.Module):
+    """OLMo3-based model with InnerX LHSA decoder layers."""
 
     def __init__(self, config, quant_config=None, prefix: str = "") -> None:
-        # We cannot call super().__init__ directly because it will build lm_head with base vocab size.
-        nn.Module.__init__(self)
+        super().__init__()
+        self.config = config
+        _is_cuda = torch.cuda.is_available()
+        self.alt_stream = torch.cuda.Stream() if _is_cuda else None
+
+        padded_vocab_size = _get_flashhsa_padded_vocab_size(config)
+        self.embed_tokens = VocabParallelEmbedding(
+            padded_vocab_size,
+            config.hidden_size,
+            enable_tp=not is_dp_attention_enabled(),
+            padding_size=32,
+            prefix=add_prefix("embed_tokens", prefix),
+        )
+        result = make_layers(
+            config.num_hidden_layers,
+            lambda idx, prefix: FlashHSAInnerXDecoderLayer(
+                config=config,
+                layer_id=idx,
+                quant_config=quant_config,
+                prefix=prefix,
+                alt_stream=self.alt_stream,
+            ),
+            prefix=add_prefix("layers", prefix),
+        )
+        if isinstance(result, tuple):
+            self.layers, self.start_layer, self.end_layer = result
+        else:
+            self.layers = result
+            self.start_layer = 0
+            self.end_layer = config.num_hidden_layers
+        self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        input_embeds: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        if input_embeds is None:
+            hidden_states = self.embed_tokens(input_ids)
+        else:
+            hidden_states = input_embeds
+
+        for decoder_layer in self.layers:
+            hidden_states = decoder_layer(positions, hidden_states, forward_batch)
+
+        hidden_states = self.norm(hidden_states)
+        return hidden_states
+
+
+class HSAForCausalLM(nn.Module):
+    """
+    OLMo3-based FlashHSA / LHSA entry class for SGLang.
+    Standalone — no Qwen3 inheritance.
+    """
+
+    def __init__(self, config, quant_config=None, prefix: str = "") -> None:
+        super().__init__()
         self.pp_group = get_pp_group()
         self.config = config
         self.quant_config = quant_config
 
-        # We only support InnerX ultra (split-head) architecture.
         if getattr(config, "hsa_heads", None) is None or getattr(config, "hsa_qk_ratio", None) is None:
             raise ValueError(
-                "InnerX ultra requires `hsa_heads` and `hsa_qk_ratio` in config. "
-                "This repo no longer supports the non-InnerX FlashHSA variant."
+                "InnerX ultra requires `hsa_heads` and `hsa_qk_ratio` in config."
             )
         self.model = FlashHSAInnerXModel(
             config, quant_config=quant_config, prefix=add_prefix("model", prefix)
@@ -723,24 +724,7 @@ class HSAForCausalLM(_Qwen3ForCausalLM):
 
         padded_vocab_size = _get_flashhsa_padded_vocab_size(config)
 
-        # Replace embedding with padded vocab so LMK row exists.
-        # Use padding_size=32 to match official FlashHSA's next_of_y(vocab+1, 32).
-        if self.pp_group.is_first_rank:
-            self.model.embed_tokens = VocabParallelEmbedding(
-                padded_vocab_size,
-                config.hidden_size,
-                quant_config=quant_config,
-                enable_tp=not is_dp_attention_enabled(),
-                padding_size=32,
-                prefix=add_prefix("embed_tokens", add_prefix("model", prefix)),
-                params_dtype=(
-                    torch.float32
-                    if get_global_server_args().rl_on_policy_target is not None
-                    else None
-                ),
-            )
-
-        # handle the lm head on different pp ranks (same as Qwen3ForCausalLM, but padded vocab size)
+        # LM head
         if self.pp_group.is_last_rank:
             if self.pp_group.world_size == 1 and getattr(config, "tie_word_embeddings", False):
                 self.lm_head = self.model.embed_tokens
@@ -756,29 +740,30 @@ class HSAForCausalLM(_Qwen3ForCausalLM):
         else:
             self.lm_head = PPMissingLayer()
 
-        # perform weight tying for PP (same as Qwen3ForCausalLM, but padded vocab size)
-        if self.pp_group.world_size > 1 and getattr(config, "tie_word_embeddings", False):
-            if self.pp_group.is_first_rank:
-                self.pp_group.send(
-                    self.model.embed_tokens.weight, dst=self.pp_group.world_size - 1
-                )
-            elif self.pp_group.is_last_rank:
-                emb_token_weight = self.pp_group.recv(
-                    size=self.lm_head.weight.shape,
-                    dtype=next(self.model.parameters()).dtype,
-                    src=0,
-                )
-                self.lm_head.weight.copy_(emb_token_weight)
-
-        # Reuse Qwen3ForCausalLM components.
         from sglang.srt.layers.logits_processor import LogitsProcessor
         from sglang.srt.layers.pooler import Pooler, PoolingType
 
         self.logits_processor = LogitsProcessor(config)
         self.pooler = Pooler(pooling_type=PoolingType.LAST, normalize=True)
-
-        # For EAGLE3 support (kept for parity)
         self.capture_aux_hidden_states = False
+
+    @torch.no_grad()
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        input_embeds: torch.Tensor = None,
+    ) -> torch.Tensor:
+        hidden_states = self.model(
+            input_ids=input_ids,
+            positions=positions,
+            forward_batch=forward_batch,
+            input_embeds=input_embeds,
+        )
+        return self.logits_processor(
+            input_ids, hidden_states, self.lm_head, forward_batch
+        )
 
     # ---- FlashHSA-specific helpers for engine ----
 
@@ -798,9 +783,17 @@ class HSAForCausalLM(_Qwen3ForCausalLM):
         """Default per-layer HSA pattern from FlashHSA: every `full_attn_interleave`-th layer."""
         interleave = int(getattr(self.config, "full_attn_interleave", 0) or 0)
         num_layers = int(getattr(self.config, "num_hidden_layers", 0) or 0)
+        num_swa_layers = int(getattr(self.config, "num_swa_layers", 0))
         if interleave <= 0 or num_layers <= 0:
             return []
-        return [i for i in range(num_layers) if (i % interleave) == (interleave - 1)]
+        result = []
+        for i in range(num_layers):
+            if i < num_swa_layers:
+                continue
+            adj = i - num_swa_layers
+            if (adj % interleave) == (interleave - 1):
+                result.append(i)
+        return result
 
     def get_flashhsa_chunk_size(self) -> Optional[int]:
         if hasattr(self.config, "chunk_size") and getattr(self.config, "chunk_size") is not None:
@@ -810,6 +803,13 @@ class HSAForCausalLM(_Qwen3ForCausalLM):
     # ---- Weight loading ----
     # We only support the InnerX ultra layout (explicit q_proj/k_proj/v_proj + hsa_* projections).
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+        # OLMo3 MLP: gate_proj + up_proj stacked into gate_up_proj
+        stacked_params_mapping = [
+            # (param_name, weight_name, shard_id)
+            ("gate_up_proj", "gate_proj", 0),
+            ("gate_up_proj", "up_proj", 1),
+        ]
+
         params_dict = dict(self.named_parameters())
         for name, loaded_weight in weights:
             if "Embedding" in str(getattr(self.config, "name_or_path", "")):
@@ -844,6 +844,21 @@ class HSAForCausalLM(_Qwen3ForCausalLM):
                 name = maybe_remap_kv_scale_name(name, params_dict)
                 if name is None:
                     continue
+
+            # Handle stacked params (e.g. OLMo3 gate_up_proj from gate_proj + up_proj)
+            handled_stacked = False
+            for param_name, weight_name, shard_id in stacked_params_mapping:
+                if weight_name not in name:
+                    continue
+                stacked_name = name.replace(weight_name, param_name)
+                if stacked_name in params_dict:
+                    param = params_dict[stacked_name]
+                    weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                    weight_loader(param, loaded_weight, shard_id)
+                    handled_stacked = True
+                    break
+            if handled_stacked:
+                continue
 
             # Direct load
             if name.endswith(".bias") and name not in params_dict:

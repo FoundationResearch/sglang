@@ -171,21 +171,36 @@ class FlashHSAConfig(PretrainedConfig):
         self.hsa_qk_ratio = hsa_qk_ratio
         self.enable_gate = bool(enable_gate)
 
+        # ---- OLMo3-LHSA additional knobs ----
+        self.enable_lmk_q_proj = bool(kwargs.pop("enable_lmk_q_proj", False))
+        self.apply_hsa_rope = bool(kwargs.pop("apply_hsa_rope", False))
+        self.unified_retrieval = bool(kwargs.pop("unified_retrieval", False))
+        self.retrieval_dim = kwargs.pop("retrieval_dim", None)
+        self.num_swa_layers = int(kwargs.pop("num_swa_layers", 0))
+        self.hsa_sliding_window = kwargs.pop("hsa_sliding_window", None)
+        self.hsa_visible_window = int(kwargs.pop("hsa_visible_window", -1))
+        self.full_upper_hsa = bool(kwargs.pop("full_upper_hsa", False))
+        # Base model variant (kept for config compat; OLMo3 post-norm is the only supported path)
+        self.base_model = str(kwargs.pop("base_model", "olmo3"))
+
         # RoPE validation (mirrors HF style)
         if self.rope_scaling is not None and isinstance(self.rope_scaling, dict):
             if "type" in self.rope_scaling and "rope_type" not in self.rope_scaling:
                 self.rope_scaling["rope_type"] = self.rope_scaling["type"]
         rope_config_validation(self)
 
-        # Layer types default pattern (mirrors FlashHSA upstream)
+        # Layer types default pattern (mirrors FlashHSA/OLMo3-LHSA upstream)
+        # First num_swa_layers are always SWA, then interleave kicks in.
         self.layer_types = layer_types
         if self.layer_types is None:
-            self.layer_types = [
-                "full_attention"
-                if full_attn_interleave > 0 and (i + 1) % full_attn_interleave == 0
-                else "sliding_attention"
-                for i in range(self.num_hidden_layers)
-            ]
+            def _layer_type(i):
+                if i < self.num_swa_layers:
+                    return "sliding_attention"
+                adj = i - self.num_swa_layers
+                if full_attn_interleave > 0 and (adj + 1) % full_attn_interleave == 0:
+                    return "full_attention"
+                return "sliding_attention"
+            self.layer_types = [_layer_type(i) for i in range(self.num_hidden_layers)]
         layer_type_validation(self.layer_types, self.num_hidden_layers)
 
         super().__init__(tie_word_embeddings=tie_word_embeddings, **kwargs)
