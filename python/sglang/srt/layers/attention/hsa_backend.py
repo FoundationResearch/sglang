@@ -1408,71 +1408,53 @@ class HSAAttnBackend(AttentionBackend):
         q3 = q.view(T, HQ_total, D)
         q_hsa = q3[:, HQ_swa:, :]   # [T, HQ_hsa, D]
 
-        # Step 2: Run dense extend on SWA heads ONLY (save_kv_cache=False since already saved).
-        # We pass sliced Q/K/V views so the triton kernel only computes HQ_swa heads,
-        # avoiding wasted attention compute on HSA heads (which have their own path below).
+        # Step 2: Run dense extend on SWA heads ONLY.
+        # We call the triton kernel directly with head-sliced tensor views,
+        # avoiding the `forward_extend` Python-level overhead.
+        # The kernel computes `kv_group_num = q.shape[1] // k_buffer.shape[1]`, so
+        # passing sliced Q (HQ_swa) and sliced KV buffer (H_swa) gives the correct GQA ratio.
         H_total = int(layer.tp_k_head_num)
-        q_swa = q3[:, :HQ_swa, :]  # [T, HQ_swa, D] — strided view, strides preserved
+        pool_k = pool.get_key_buffer(layer.layer_id)[:, :H_swa, :]
+        pool_v = pool.get_value_buffer(layer.layer_id)[:, :H_swa, :]
+
+        dense_out_3 = torch.empty((T, HQ_total, D), device=q.device, dtype=q.dtype)
+        db = self._dense_backend
+        dense_md = db.forward_metadata
+
         k3 = k.view(-1, H_total, D)
         v3 = v.view(-1, H_total, D)
-        k_swa = k3[:, :H_swa, :]  # [T, H_swa, D]
-        v_swa = v3[:, :H_swa, :]
 
-        # Lightweight proxy: override head counts so triton backend reshapes correctly.
-        class _LayerProxy:
-            """Delegates all attribute access to the real layer, overriding head counts."""
-            __slots__ = ("_real", "tp_q_head_num", "tp_k_head_num", "tp_v_head_num")
-            def __init__(self, real, hq, hk, hv):
-                object.__setattr__(self, "_real", real)
-                object.__setattr__(self, "tp_q_head_num", hq)
-                object.__setattr__(self, "tp_k_head_num", hk)
-                object.__setattr__(self, "tp_v_head_num", hv)
-            def __getattr__(self, name):
-                return getattr(object.__getattribute__(self, "_real"), name)
-
-        layer_swa = _LayerProxy(layer, HQ_swa, H_swa, H_swa)
-
-        # Wrap KV pool to return sliced head views for this layer.
-        class _PoolSlice:
-            """Returns head-sliced KV buffer views so kv_group_num = HQ_swa/H_swa."""
-            __slots__ = ("_pool", "_h_swa", "_layer_id")
-            def __init__(self, pool, h_swa, layer_id):
-                object.__setattr__(self, "_pool", pool)
-                object.__setattr__(self, "_h_swa", h_swa)
-                object.__setattr__(self, "_layer_id", layer_id)
-            def get_key_buffer(self, layer_id):
-                h = object.__getattribute__(self, "_h_swa")
-                lid = object.__getattribute__(self, "_layer_id")
-                if layer_id == lid:
-                    return object.__getattribute__(self, "_pool").get_key_buffer(layer_id)[:, :h, :]
-                return object.__getattribute__(self, "_pool").get_key_buffer(layer_id)
-            def get_value_buffer(self, layer_id):
-                h = object.__getattribute__(self, "_h_swa")
-                lid = object.__getattribute__(self, "_layer_id")
-                if layer_id == lid:
-                    return object.__getattribute__(self, "_pool").get_value_buffer(layer_id)[:, :h, :]
-                return object.__getattribute__(self, "_pool").get_value_buffer(layer_id)
-            def set_kv_buffer(self, *args, **kw):
-                return object.__getattribute__(self, "_pool").set_kv_buffer(*args, **kw)
-            def __getattr__(self, name):
-                return getattr(object.__getattribute__(self, "_pool"), name)
-
-        # Temporarily swap pool on forward_batch so triton kernel sees sliced KV.
-        orig_pool = forward_batch.token_to_kv_pool
-        forward_batch.token_to_kv_pool = _PoolSlice(pool, H_swa, layer.layer_id)
-        kwargs_clean = {kk: vv for kk, vv in kwargs.items() if not kk.startswith("hsa_")}
-        try:
-            dense_out_swa = self._dense_backend.forward_extend(
-                q_swa.reshape(T, HQ_swa * D), k_swa.reshape(T, H_swa * D),
-                v_swa.reshape(T, H_swa * D),
-                layer_swa, forward_batch, save_kv_cache=False, **kwargs_clean
+        if db.enable_deterministic:
+            # 1-stage unified kernel: uses kv_indices for both prefix + extend
+            db.extend_attention_fwd_unified(
+                q3[:, :HQ_swa, :],
+                dense_out_3[:, :HQ_swa, :],
+                pool_k, pool_v,
+                dense_md.qo_indptr,
+                dense_md.kv_indptr,
+                dense_md.kv_indices,
+                forward_batch.extend_prefix_lens.to(torch.int32),
+                dense_md.max_extend_len,
+                sm_scale=layer.scaling,
             )
-        finally:
-            forward_batch.token_to_kv_pool = orig_pool
-
-        # Assemble: SWA heads from dense, HSA heads filled later.
-        dense_out_3 = torch.empty((T, HQ_total, D), device=q.device, dtype=dense_out_swa.dtype)
-        dense_out_3[:, :HQ_swa, :] = dense_out_swa.view(T, HQ_swa, D)
+        else:
+            # 2-stage kernel: uses k_extend/v_extend + k_buffer/v_buffer separately
+            kv_indptr = dense_md.kv_indptr
+            kv_indices = dense_md.kv_indices
+            db.extend_attention_fwd(
+                q3[:, :HQ_swa, :],
+                k3[:, :H_swa, :].contiguous(),
+                v3[:, :H_swa, :].contiguous(),
+                dense_out_3[:, :HQ_swa, :],
+                pool_k, pool_v,
+                dense_md.qo_indptr,
+                kv_indptr, kv_indices,
+                dense_md.custom_mask,
+                True,  # is_causal
+                dense_md.mask_indptr,
+                dense_md.max_extend_len,
+                sm_scale=layer.scaling,
+            )
 
         page_table_1 = md.page_table_1
 
@@ -1504,8 +1486,8 @@ class HSAAttnBackend(AttentionBackend):
         selected_scores = md.hsa_ext_selected_scores  # [T, H_hsa, K]
 
         if selected_page_ids is None or selected_scores is None:
-            # No selection results (e.g. all tokens at early positions) → return dense output.
-            # HSA heads are uninitialized; zero them out for safety.
+            # No selection results (e.g. all tokens at early positions).
+            # HSA heads uninitialized; zero them.
             dense_out_3[:, HQ_swa:, :] = 0
             return dense_out_3.reshape(T, HQ_total * D)
 
@@ -1574,8 +1556,8 @@ class HSAAttnBackend(AttentionBackend):
             )
             out_hsa = out_hsa.to(torch.float32) + swa_o_inner * swa_w_q[:, :, None]
 
-        # Step 8: Write HSA heads into the pre-assembled output tensor.
-        dense_out_3[:, HQ_swa:, :] = out_hsa.to(torch.bfloat16)
+        # Step 8: Write HSA heads into the pre-allocated output tensor.
+        dense_out_3[:, HQ_swa:, :] = out_hsa.to(dense_out_3.dtype)
         return dense_out_3.reshape(T, HQ_total * D)
 
 
