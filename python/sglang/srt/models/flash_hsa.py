@@ -146,6 +146,7 @@ class FlashHSAInnerXAttention(nn.Module):
         rms_norm_eps: float,
         attention_bias: bool,
         prefix: str,
+        sliding_window_size: int = -1,
         alt_stream: Optional[torch.cuda.Stream] = None,
     ) -> None:
         super().__init__()
@@ -236,6 +237,7 @@ class FlashHSAInnerXAttention(nn.Module):
             self.scaling,
             num_kv_heads=self.num_kv_heads,
             layer_id=self.layer_id,
+            sliding_window_size=sliding_window_size,
             prefix=add_prefix("attn", prefix),
         )
 
@@ -585,6 +587,12 @@ class FlashHSAInnerXDecoderLayer(nn.Module):
                 alt_stream=alt_stream,
             )
         else:
+            # SWA layers: use sliding_window_attention_size for KV eviction
+            swa_window = -1
+            if bool(getattr(config, "use_sliding_window_attention", False)):
+                swa_window = int(
+                    getattr(config, "sliding_window_attention_size") or -1
+                )
             self.self_attn = FlashHSAInnerXAttention(
                 hidden_size=self.hidden_size,
                 num_heads=int(getattr(config, "num_attention_heads")),
@@ -597,6 +605,7 @@ class FlashHSAInnerXDecoderLayer(nn.Module):
                 quant_config=quant_config,
                 rms_norm_eps=float(getattr(config, "rms_norm_eps", 1e-6)),
                 attention_bias=bool(getattr(config, "attention_bias", False)),
+                sliding_window_size=swa_window,
                 prefix=add_prefix("self_attn", prefix),
                 alt_stream=alt_stream,
             )
