@@ -4,6 +4,11 @@ using identical random weights on the same input.
 
 Tests both prefill and decode alignment.
 
+The official model's eager/sdpa attention does NOT enforce sliding_window on the
+upper SWA branch (the kwarg is silently ignored).  Only flash_attention_2 actually
+applies it.  We patch the eager path to simulate FA2 behaviour so the reference
+matches what a properly-trained model would produce.
+
 Usage:
   CUDA_VISIBLE_DEVICES=0 python dev/compare_olmo_lhsa_vs_sglang.py
 """
@@ -116,6 +121,33 @@ from models.DRT.modeling_olmo_lhsa import HSAForCausalLM as OfficialModel, HSAMo
 from models.DRT.lhsa_layer import LandmarkHSA
 from utils.landmark_utils import insert_special_tokens, create_position_ids_with_landmarks
 OfficialConfig = _HSAConfig
+
+# ============================================================
+# 2b. Patch eager attention to enforce sliding_window (simulating FA2)
+# ============================================================
+# The official eager_attention_forward silently ignores `sliding_window` kwarg.
+# FA2 is the only backend that applies it.  We patch eager to build a proper
+# SWA mask when `sliding_window` is passed, so our reference matches FA2.
+import models.DRT.lhsa_layer as _lhsa_mod
+
+_orig_eager_attn = _lhsa_mod.eager_attention_forward
+
+def _eager_with_sliding_window(module, query, key, value, attention_mask, scaling, dropout=0.0, **kwargs):
+    sw = kwargs.pop('sliding_window', None)
+    if sw is not None and sw > 0 and attention_mask is None:
+        B, H, L_q, D = query.shape
+        L_k = key.shape[2]
+        qi = torch.arange(L_q, device=query.device)
+        ki = torch.arange(L_k, device=query.device)
+        causal = ki[None, :] <= qi[:, None]
+        in_window = ki[None, :] >= (qi[:, None] - sw + 1)
+        mask = causal & in_window
+        attn_mask = torch.zeros(L_q, L_k, device=query.device, dtype=query.dtype)
+        attn_mask.masked_fill_(~mask, float('-inf'))
+        attention_mask = attn_mask[None, None, :, :]
+    return _orig_eager_attn(module, query, key, value, attention_mask, scaling, dropout, **kwargs)
+
+_lhsa_mod.eager_attention_forward = _eager_with_sliding_window
 
 # Patch: LandmarkHSA and Olmo3Attention need num_key_value_groups for eager_attention_forward
 _orig_lhsa_init = LandmarkHSA.__init__
@@ -340,7 +372,7 @@ def main():
         tie_word_embeddings=False, rope_theta=10000.0, hidden_act='silu',
         enable_softmax1=True, enable_lmk_q_proj=False,
     )
-    oc._attn_implementation = 'sdpa'
+    oc._attn_implementation = 'eager'  # patched to enforce sliding_window (simulates FA2)
     oc.pad_token_id = None
     oc.num_swa_layers = 0
 
