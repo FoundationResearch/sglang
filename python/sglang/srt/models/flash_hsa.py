@@ -525,13 +525,18 @@ class FlashHSAInnerXHierarchicalSparseAttention(nn.Module):
         else:
             window = None
 
+        # Upper SWA branch sliding window (config.sliding_window in official model).
+        # TODO: Enable once triton extend kernel's sliding window semantics are
+        # verified to match the official eager_attention_forward sliding window.
+        upper_swa_window = None
+
         hsa_split_head_info = dict(
             hq_swa=int(self.hq_swa),
             hq_hsa=int(self.hq_hsa),
             h_swa=int(self.hk_swa),
             h_hsa=int(self.hk_hsa),
             swa_window_size=window,
-            # ultra reference: SWA sees LMK (no explicit exclusion)
+            upper_swa_window_size=upper_swa_window,
             swa_exclude_lmk=False,
         )
         attn_output = self.attn(

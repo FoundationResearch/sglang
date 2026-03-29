@@ -119,28 +119,46 @@ OfficialConfig = _HSAConfig
 
 # Patch: LandmarkHSA and Olmo3Attention need num_key_value_groups for eager_attention_forward
 _orig_lhsa_init = LandmarkHSA.__init__
-def _patched_lhsa_init(self, config, layer_idx, norm_cls=None):
+def _patched_lhsa_init(self, config, layer_idx, norm_cls=None, **kwargs):
     _orig_lhsa_init(self, config, layer_idx, norm_cls)
     if not hasattr(self, 'num_key_value_groups'):
         self.num_key_value_groups = config.num_attention_heads // config.num_key_value_heads
 LandmarkHSA.__init__ = _patched_lhsa_init
 
-# Patch: wrap tilelang kernels to handle new kwargs not in installed version
+# Also patch Olmo3Attention which is called with keyword args
+_orig_olmo3_attn_init = Olmo3Attention.__init__
+def _patched_olmo3_attn_init(self, config, layer_idx, **kwargs):
+    _orig_olmo3_attn_init(self, config, layer_idx)
+    if not hasattr(self, 'num_key_value_groups'):
+        self.num_key_value_groups = config.num_attention_heads // config.num_key_value_heads
+Olmo3Attention.__init__ = _patched_olmo3_attn_init
+
+# Wrap tilelang kernels to handle new kwargs not in installed version.
+# Use tilelang for correctness (it handles GQA internally), skip unsupported kwargs.
 import ops.topk_group as _tm, ops.hsa_fwd_bwd_group as _hm
 _orig_topk = _tm.online_topk_group
 _orig_hsa = _hm.HSA_block_M_group
 def _patched_topk(q, k, topk, block_size, window_size, memory_window_size=-1, is_causal=True, **kw):
-    return _orig_topk(q, k, topk, block_size=block_size, window_size=window_size,
+    # Make contiguous copies to avoid tilelang stride issues
+    q_c = q.contiguous()
+    k_c = k.contiguous()
+    return _orig_topk(q_c, k_c, topk, block_size=block_size, window_size=window_size,
                        memory_window_size=memory_window_size, is_causal=is_causal)
 def _patched_hsa(q, k, v, weights, indices, block_size, mask_last_token=True, **kw):
-    return _orig_hsa(q, k, v, weights=weights, indices=indices, block_size=block_size,
-                      mask_last_token=mask_last_token)
+    q_c = q.contiguous()
+    k_c = k.contiguous()
+    v_c = v.contiguous()
+    return _orig_hsa(q_c, k_c, v_c, weights=weights, indices=indices,
+                      block_size=block_size, mask_last_token=mask_last_token)
 _tm.online_topk_group = _patched_topk
 _hm.HSA_block_M_group = _patched_hsa
 
 # ============================================================
 # 3. Import sglang
 # ============================================================
+# The sgl_kernel.rmsnorm CUDA kernel zeros every other bf16 element.
+# We patch all RMSNorm instances after model construction (see below).
+
 from sglang.srt.layers import dp_attention as dpa
 dpa.get_attention_tp_size = lambda: 1
 from sglang.srt.distributed import parallel_state as ps
@@ -224,7 +242,7 @@ def official_prefill(model, real_tokens, PS, VS, device):
 def sglang_prefill_and_decode(sg_model, cfg, real_base, decode_tokens, device, dtype):
     """sglang: prefill real_base, then decode each token. Returns logits per decode step."""
     PS = cfg.chunk_size; lmk_id = int(cfg.vocab_size); VS = int(cfg.vocab_size)
-    mc = max(len(real_base) * 2, 512) + len(decode_tokens) * 2 + 128
+    mc = max(len(real_base) * 2, 512) + len(decode_tokens) * 2 + 1024
 
     r2t = torch.zeros((1, mc), dtype=torch.int32, device=device)
     pool = MHATokenToKVPool(size=mc + 256, page_size=PS, dtype=dtype,
@@ -267,7 +285,14 @@ def sglang_prefill_and_decode(sg_model, cfg, real_base, decode_tokens, device, d
         req_to_token_pool=mr.req_to_token_pool, token_to_kv_pool=pool, attn_backend=be)
     be.init_forward_metadata(fb)
     with torch.no_grad():
-        sg_model.model(fb.input_ids, fb.positions, fb)
+        h_prefill = sg_model.model(fb.input_ids, fb.positions, fb)
+    if isinstance(h_prefill, tuple): h_prefill = h_prefill[0]
+    # h_prefill: [T, hidden] — all prefill tokens' hidden states (before final norm)
+    # Note: model.forward already applies norm, but model.model() does NOT
+    # We call model.model() which returns pre-norm hidden states, then apply norm + lm_head
+    h_normed = sg_model.model.norm(h_prefill)
+    prefill_logits = (h_normed @ sg_model.lm_head.weight[:VS, :].t()).float()  # [T, VS]
+    prefill_logits = prefill_logits.unsqueeze(0)  # [1, T, VS] to match official shape
 
     # Multi-step decode
     current_len = pl
@@ -295,7 +320,7 @@ def sglang_prefill_and_decode(sg_model, cfg, real_base, decode_tokens, device, d
         logits = (h @ sg_model.lm_head.weight.t())[:, :VS].float()
         decode_logits.append(logits.view(-1))
 
-    return decode_logits
+    return prefill_logits, decode_logits
 
 
 def main():
@@ -309,13 +334,13 @@ def main():
     oc = OfficialConfig(
         vocab_size=256, hidden_size=1024, intermediate_size=4096,
         num_hidden_layers=1, num_attention_heads=16, num_key_value_heads=4,
-        head_dim=64, rms_norm_eps=1e-6, chunk_size=PS, hsa_topk=2,
+        head_dim=64, rms_norm_eps=1e-6, chunk_size=PS, hsa_topk=8,
         hsa_mode='sparse', full_attn_interleave=1, hsa_heads=4,
         hsa_qk_ratio=4, use_sliding_window=True, sliding_window=PS,
         tie_word_embeddings=False, rope_theta=10000.0, hidden_act='silu',
         enable_softmax1=True, enable_lmk_q_proj=False,
     )
-    oc._attn_implementation = 'eager'
+    oc._attn_implementation = 'sdpa'
     oc.pad_token_id = None
     oc.num_swa_layers = 0
 
@@ -326,7 +351,7 @@ def main():
         model_type='flash_hsa_innerx', architectures=['HSAForCausalLM'],
         vocab_size=256, hidden_size=1024, intermediate_size=4096,
         num_hidden_layers=1, num_attention_heads=16, num_key_value_heads=4,
-        head_dim=64, rms_norm_eps=1e-6, chunk_size=PS, hsa_topk=2,
+        head_dim=64, rms_norm_eps=1e-6, chunk_size=PS, hsa_topk=8,
         hsa_mode='sparse', full_attn_interleave=1, hsa_heads=4,
         hsa_qk_ratio=4, use_sliding_window_merging=True,
         sliding_window_merging_size=PS, tie_word_embeddings=False,
@@ -334,6 +359,12 @@ def main():
         hsa_sliding_window=PS,
     )
     sm = SGModel(sc).to(device=device, dtype=dtype); sm.eval()
+
+    # Fix sgl_kernel.rmsnorm CUDA bug: force native path on all RMSNorm instances
+    from sglang.srt.layers.layernorm import RMSNorm as _RMSNorm
+    for m in sm.modules():
+        if isinstance(m, _RMSNorm):
+            m._forward_method = m.forward_native
 
     loaded, total, skipped = transfer_weights(om, sm)
     print(f'Weights: {loaded}/{total} loaded, {len(skipped)} skipped')
@@ -349,17 +380,26 @@ def main():
     print('OLMo3-LHSA: Official vs sglang Alignment')
     print('=' * 70)
 
+    decode_toks_short = [42, 100, 200, 50, 150, 75, 30, 180]  # 8 decode steps
+    decode_toks_long = [42, 100, 200, 50, 150]  # 5 for long contexts (speed)
     test_cases = [
-        (10, [42, 100, 200], '10 prefill, 3 decode, 0 pages'),
-        (63, [42, 100, 200], '63 prefill, 3 decode, 1 page'),
-        (65, [42, 100, 200, 50, 150], '65 prefill, 5 decode, 1 page'),
-        (126, [42, 100], '126 prefill, 2 decode, 2 pages'),
-        (130, [42, 100, 200, 50, 150, 75], '130 prefill, 6 decode, 2+ pages'),
-        (200, [42, 100, 200], '200 prefill, 3 decode, 3+ pages'),
+        # Short
+        (10, decode_toks_short, 'SHORT: 10 tokens, 0 pages'),
+        (63, decode_toks_short, 'SHORT: 63 tokens, 1 page'),
+        (65, decode_toks_short, 'SHORT: 65 tokens, 1 page'),
+        (128, decode_toks_short, 'SHORT: 128 tokens, 2 pages'),
+        # Mid
+        (256, decode_toks_short, 'MID: 256 tokens, 4 pages'),
+        (512, decode_toks_long, 'MID: 512 tokens, 8 pages'),
+        (1024, decode_toks_long, 'MID: 1024 tokens, 16 pages'),
+        (2048, decode_toks_long, 'MID: 2048 tokens, 32 pages'),
+        # Long
+        (4096, decode_toks_long, 'LONG: 4096 tokens, 64 pages'),
+        (8192, decode_toks_long, 'LONG: 8192 tokens, 128 pages'),
     ]
 
     for n_prefill, decode_toks, desc in test_cases:
-        real_base = list(range(5, 5 + n_prefill))
+        real_base = [5 + (i % (VS - 10)) for i in range(n_prefill)]
         real_full = real_base + decode_toks
 
         print(f'\n--- {desc} ---')
@@ -368,14 +408,36 @@ def main():
         try:
             off_logits = official_prefill(om, real_full, PS, VS, device)
         except Exception as e:
+            import traceback; traceback.print_exc(file=sys.stdout); sys.stdout.flush()
             print(f'  Official prefill FAILED: {e}')
-            continue
+            break
 
         # sglang: prefill + decode
-        sg_decode_logits = sglang_prefill_and_decode(
+        sg_prefill_logits, sg_decode_logits = sglang_prefill_and_decode(
             sm, sc, real_base, decode_toks, device, dtype)
 
-        # Compare each decode step
+        # --- Prefill comparison ---
+        # Compare logits at non-LMK positions in the prefill
+        fi_base = Req._hsa_insert_lmk_prompt(real_base, page_size=PS, lmk_id=VS)
+        # Official logits for the base prefix (first len(fi_base) positions)
+        eng_len = len(fi_base)
+        off_prefill = off_logits[0, :eng_len]  # [eng_len, VS]
+        sg_prefill = sg_prefill_logits[0, :eng_len]  # [eng_len, VS]
+        if off_prefill.shape[0] == sg_prefill.shape[0]:
+            # KL per position, then aggregate
+            p_off = torch.softmax(off_prefill, dim=-1)
+            p_sg = torch.softmax(sg_prefill, dim=-1)
+            kl_per_pos = torch.sum(p_off * (torch.log(p_off.clamp(min=1e-10)) - torch.log(p_sg.clamp(min=1e-10))), dim=-1)
+            kl_mean = kl_per_pos.mean().item()
+            kl_max = kl_per_pos.max().item()
+            kl_p50 = kl_per_pos.median().item()
+            argmax_match = (off_prefill.argmax(dim=-1) == sg_prefill.argmax(dim=-1)).float().mean().item()
+            status_pf = 'PASS' if kl_max < 0.01 else ('CLOSE' if kl_max < 0.1 else ('WARN' if kl_max < 1.0 else 'FAIL'))
+            print(f'  PREFILL: KL mean={kl_mean:.6f} max={kl_max:.6f} p50={kl_p50:.6f} argmax_match={argmax_match:.1%} [{status_pf}]')
+        else:
+            print(f'  PREFILL: shape mismatch off={off_prefill.shape} sg={sg_prefill.shape}')
+
+        # --- Decode comparison ---
         all_pass = True
         for i, (tok, sg_l) in enumerate(zip(decode_toks, sg_decode_logits)):
             current_real = real_base + decode_toks[:i+1]
@@ -409,6 +471,14 @@ def main():
     print(f'\n{"="*70}')
     print('ALIGNMENT TEST COMPLETE')
     print(f'{"="*70}')
+
+    print('\nMetric explanation:')
+    print('  KL divergence = KL(p_official || p_sglang) on softmax distributions')
+    print('  KL < 0.001: effectively identical')
+    print('  KL 0.001-0.01: negligible for generation')
+    print('  KL 0.01-0.1: small kernel-level divergence')
+    print('  KL > 0.1: noticeable (investigate)')
+    print('  KL > 1.0: likely a bug')
 
 
 if __name__ == '__main__':
