@@ -125,7 +125,7 @@ class HSAAttnBackend(AttentionBackend):
         if callable(get_default):
             try:
                 default_layers = get_default()
-                if default_layers:
+                if default_layers is not None:
                     return set(int(x) for x in default_layers)
             except Exception:
                 return None
@@ -1410,54 +1410,58 @@ class HSAAttnBackend(AttentionBackend):
         q_hsa = q3[:, HQ_swa:, :]   # [T, HQ_hsa, D]
 
         # Step 2: Run dense extend on SWA heads ONLY.
-        # We call the triton kernel directly with head-sliced tensor views,
-        # avoiding the `forward_extend` Python-level overhead.
-        # The kernel computes `kv_group_num = q.shape[1] // k_buffer.shape[1]`, so
-        # passing sliced Q (HQ_swa) and sliced KV buffer (H_swa) gives the correct GQA ratio.
+        # When HQ_swa == 0 (all heads are HSA, e.g. hsa_denom=1), skip this step.
         H_total = int(layer.tp_k_head_num)
-        pool_k = pool.get_key_buffer(layer.layer_id)[:, :H_swa, :]
-        pool_v = pool.get_value_buffer(layer.layer_id)[:, :H_swa, :]
 
         dense_out_3 = torch.empty((T, HQ_total, D), device=q.device, dtype=q.dtype)
-        db = self._dense_backend
-        dense_md = db.forward_metadata
 
-        k3 = k.view(-1, H_total, D)
-        v3 = v.view(-1, H_total, D)
+        if HQ_swa > 0 and H_swa > 0:
+            # We call the triton kernel directly with head-sliced tensor views,
+            # avoiding the `forward_extend` Python-level overhead.
+            # The kernel computes `kv_group_num = q.shape[1] // k_buffer.shape[1]`, so
+            # passing sliced Q (HQ_swa) and sliced KV buffer (H_swa) gives the correct GQA ratio.
+            pool_k = pool.get_key_buffer(layer.layer_id)[:, :H_swa, :]
+            pool_v = pool.get_value_buffer(layer.layer_id)[:, :H_swa, :]
 
-        if db.enable_deterministic:
-            # 1-stage unified kernel: uses kv_indices for both prefix + extend
-            db.extend_attention_fwd_unified(
-                q3[:, :HQ_swa, :],
-                dense_out_3[:, :HQ_swa, :],
-                pool_k, pool_v,
-                dense_md.qo_indptr,
-                dense_md.kv_indptr,
-                dense_md.kv_indices,
-                forward_batch.extend_prefix_lens.to(torch.int32),
-                dense_md.max_extend_len,
-                sm_scale=layer.scaling,
-                sliding_window_size=upper_swa_window,
-            )
-        else:
-            # 2-stage kernel: uses k_extend/v_extend + k_buffer/v_buffer separately
-            kv_indptr = dense_md.kv_indptr
-            kv_indices = dense_md.kv_indices
-            db.extend_attention_fwd(
-                q3[:, :HQ_swa, :],
-                k3[:, :H_swa, :].contiguous(),
-                v3[:, :H_swa, :].contiguous(),
-                dense_out_3[:, :HQ_swa, :],
-                pool_k, pool_v,
-                dense_md.qo_indptr,
-                kv_indptr, kv_indices,
-                dense_md.custom_mask,
-                True,  # is_causal
-                dense_md.mask_indptr,
-                dense_md.max_extend_len,
-                sm_scale=layer.scaling,
-                sliding_window_size=upper_swa_window,
-            )
+            db = self._dense_backend
+            dense_md = db.forward_metadata
+
+            k3 = k.view(-1, H_total, D)
+            v3 = v.view(-1, H_total, D)
+
+            if db.enable_deterministic:
+                # 1-stage unified kernel: uses kv_indices for both prefix + extend
+                db.extend_attention_fwd_unified(
+                    q3[:, :HQ_swa, :],
+                    dense_out_3[:, :HQ_swa, :],
+                    pool_k, pool_v,
+                    dense_md.qo_indptr,
+                    dense_md.kv_indptr,
+                    dense_md.kv_indices,
+                    forward_batch.extend_prefix_lens.to(torch.int32),
+                    dense_md.max_extend_len,
+                    sm_scale=layer.scaling,
+                    sliding_window_size=upper_swa_window,
+                )
+            else:
+                # 2-stage kernel: uses k_extend/v_extend + k_buffer/v_buffer separately
+                kv_indptr = dense_md.kv_indptr
+                kv_indices = dense_md.kv_indices
+                db.extend_attention_fwd(
+                    q3[:, :HQ_swa, :],
+                    k3[:, :H_swa, :].contiguous(),
+                    v3[:, :H_swa, :].contiguous(),
+                    dense_out_3[:, :HQ_swa, :],
+                    pool_k, pool_v,
+                    dense_md.qo_indptr,
+                    kv_indptr, kv_indices,
+                    dense_md.custom_mask,
+                    True,  # is_causal
+                    dense_md.mask_indptr,
+                    dense_md.max_extend_len,
+                    sm_scale=layer.scaling,
+                    sliding_window_size=upper_swa_window,
+                )
 
         page_table_1 = md.page_table_1
 

@@ -335,33 +335,41 @@ class FlashHSAInnerXHierarchicalSparseAttention(nn.Module):
         self.lmk_q_norm = None
 
         # Projections (explicit matrices, matching ultra reference naming).
-        self.q_proj = ColumnParallelLinear(
-            self.hidden_size,
-            self.hq_swa_total * self.head_dim,
-            bias=attention_bias,
-            quant_config=quant_config,
-            tp_rank=attn_tp_rank,
-            tp_size=attn_tp_size,
-            prefix=add_prefix("q_proj", prefix),
-        )
-        self.k_proj = ColumnParallelLinear(
-            self.hidden_size,
-            self.hk_swa_total * self.head_dim,
-            bias=attention_bias,
-            quant_config=quant_config,
-            tp_rank=attn_tp_rank,
-            tp_size=attn_tp_size,
-            prefix=add_prefix("k_proj", prefix),
-        )
-        self.v_proj = ColumnParallelLinear(
-            self.hidden_size,
-            self.hk_swa_total * self.head_dim,
-            bias=attention_bias,
-            quant_config=quant_config,
-            tp_rank=attn_tp_rank,
-            tp_size=attn_tp_size,
-            prefix=add_prefix("v_proj", prefix),
-        )
+        # When hsa_denom == 1 (all heads are HSA), there are no SWA heads and
+        # q/k/v_proj are not needed.  Skip creation to avoid zero-sized linears.
+        self.has_swa_branch = self.hq_swa_total > 0
+        if self.has_swa_branch:
+            self.q_proj = ColumnParallelLinear(
+                self.hidden_size,
+                self.hq_swa_total * self.head_dim,
+                bias=attention_bias,
+                quant_config=quant_config,
+                tp_rank=attn_tp_rank,
+                tp_size=attn_tp_size,
+                prefix=add_prefix("q_proj", prefix),
+            )
+            self.k_proj = ColumnParallelLinear(
+                self.hidden_size,
+                self.hk_swa_total * self.head_dim,
+                bias=attention_bias,
+                quant_config=quant_config,
+                tp_rank=attn_tp_rank,
+                tp_size=attn_tp_size,
+                prefix=add_prefix("k_proj", prefix),
+            )
+            self.v_proj = ColumnParallelLinear(
+                self.hidden_size,
+                self.hk_swa_total * self.head_dim,
+                bias=attention_bias,
+                quant_config=quant_config,
+                tp_rank=attn_tp_rank,
+                tp_size=attn_tp_size,
+                prefix=add_prefix("v_proj", prefix),
+            )
+        else:
+            self.q_proj = None
+            self.k_proj = None
+            self.v_proj = None
 
         self.hsa_q_proj = ColumnParallelLinear(
             self.hidden_size,
@@ -461,13 +469,14 @@ class FlashHSAInnerXHierarchicalSparseAttention(nn.Module):
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
         # --- SWA branch (per-head QK norm + RoPE) ---
-        swa_q, _ = self.q_proj(hidden_states)
-        swa_k, _ = self.k_proj(hidden_states)
-        swa_v, _ = self.v_proj(hidden_states)
-        # Per-head RMSNorm: reshape to [..., head_dim], norm, reshape back
-        swa_q = self.q_norm(swa_q.view(-1, self.head_dim)).view(swa_q.shape)
-        swa_k = self.k_norm(swa_k.view(-1, self.head_dim)).view(swa_k.shape)
-        swa_q, swa_k = self.rotary_emb(positions, swa_q, swa_k)
+        if self.has_swa_branch:
+            swa_q, _ = self.q_proj(hidden_states)
+            swa_k, _ = self.k_proj(hidden_states)
+            swa_v, _ = self.v_proj(hidden_states)
+            # Per-head RMSNorm: reshape to [..., head_dim], norm, reshape back
+            swa_q = self.q_norm(swa_q.view(-1, self.head_dim)).view(swa_q.shape)
+            swa_k = self.k_norm(swa_k.view(-1, self.head_dim)).view(swa_k.shape)
+            swa_q, swa_k = self.rotary_emb(positions, swa_q, swa_k)
 
         # --- HSA branch (per-head QK norm; RoPE only when apply_hsa_rope=True) ---
         hsa_q, _ = self.hsa_q_proj(hidden_states)
@@ -512,9 +521,14 @@ class FlashHSAInnerXHierarchicalSparseAttention(nn.Module):
             sel_q = hsa_q.view(-1, self.hq_hsa, self.head_dim)
 
         # Concatenate heads into the single KV cache layout: [SWA | HSA].
-        q_full = torch.cat([swa_q, hsa_q], dim=-1)
-        k_full = torch.cat([swa_k, hsa_k], dim=-1)
-        v_full = torch.cat([swa_v, hsa_v], dim=-1)
+        if self.has_swa_branch:
+            q_full = torch.cat([swa_q, hsa_q], dim=-1)
+            k_full = torch.cat([swa_k, hsa_k], dim=-1)
+            v_full = torch.cat([swa_v, hsa_v], dim=-1)
+        else:
+            q_full = hsa_q
+            k_full = hsa_k
+            v_full = hsa_v
 
         # Use hsa_sliding_window if configured, else fall back to merging window
         hsa_sw = getattr(self.config, "hsa_sliding_window", None)
