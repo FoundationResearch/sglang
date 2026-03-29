@@ -526,9 +526,14 @@ class FlashHSAInnerXHierarchicalSparseAttention(nn.Module):
             window = None
 
         # Upper SWA branch sliding window (config.sliding_window in official model).
-        # TODO: Enable once triton extend kernel's sliding window semantics are
-        # verified to match the official eager_attention_forward sliding window.
-        upper_swa_window = None
+        # In the official code, only FA2 actually enforces this window on the SWA
+        # heads inside HSA layers.  We pass it to the triton extend kernel which
+        # implements equivalent SWA masking.
+        _upper_sw = getattr(self.config, "sliding_window_attention_size", None)
+        if _upper_sw is None:
+            # Fall back: official uses config.sliding_window for both merging + upper SWA
+            _upper_sw = getattr(self.config, "hsa_sliding_window", None)
+        upper_swa_window = int(_upper_sw) if _upper_sw is not None else None
 
         hsa_split_head_info = dict(
             hq_swa=int(self.hq_swa),
