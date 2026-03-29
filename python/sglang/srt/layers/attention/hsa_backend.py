@@ -615,8 +615,8 @@ class HSAAttnBackend(AttentionBackend):
             q_swa = q3[:, :HQ_swa, :]
             q_hsa = q3[:, HQ_swa:, :]
 
-            # SWA branch: full causal attention on upper (SWA) heads.
-            # For decode (Q_LEN=1), causal = attend to all KV. Use SDPA for speed.
+            # SWA branch: sliding window attention on upper (SWA) heads.
+            upper_swa_window = int(split_info.get("upper_swa_window_size", 0) or -1)
             out_swa = torch.zeros((B, HQ_swa, D), device=q3.device, dtype=torch.float32)
             if HQ_swa > 0 and H_swa > 0:
                 import torch.nn.functional as F
@@ -624,7 +624,7 @@ class HSAAttnBackend(AttentionBackend):
                 seq_lens_i64 = md.cache_seqlens_int32.to(torch.int64)
                 k_cache_all = pool.get_key_buffer(layer.layer_id)
                 v_cache_all = pool.get_value_buffer(layer.layer_id)
-                swa_sliding_window = getattr(layer, "sliding_window_size", None)
+                swa_sliding_window = upper_swa_window if upper_swa_window > 0 else None
                 sm_scale = float(getattr(layer, "scaling", 1.0))
                 assert HQ_swa % H_swa == 0
                 Gs = HQ_swa // H_swa
@@ -1395,6 +1395,7 @@ class HSAAttnBackend(AttentionBackend):
         H_swa = int(split_info.get("h_swa", 0))
         H_hsa = int(split_info.get("h_hsa", 0))
         hsa_window = int(split_info.get("swa_window_size", 0) or 0)
+        upper_swa_window = int(split_info.get("upper_swa_window_size", 0) or -1)
 
         if layer.qk_head_dim != layer.v_head_dim:
             raise NotImplementedError(
@@ -1436,6 +1437,7 @@ class HSAAttnBackend(AttentionBackend):
                 forward_batch.extend_prefix_lens.to(torch.int32),
                 dense_md.max_extend_len,
                 sm_scale=layer.scaling,
+                sliding_window_size=upper_swa_window,
             )
         else:
             # 2-stage kernel: uses k_extend/v_extend + k_buffer/v_buffer separately
@@ -1454,6 +1456,7 @@ class HSAAttnBackend(AttentionBackend):
                 dense_md.mask_indptr,
                 dense_md.max_extend_len,
                 sm_scale=layer.scaling,
+                sliding_window_size=upper_swa_window,
             )
 
         page_table_1 = md.page_table_1
