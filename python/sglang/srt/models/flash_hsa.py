@@ -500,11 +500,9 @@ class FlashHSAInnerXHierarchicalSparseAttention(nn.Module):
                 lmk_q_3.shape[0], lmk_q_3.shape[1], lmk_q_3.shape[2]
             )  # [T, rhn, norm_dim]
             if self.unified_retrieval:
-                # unified_retrieval: single retrieval head, expand to hq_hsa heads
-                sel_q = lmk_q_norm.repeat_interleave(self.hq_hsa, dim=1)
-                # Trim or pad to head_dim if norm_dim != head_dim
-                if norm_dim != self.head_dim:
-                    sel_q = sel_q[:, :, :self.head_dim].contiguous()
+                # unified_retrieval: keep as single retrieval head [T, 1, retrieval_dim].
+                # The backend will group+sum the KV cache to match this dim.
+                sel_q = lmk_q_norm  # [T, 1, retrieval_dim]
             else:
                 # Standard: expand kv heads to q-head space for selector: [T, hq_hsa, D]
                 assert self.hq_hsa % self.hk_hsa == 0
@@ -554,6 +552,8 @@ class FlashHSAInnerXHierarchicalSparseAttention(nn.Module):
             hq_hsa=int(self.hq_hsa),
             h_swa=int(self.hk_swa),
             h_hsa=int(self.hk_hsa),
+            unified_retrieval=self.unified_retrieval,
+            retrieval_dim=self.retrieval_dim if self.unified_retrieval else None,
             swa_window_size=window,
             upper_swa_window_size=upper_swa_window,
             swa_exclude_lmk=False,
