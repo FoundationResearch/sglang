@@ -307,7 +307,7 @@ def main():
     print(f'HSA: hsa_heads={HSA_HEADS}, qk_ratio={HSA_QK_RATIO}, topk={HSA_TOPK}')
     print(f'  → All heads are HSA (no SWA upper branch)')
     print(f'Sliding window: {SW}, chunk_size: {PS}')
-    print(f'enable_lmk_q_proj=True, unified_retrieval=False (tilelang topk D-mismatch with True)')
+    print(f'enable_lmk_q_proj=True, unified_retrieval=True, retrieval_dim=1024')
     print()
 
     # Official config
@@ -319,7 +319,7 @@ def main():
         hsa_qk_ratio=HSA_QK_RATIO, use_sliding_window=True, sliding_window=SW,
         tie_word_embeddings=False, rope_theta=500000.0, hidden_act='silu',
         enable_softmax1=True, enable_lmk_q_proj=True,
-        unified_retrieval=False,  # unified_retrieval=True crashes tilelang topk (D mismatch)
+        unified_retrieval=True, retrieval_dim=1024,
     )
     oc._attn_implementation = 'sdpa'  # SDPA ignores sliding_window (matches sglang SWA layers)
     oc.pad_token_id = None
@@ -339,7 +339,7 @@ def main():
         hsa_qk_ratio=HSA_QK_RATIO, use_sliding_window_merging=True,
         sliding_window_merging_size=SW, tie_word_embeddings=False,
         rope_theta=500000.0, hidden_act='silu', enable_lmk_q_proj=True,
-        hsa_sliding_window=SW, unified_retrieval=False,
+        hsa_sliding_window=SW, unified_retrieval=True, retrieval_dim=1024,
     )
 
     print('Building sglang model...', flush=True)

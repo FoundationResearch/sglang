@@ -343,7 +343,19 @@ class LandmarkHSA(nn.Module):
         if full_seq_len >= self.chunk_size:
             lmk_k: Any = hsa_k_norm[:, self.chunk_size - 1::self.chunk_size, : ,:]  # (B, L // S, hsa_kv, d)
             if self.unified_retrieval:
-                lmk_k = rearrange(lmk_k, 'B S H D -> B S 1 (H D)')
+                # Group KV heads so that the flattened dim matches retrieval_dim.
+                # lmk_k: [B, S, h_hsa_kv, head_dim] → [B, S, 1, retrieval_dim]
+                # E.g. h_hsa_kv=32, head_dim=128, retrieval_dim=1024:
+                #   [B,S,32,128] → [B,S,1,4,8*128] → sum(dim=3) → [B,S,1,1024]
+                rd = self.retrieval_dim
+                H, D = lmk_k.shape[2], lmk_k.shape[3]
+                flat_dim = H * D  # e.g. 4096
+                if flat_dim == rd:
+                    lmk_k = rearrange(lmk_k, 'B S H D -> B S 1 (H D)')
+                else:
+                    G = flat_dim // rd  # number of groups to sum over
+                    lmk_k = rearrange(lmk_k, 'B S (G Hg) D -> B S 1 G (Hg D)', G=G)
+                    lmk_k = lmk_k.sum(dim=3)  # [B, S, 1, rd]
             hsa_visible_window = self.hsa_visible_window if self.training else -1
             B, S,  H, D = lmk_k.shape
 

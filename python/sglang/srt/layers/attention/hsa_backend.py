@@ -149,6 +149,7 @@ class HSAAttnBackend(AttentionBackend):
         window_size_override: Optional[int] = None,
         kv_head_offset: int = 0,
         kv_head_count: Optional[int] = None,
+        split_info: Optional[dict] = None,
     ) -> None:
         """Top-k page selection for decode.
 
@@ -240,6 +241,18 @@ class HSAAttnBackend(AttentionBackend):
         if kv_head_count is not None:
             flat_repr = flat_repr[:, int(kv_head_offset):int(kv_head_offset) + int(kv_head_count), :]
         cand_repr = flat_repr.view(B, C_max, H_sel, D)
+
+        # unified_retrieval: group+sum KV heads to match retrieval_dim.
+        unified = split_info is not None and split_info.get("unified_retrieval", False)
+        retrieval_dim = split_info.get("retrieval_dim", None) if split_info is not None else None
+        if unified and retrieval_dim is not None:
+            flat_dim = H_sel * D
+            if flat_dim != retrieval_dim:
+                G_groups = flat_dim // retrieval_dim
+                cand_repr = cand_repr.reshape(B, C_max, 1, G_groups, retrieval_dim)
+                cand_repr = cand_repr.sum(dim=3)
+            else:
+                cand_repr = cand_repr.reshape(B, C_max, 1, flat_dim)
 
         q_sel = selection_q if selection_q is not None else q
         sel = select_topk_pages_decode(
@@ -531,6 +544,7 @@ class HSAAttnBackend(AttentionBackend):
                 window_size_override=hsa_window,
                 kv_head_offset=h_swa,
                 kv_head_count=h_hsa,
+                split_info=split_info,
             )
         else:
             self._run_selection_decode(q=q, layer=layer, forward_batch=forward_batch)
@@ -605,7 +619,13 @@ class HSAAttnBackend(AttentionBackend):
                 )
             if HQ_hsa <= 0 or H_hsa <= 0:
                 raise ValueError("InnerX split-head requires non-empty HSA head partitions")
-            if int(selected_page_ids.shape[1]) != H_hsa:
+            # unified_retrieval: selection returns [B, 1, K]; expand to [B, H_hsa, K]
+            if int(selected_page_ids.shape[1]) == 1 and H_hsa > 1:
+                selected_page_ids = selected_page_ids.expand(B, H_hsa, -1).contiguous()
+                selected_scores = selected_scores.expand(B, H_hsa, -1).contiguous()
+                md.hsa_selected_page_ids = selected_page_ids
+                md.hsa_selected_scores = selected_scores
+            elif int(selected_page_ids.shape[1]) != H_hsa:
                 raise ValueError(
                     f"Selection H mismatch: got {int(selected_page_ids.shape[1])}, expected H_hsa={H_hsa}"
                 )
@@ -992,6 +1012,7 @@ class HSAAttnBackend(AttentionBackend):
         kv_head_offset: int = 0,
         kv_head_count: Optional[int] = None,
         hsa_window: int = 0,
+        split_info: Optional[dict] = None,
     ) -> None:
         """Dispatch to batched (production) or reference implementation."""
         if self._USE_EXTEND_REFERENCE:
@@ -1006,6 +1027,7 @@ class HSAAttnBackend(AttentionBackend):
             selection_q=selection_q, page_table_1=page_table_1,
             kv_head_offset=kv_head_offset, kv_head_count=kv_head_count,
             hsa_window=hsa_window,
+            split_info=split_info,
         )
 
     def _run_selection_extend_batched(
@@ -1015,6 +1037,7 @@ class HSAAttnBackend(AttentionBackend):
         layer: "RadixAttention",
         forward_batch: "ForwardBatch",
         selection_q: Optional[torch.Tensor] = None,
+        split_info: Optional[dict] = None,
         page_table_1: torch.Tensor,
         kv_head_offset: int = 0,
         kv_head_count: Optional[int] = None,
@@ -1113,6 +1136,19 @@ class HSAAttnBackend(AttentionBackend):
         if kv_head_count is not None:
             cand_repr = cand_repr[:, int(kv_head_offset):int(kv_head_offset) + int(kv_head_count), :]
         cand_repr = cand_repr.view(T, C_max, H_sel, D)  # [T, C_max, H_sel, D]
+
+        # unified_retrieval: group+sum KV heads to match retrieval_dim.
+        # E.g. [T, C, 32, 128] → [T, C, 1, 4, 1024] → sum(3) → [T, C, 1, 1024]
+        unified = split_info is not None and split_info.get("unified_retrieval", False)
+        retrieval_dim = split_info.get("retrieval_dim", None) if split_info is not None else None
+        if unified and retrieval_dim is not None:
+            flat_dim = H_sel * D
+            if flat_dim != retrieval_dim:
+                G_groups = flat_dim // retrieval_dim
+                cand_repr = cand_repr.reshape(T, C_max, 1, G_groups, retrieval_dim)
+                cand_repr = cand_repr.sum(dim=3)  # [T, C_max, 1, retrieval_dim]
+            else:
+                cand_repr = cand_repr.reshape(T, C_max, 1, flat_dim)
 
         # 4. Single batched selection call with B=T.
         sel = select_topk_pages_decode(
@@ -1487,6 +1523,7 @@ class HSAAttnBackend(AttentionBackend):
             kv_head_offset=H_swa,
             kv_head_count=H_hsa,
             hsa_window=hsa_window,
+            split_info=split_info,
         )
 
         selected_page_ids = md.hsa_ext_selected_page_ids  # [T, H_hsa, K]
@@ -1502,6 +1539,11 @@ class HSAAttnBackend(AttentionBackend):
         assert HQ_hsa % H_hsa == 0
         Gh = HQ_hsa // H_hsa
         TOPK = int(selected_page_ids.shape[2])
+
+        # unified_retrieval: selection returns [T, 1, K]; expand to [T, H_hsa, K]
+        if selected_page_ids.shape[1] == 1 and H_hsa > 1:
+            selected_page_ids = selected_page_ids.expand(T, H_hsa, TOPK).contiguous()
+            selected_scores = selected_scores.expand(T, H_hsa, TOPK).contiguous()
 
         valid = selected_page_ids >= 0
         scores = selected_scores.masked_fill(~valid, float("-inf"))
