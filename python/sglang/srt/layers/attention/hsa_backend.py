@@ -11,11 +11,15 @@ from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.hsa.kernels import hsa_decode_paged_fwd
 from sglang.srt.layers.attention.hsa.metadata import HSAMetadata
 from sglang.srt.layers.attention.hsa.selector import (
+    _online_topk_group,
     build_active_page_candidates,
     select_topk_pages_decode,
+    select_topk_pages_decode_fused,
 )
 from sglang.srt.layers.attention.hsa.utils import transform_page_table_1_to_real
 from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
+from sglang.srt.distributed import tensor_model_parallel_all_gather
+from sglang.srt.layers.dp_attention import get_attention_tp_size
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
@@ -246,6 +250,13 @@ class HSAAttnBackend(AttentionBackend):
         unified = split_info is not None and split_info.get("unified_retrieval", False)
         retrieval_dim = split_info.get("retrieval_dim", None) if split_info is not None else None
         if unified and retrieval_dim is not None:
+            tp_size = get_attention_tp_size()
+            if tp_size > 1:
+                # All-gather KV head landmark keys across TP ranks so every rank
+                # sees the full head dimension, matching training semantics where
+                # a single retrieval head operates on all KV heads.
+                cand_repr = tensor_model_parallel_all_gather(cand_repr.contiguous(), dim=2)
+                H_sel = cand_repr.shape[2]  # updated to full H_hsa
             flat_dim = H_sel * D
             if flat_dim != retrieval_dim:
                 G_groups = flat_dim // retrieval_dim
@@ -255,16 +266,35 @@ class HSAAttnBackend(AttentionBackend):
                 cand_repr = cand_repr.reshape(B, C_max, 1, flat_dim)
 
         q_sel = selection_q if selection_q is not None else q
-        sel = select_topk_pages_decode(
+        if unified and retrieval_dim is not None:
+            tp_size = get_attention_tp_size()
+            if tp_size > 1:
+                # All-gather sel_q across TP ranks to reconstruct the full
+                # retrieval_dim vector (ColumnParallelLinear splits along last dim).
+                q_sel = tensor_model_parallel_all_gather(q_sel.contiguous(), dim=-1)
+        sm_scale_val = getattr(layer, "scaling", None)
+
+        sel = select_topk_pages_decode_fused(
             q=q_sel,
             cand_page_ids=cand_page_ids,
             cand_mask=cand_mask,
-            cand_chunk_repr=cand_repr,
-            cand_chunk_repr_valid=cand_mask,
+            cand_repr=cand_repr,
             topk=int(self.hsa_topk),
+            page_size=int(self.page_size),
+            sm_scale=sm_scale_val,
             selection_strategy=str(self.hsa_selection_strategy),
-            sm_scale=getattr(layer, "scaling", None),
         )
+        if sel is None:
+            sel = select_topk_pages_decode(
+                q=q_sel,
+                cand_page_ids=cand_page_ids,
+                cand_mask=cand_mask,
+                cand_chunk_repr=cand_repr,
+                cand_chunk_repr_valid=cand_mask,
+                topk=int(self.hsa_topk),
+                selection_strategy=str(self.hsa_selection_strategy),
+                sm_scale=sm_scale_val,
+            )
 
         md.hsa_cand_page_ids = sel.cand_page_ids
         md.hsa_cand_mask = sel.cand_mask
@@ -808,15 +838,19 @@ class HSAAttnBackend(AttentionBackend):
         HQ_hsa: int,
         hsa_window: int,
     ) -> tuple:
-        """Batched internal SWA on HSA heads for extend (vectorized over tokens).
+        """Internal SWA on HSA heads for extend via triton extend kernel.
 
-        Eliminates the per-token Python loop by padding windows to a uniform
-        size and using batched matmuls.
+        Uses the triton extend_attention_fwd_unified kernel with custom
+        kv_indices that implement chunk-aligned sliding window + LMK exclusion,
+        matching the training block_causal_mask semantics exactly.
+
+        Memory: O(max_kv_per_token) for indices, no element-level mask needed.
+        Only supports batch=1 (SGLang continuous batching guarantee).
 
         Returns
         -------
         swa_o : [T, HQ_hsa, D] float32
-        lse_kv : [T, H_hsa] float32
+        lse_kv : [T, H_hsa] float32  (GQA-aggregated logsumexp)
         """
         T, _, D = q_hsa.shape
         device = q_hsa.device
@@ -832,84 +866,144 @@ class HSAAttnBackend(AttentionBackend):
         if md is None or pool is None or md.token_positions is None or md.token_to_seq_id is None:
             return swa_o, lse_kv
 
-        k_cache_all = pool.get_key_buffer(layer.layer_id)
-        v_cache_all = pool.get_value_buffer(layer.layer_id)
-        token_to_seq_id = md.token_to_seq_id  # [T] int32
+        # --- 只支持 batch=1 ---
+        extend_seq_lens = md.extend_seq_lens
+        extend_prefix_lens = md.extend_prefix_lens
+        assert extend_seq_lens is not None and extend_prefix_lens is not None
+        B = int(extend_seq_lens.shape[0])
+        assert B == 1, (
+            f"_compute_internal_swa_extend_batched 当前只支持 batch=1，"
+            f"但收到 B={B}。"
+        )
 
         assert HQ_hsa % H_hsa == 0
         Gh = HQ_hsa // H_hsa
         page_size = int(self.page_size)
         sm_scale = float(getattr(layer, "scaling", 1.0))
 
-        # Use precomputed engine indices from metadata.
-        engine_indices = md.engine_indices
-        if engine_indices is None:
-            return swa_o, lse_kv
+        prefix_len = int(extend_prefix_lens[0].item())
+        extend_len = int(extend_seq_lens[0].item())
 
-        # Compute per-token chunk-aligned window start using ENGINE indices.
-        # Official mask: chunk_start = ((q_engine_idx - window_size + 1) // chunk_size) * chunk_size
+        # --- 构建 chunk-aligned window + LMK-excluded 的 kv_indices ---
+        # 对于每个 Q token t (engine_idx = prefix_len + t):
+        #   chunk_start = max(0, ((engine_idx - hsa_window + 1) // page_size) * page_size)
+        #   valid KV: positions in [chunk_start, engine_idx] where (pos+1) % page_size != 0
+        # 由于 batch=1，我们构建一个统一的 kv_indptr/kv_indices
+
+        # 计算所有 Q token 的 engine indices
+        engine_indices = torch.arange(prefix_len, prefix_len + extend_len,
+                                      device=device, dtype=torch.int64)  # [T]
+
+        # 计算每个 Q token 的 chunk-aligned window start
         raw_starts = engine_indices - hsa_window + 1  # [T]
-        chunk_starts = torch.where(
-            raw_starts >= 0,
-            (raw_starts // page_size) * page_size,
-            torch.zeros_like(raw_starts),
-        ).clamp(min=0)  # [T]
+        chunk_starts = (raw_starts // page_size) * page_size  # [T], chunk-aligned
+        chunk_starts = chunk_starts.clamp(min=0)
 
-        # Window length (before LMK exclusion).
-        win_lens = engine_indices - chunk_starts + 1  # [T]
-        max_win = int(win_lens.max().item())
-        if max_win <= 0:
+        # 每个 Q token 的 KV 范围: [chunk_start, engine_idx]
+        # 排除 LMK: (pos + 1) % page_size != 0
+        # 最大 KV 长度 per token: hsa_window + page_size (chunk alignment 可能多一个 page)
+        # 减去 LMK tokens: 每 page_size 个 token 有 1 个 LMK
+        max_kv_per_token = hsa_window + page_size  # 上界
+
+        # 构建 kv_indptr 和 kv_indices
+        # 为了效率，使用向量化操作
+        kv_counts = torch.zeros(T, device=device, dtype=torch.int32)
+        # 实际 KV 数 = (engine_idx - chunk_start + 1) - num_lmk_in_range
+        range_lens = engine_indices - chunk_starts + 1  # [T]
+        # LMK 数量: 在 [chunk_start, engine_idx] 范围内 (pos+1) % page_size == 0 的数量
+        # = (engine_idx // page_size) - (chunk_start // page_size) + (1 if (engine_idx+1)%page_size==0 else 0)
+        # 简化: floor(engine_idx / page_size) - floor((chunk_start-1) / page_size)
+        # 但更准确的是: 在 [chunk_start, engine_idx] 中，page_size-1, 2*page_size-1, ... 的数量
+        first_lmk = (chunk_starts // page_size) * page_size + (page_size - 1)  # 第一个可能的 LMK 位置
+        # 如果 first_lmk < chunk_start，则从下一个 LMK 开始
+        first_lmk = torch.where(first_lmk >= chunk_starts, first_lmk,
+                                first_lmk + page_size)
+        # LMK 数量 = max(0, (engine_idx - first_lmk) // page_size + 1) if first_lmk <= engine_idx
+        num_lmk = torch.where(
+            first_lmk <= engine_indices,
+            (engine_indices - first_lmk) // page_size + 1,
+            torch.zeros_like(engine_indices),
+        )
+        kv_counts = (range_lens - num_lmk).to(torch.int32).clamp(min=0)
+
+        kv_indptr = torch.zeros(T + 1, device=device, dtype=torch.int32)
+        kv_indptr[1:] = torch.cumsum(kv_counts, dim=0)
+        total_kv = int(kv_indptr[-1].item())
+
+        if total_kv == 0:
             return swa_o, lse_kv
 
-        # Build padded window ENGINE indices [T, max_win].
-        offsets = torch.arange(max_win, device=device, dtype=torch.int64)  # [max_win]
-        win_positions = chunk_starts.unsqueeze(1) + offsets.unsqueeze(0)  # [T, max_win]
+        # 构建 kv_indices: 对于每个 Q token，列出其 KV slot indices
+        # 使用 page_table_1 将 engine position → KV cache slot
+        kv_indices = torch.empty(total_kv, device=device, dtype=torch.int64)
 
-        # Validity: engine_idx <= current token's engine_idx AND not LMK position.
-        # LMK exclusion uses ENGINE indices: (engine_idx + 1) % page_size == 0
-        # i.e., engine indices page_size-1, 2*page_size-1, ... are LMK slots.
-        valid = (win_positions <= engine_indices.unsqueeze(1))
-        valid = valid & (((win_positions + 1) % page_size) != 0)
+        # 向量化构建: 展开所有 Q token 的 KV 范围
+        # 方法: 对每个 Q token t，生成 [chunk_start[t], engine_idx[t]] 中非 LMK 的位置
+        # 然后通过 page_table_1 映射到 KV cache slot
+        #
+        # 为了避免 Python 循环，使用 padded 矩阵 + mask 的方式
+        max_range = int(range_lens.max().item())
+        if max_range <= 0:
+            return swa_o, lse_kv
 
-        # Gather token_locs via page_table_1[seq_id, position].
-        safe_positions = win_positions.clamp(min=0, max=page_table_1.shape[1] - 1)
-        pt_per_token = page_table_1[token_to_seq_id.long()]  # [T, MAX_T]
-        token_locs = torch.gather(
-            pt_per_token, 1, safe_positions
-        ).to(torch.int64)  # [T, max_win]
+        # offsets: [T, max_range], 每行是 [0, 1, ..., max_range-1]
+        offsets = torch.arange(max_range, device=device, dtype=torch.int64).unsqueeze(0)  # [1, max_range]
+        # positions: [T, max_range], 每行是 [chunk_start[t], chunk_start[t]+1, ...]
+        positions = chunk_starts.unsqueeze(1) + offsets  # [T, max_range]
 
-        # Expand valid mask for GQA groups: [T, Gh, max_win].
-        valid_expanded = valid.unsqueeze(1).expand(T, Gh, max_win)
+        # valid mask: position <= engine_idx AND (position+1) % page_size != 0
+        valid = (positions <= engine_indices.unsqueeze(1)) & \
+                ((positions + 1) % page_size != 0)
 
-        lse_per_q = torch.full((T, H_hsa, Gh), float("-inf"), device=device, dtype=torch.float32)
+        # 通过 page_table_1 映射到 KV cache slot
+        positions_safe = positions.clamp(min=0, max=page_table_1.shape[1] - 1)
+        kv_slots = page_table_1[0, positions_safe].to(torch.int64)  # [T, max_range]
 
-        flat_locs = token_locs.reshape(-1)  # [T * max_win]
+        # 使用 valid mask 提取有效的 kv_slots
+        kv_indices = kv_slots[valid]  # [total_kv]
 
-        for kv_h in range(H_hsa):
-            kv_h_global = H_swa + kv_h
-            # Gather K, V: [T * max_win, D] -> [T, max_win, D]
-            k_win = k_cache_all[flat_locs, kv_h_global, :].view(T, max_win, D).to(torch.float32)
-            v_win = v_cache_all[flat_locs, kv_h_global, :].view(T, max_win, D).to(torch.float32)
+        # --- 调用 triton extend kernel ---
+        # 把每个 Q token 当作一个独立的 "sequence"，这样每个 Q token
+        # 有自己的 KV indices（chunk-aligned window + LMK excluded）
+        # batch_size = T, 每个 "sequence" 有 1 个 Q token
+        qo_indptr = torch.arange(T + 1, device=device, dtype=torch.int32)  # [0, 1, 2, ..., T]
+        prefix_lens_tensor = kv_counts  # 每个 "sequence" 的所有 KV 都是 "prefix"
 
-            # q for this kv_head group: [T, Gh, D]
-            q_group = q_hsa[:, kv_h * Gh : (kv_h + 1) * Gh, :].to(torch.float32)
+        # 获取 HSA heads 的 KV cache buffer
+        pool_k = pool.get_key_buffer(layer.layer_id)[:, H_swa:H_swa + H_hsa, :]
+        pool_v = pool.get_value_buffer(layer.layer_id)[:, H_swa:H_swa + H_hsa, :]
 
-            # Batched attention: logits = [T, Gh, max_win]
-            logits = torch.bmm(q_group, k_win.transpose(1, 2)) * sm_scale
+        # 输出 tensor
+        swa_o_3 = torch.zeros((T, HQ_hsa, D), device=device, dtype=q_hsa.dtype)
 
-            # Mask invalid positions.
-            logits = logits.masked_fill(~valid_expanded, float("-inf"))
+        # LSE 输出 tensor: [T, HQ_hsa]，由 triton kernel 直接写入
+        lse_raw = torch.full((T, HQ_hsa), float("-inf"), device=device, dtype=torch.float32)
 
-            # LSE per query head group.
-            lse_per_q[:, kv_h, :] = torch.logsumexp(logits, dim=-1)  # [T, Gh]
+        # 使用 unified kernel（1-stage），因为所有 KV 都在 cache 中（没有 extend KV）
+        from sglang.srt.layers.attention.triton_ops.extend_attention import (
+            extend_attention_fwd_unified,
+        )
+        extend_attention_fwd_unified(
+            q_hsa,           # [T, HQ_hsa, D]
+            swa_o_3,         # [T, HQ_hsa, D] output
+            pool_k,          # KV cache key buffer (HSA heads only)
+            pool_v,          # KV cache value buffer (HSA heads only)
+            qo_indptr,       # [T+1]: [0, 1, 2, ..., T]
+            kv_indptr,       # [T+1]: per-token KV offsets
+            kv_indices,      # [total_kv]: KV cache slot indices
+            prefix_lens_tensor,  # [T]: 每个 "sequence" 的所有 KV 都是 prefix
+            max_len_extend=1,    # 每个 "sequence" 只有 1 个 extend token
+            sm_scale=sm_scale,
+            is_causal=False,  # causal mask 已通过 kv_indices 实现
+            lse_output=lse_raw,  # [T, HQ_hsa] kernel 直接写入 LSE
+        )
 
-            # Softmax + weighted V.
-            p = torch.softmax(logits, dim=-1)  # [T, Gh, max_win]
-            o = torch.bmm(p, v_win)  # [T, Gh, D]
-            swa_o[:, kv_h * Gh : (kv_h + 1) * Gh, :] = o
+        swa_o = swa_o_3.to(torch.float32)
 
-        # Aggregate logsumexp across GQA groups -> per-kv-head.
-        lse_kv = torch.logsumexp(lse_per_q, dim=-1)  # [T, H_hsa]
+        # --- 从 kernel 返回的 per-query-head LSE 聚合到 per-kv-head ---
+        # lse_raw: [T, HQ_hsa] → [T, H_hsa, Gh] → logsumexp over Gh → [T, H_hsa]
+        lse_per_group = lse_raw.view(T, H_hsa, Gh)  # [T, H_hsa, Gh]
+        lse_kv = torch.logsumexp(lse_per_group, dim=-1)  # [T, H_hsa]
 
         return swa_o, lse_kv
 
@@ -1043,10 +1137,14 @@ class HSAAttnBackend(AttentionBackend):
         kv_head_count: Optional[int] = None,
         hsa_window: int = 0,
     ) -> None:
-        """Batched per-token top-k page selection for extend.
+        """Memory-efficient extend selection via shared LMK + online_topk_group.
 
-        Vectorizes candidate building, LMK key gathering, and scoring
-        across all T tokens in a single call to select_topk_pages_decode.
+        复用 training 的 online_topk_group kernel 调用方式：
+        只 gather 一次共享的 LMK [1, S, H, D]，然后调用
+        online_topk_group(B=1, L=T, is_causal=True, q_offset=prefix_len)，
+        kernel 内部自动处理 causal mask + head group sum。
+        内存从 O(T × C_max × H × D) 降到 O(S × H × D)。
+        当前只支持 batch=1（SGLang continuous batching 保证）。
         """
         md = self.forward_metadata
         if md is None:
@@ -1060,16 +1158,24 @@ class HSAAttnBackend(AttentionBackend):
         if md.token_positions is None or md.token_to_seq_id is None:
             return
 
+        # --- 只支持 batch=1，多序列直接报错暴露问题 ---
+        extend_seq_lens = md.extend_seq_lens
+        extend_prefix_lens = md.extend_prefix_lens
+        assert extend_seq_lens is not None and extend_prefix_lens is not None, \
+            "extend_seq_lens and extend_prefix_lens must be set for extend mode"
+        B = int(extend_seq_lens.shape[0])
+        assert B == 1, (
+            f"_run_selection_extend_batched 当前只支持 batch=1，"
+            f"但收到 B={B}。SGLang continuous batching 应保证 extend 阶段 B=1。"
+        )
+
         T = int(md.token_positions.shape[0])
         H_sel = int(kv_head_count) if kv_head_count is not None else int(layer.tp_k_head_num)
         page_size = int(self.page_size)
-        token_positions = md.token_positions  # [T] int64
-        token_to_seq_id = md.token_to_seq_id  # [T] int32
         device = q.device
 
         k_cache = pool.get_key_buffer(layer.layer_id)  # [num_locs, H_total, D]
         D = int(k_cache.shape[2])
-        sm_scale = getattr(layer, "scaling", None)
 
         q_sel = selection_q if selection_q is not None else q
         if q_sel.dim() == 2:
@@ -1079,33 +1185,12 @@ class HSAAttnBackend(AttentionBackend):
             q_sel_3 = q_sel
             HQ_sel = int(q_sel_3.shape[1])
 
-        # 1. Compute per-token completed page count and exclusion boundary.
-        # Use ENGINE indices (not position_ids) to match official topk semantics.
-        engine_indices = md.engine_indices
-        if engine_indices is None:
-            md.hsa_ext_selected_page_ids = torch.full(
-                (T, H_sel, int(self.hsa_topk)), -1, device=device, dtype=torch.int32)
-            md.hsa_ext_selected_scores = torch.full(
-                (T, H_sel, int(self.hsa_topk)), float("-inf"), device=device, dtype=torch.float32)
-            return
+        # --- 计算 prefix_len 和总序列长度 ---
+        prefix_len = int(extend_prefix_lens[0].item())
+        total_seq_len = prefix_len + int(extend_seq_lens[0].item())  # prefix + extend
+        S = total_seq_len // page_size  # 总 LMK chunk 数
 
-        completed_pages = engine_indices // page_size  # [T]
-
-        if hsa_window > 0:
-            raw_starts = engine_indices - hsa_window + 1
-            limit_chunks = torch.where(
-                raw_starts >= 0,
-                raw_starts // page_size,
-                torch.zeros_like(raw_starts),
-            ).clamp(min=0)  # [T]
-            effective_cands = torch.min(completed_pages, limit_chunks)
-        else:
-            effective_cands = completed_pages
-
-        effective_cands = effective_cands.clamp(min=0)
-        C_max = int(effective_cands.max().item())
-
-        if C_max == 0:
+        if S == 0:
             md.hsa_ext_selected_page_ids = torch.full(
                 (T, H_sel, int(self.hsa_topk)), -1, device=device, dtype=torch.int32
             )
@@ -1114,56 +1199,80 @@ class HSAAttnBackend(AttentionBackend):
             )
             return
 
-        # 2. Build padded candidate page_ids [T, C_max].
-        cand_range = torch.arange(C_max, device=device, dtype=torch.int32)
-        cand_page_ids = cand_range.unsqueeze(0).expand(T, C_max).contiguous()  # [T, C_max]
-        cand_mask = cand_page_ids < effective_cands.unsqueeze(1).to(torch.int32)  # [T, C_max]
-        cand_page_ids = cand_page_ids.masked_fill(~cand_mask, -1)
-
-        # 3. Gather LMK keys for all candidates.
-        safe_page_ids = cand_page_ids.clamp(min=0).to(torch.int64)
-        lmk_token_pos = safe_page_ids * page_size + (page_size - 1)  # [T, C_max]
-
-        # Map to storage locations via page_table_1[seq_id, lmk_pos].
-        pt_per_token = page_table_1[token_to_seq_id.long()]  # [T, MAX_T]
-        lmk_token_pos_safe = lmk_token_pos.clamp(max=pt_per_token.shape[1] - 1)
-        lmk_locs = torch.gather(
-            pt_per_token, 1, lmk_token_pos_safe
-        ).to(torch.int64)  # [T, C_max]
-
-        flat_locs = lmk_locs.reshape(-1)
-        cand_repr = k_cache[flat_locs]  # [T*C_max, H_total, D]
+        # --- 1. 只 gather 一次共享的 LMK [S, H, D] ---
+        lmk_positions = torch.arange(S, device=device, dtype=torch.int64) * page_size + (page_size - 1)  # [S]
+        lmk_positions = lmk_positions.clamp(max=page_table_1.shape[1] - 1)
+        lmk_locs = page_table_1[0, lmk_positions].to(torch.int64)  # [S]
+        lmk_keys = k_cache[lmk_locs]  # [S, H_total, D]
         if kv_head_count is not None:
-            cand_repr = cand_repr[:, int(kv_head_offset):int(kv_head_offset) + int(kv_head_count), :]
-        cand_repr = cand_repr.view(T, C_max, H_sel, D)  # [T, C_max, H_sel, D]
+            lmk_keys = lmk_keys[:, int(kv_head_offset):int(kv_head_offset) + int(kv_head_count), :]
+        # lmk_keys: [S, H_sel, D]
 
-        # unified_retrieval: group+sum KV heads to match retrieval_dim.
-        # E.g. [T, C, 32, 128] → [T, C, 1, 4, 1024] → sum(3) → [T, C, 1, 1024]
+        # --- 2. unified_retrieval 降维（跟 training 一致）---
         unified = split_info is not None and split_info.get("unified_retrieval", False)
         retrieval_dim = split_info.get("retrieval_dim", None) if split_info is not None else None
         if unified and retrieval_dim is not None:
-            flat_dim = H_sel * D
-            if flat_dim != retrieval_dim:
-                G_groups = flat_dim // retrieval_dim
-                cand_repr = cand_repr.reshape(T, C_max, 1, G_groups, retrieval_dim)
-                cand_repr = cand_repr.sum(dim=3)  # [T, C_max, 1, retrieval_dim]
-            else:
-                cand_repr = cand_repr.reshape(T, C_max, 1, flat_dim)
+            tp_size = get_attention_tp_size()
+            if tp_size > 1:
+                # All-gather KV head landmark keys across TP ranks
+                lmk_keys = tensor_model_parallel_all_gather(lmk_keys.contiguous(), dim=1)
+                H_sel = lmk_keys.shape[1]  # updated to full H_hsa
+                # All-gather sel_q across TP ranks
+                q_sel_3 = tensor_model_parallel_all_gather(q_sel_3.contiguous(), dim=-1)
+            # 跟 training 一致: rearrange('S H D -> S 1 (H D)')
+            lmk_keys = lmk_keys.reshape(S, 1, H_sel * D)  # [S, 1, H_sel*D]
+            H_sel_kernel = 1
+            D_kernel = H_sel * D  # = retrieval_dim (e.g. 1024)
+        else:
+            H_sel_kernel = H_sel
+            D_kernel = D
 
-        # 4. Single batched selection call with B=T.
-        sel = select_topk_pages_decode(
-            q=q_sel_3,
-            cand_page_ids=cand_page_ids,
-            cand_mask=cand_mask,
-            cand_chunk_repr=cand_repr,
-            cand_chunk_repr_valid=cand_mask,
-            topk=int(self.hsa_topk),
-            selection_strategy=str(self.hsa_selection_strategy),
-            sm_scale=sm_scale,
+        # --- 3. 调用 online_topk_group（跟 training 一致）---
+        assert _online_topk_group is not None, (
+            "Fused online_topk_group kernel 未加载，无法执行 extend selection。"
+            "请确保 hsa-kernel-main/ops/topk_group.py 可正常导入。"
         )
 
-        md.hsa_ext_selected_page_ids = sel.selected_page_ids  # [T, H_sel, K]
-        md.hsa_ext_selected_scores = sel.selected_scores  # [T, H_sel, K]
+        # Q: [T, HQ_sel, D] → [1, T, HQ_sel, D]
+        # 对于 unified_retrieval，HQ_sel=1, D=retrieval_dim
+        q_4d = q_sel_3.unsqueeze(0)  # [1, T, HQ_sel, D_sel]
+        lmk_4d = lmk_keys.unsqueeze(0)  # [1, S, H_sel_kernel, D_kernel]
+
+        # q_offset = prefix_len，表示 extend 的第一个 token 在全局序列中的位置
+        fused_indices, fused_scores = _online_topk_group(
+            q=q_4d,
+            lmks=lmk_4d,
+            topk=int(self.hsa_topk),
+            block_size=page_size,
+            window_size=hsa_window if hsa_window > 0 else 0,
+            is_causal=True,
+            q_offset=prefix_len,
+            is_training=False,
+        )
+        # fused_indices: [1, T, h_shared, topk], fused_scores: [1, T, h_shared, topk]
+
+        # --- 4. 转换输出格式 ---
+        # squeeze batch dim: [T, h_shared, topk]
+        selected_page_ids = fused_indices.squeeze(0).to(torch.int32)
+        selected_scores = fused_scores.squeeze(0).to(torch.float32)
+
+        # kernel 返回的 index 是 chunk index（0-based），即 page_id
+        # 无效位（-1）保持不变
+        selected_page_ids = selected_page_ids.masked_fill(selected_page_ids < 0, -1)
+
+        # 如果 unified_retrieval，h_shared=1，需要 repeat 到 H_sel（原始 kv head 数）
+        if unified and retrieval_dim is not None:
+            orig_H_sel = int(kv_head_count) if kv_head_count is not None else int(layer.tp_k_head_num)
+            if selected_page_ids.shape[1] != orig_H_sel:
+                selected_page_ids = selected_page_ids.repeat_interleave(
+                    orig_H_sel // selected_page_ids.shape[1], dim=1
+                )
+                selected_scores = selected_scores.repeat_interleave(
+                    orig_H_sel // selected_scores.shape[1], dim=1
+                )
+
+        md.hsa_ext_selected_page_ids = selected_page_ids  # [T, H_sel, K]
+        md.hsa_ext_selected_scores = selected_scores  # [T, H_sel, K]
 
     def _run_selection_extend_reference(
         self,
@@ -1608,5 +1717,3 @@ class HSAAttnBackend(AttentionBackend):
         # Step 8: Write HSA heads into the pre-allocated output tensor.
         dense_out_3[:, HQ_swa:, :] = out_hsa.to(dense_out_3.dtype)
         return dense_out_3.reshape(T, HQ_total * D)
-
-

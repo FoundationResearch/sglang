@@ -885,8 +885,6 @@ python -m sglang_router.launch_router \
 ### PostgreSQL Configuration
 
 ```bash
-export POSTGRES_DB_URL="postgres://user:password@host:5432/dbname"
-
 python -m sglang_router.launch_router \
   --backend openai \
   --worker-urls https://api.openai.com \

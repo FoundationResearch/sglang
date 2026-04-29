@@ -213,6 +213,8 @@ def _register_flash_hsa_autoconfig() -> None:
 
         if "flash_hsa_innerx" not in CONFIG_MAPPING:
             CONFIG_MAPPING.register("flash_hsa_innerx", FlashHSAConfig)
+        if "olmo_lhsa" not in CONFIG_MAPPING:
+            CONFIG_MAPPING.register("olmo_lhsa", FlashHSAConfig)
     except Exception:
         # Be conservative: any import/version mismatch should not break SGLang.
         print("[ERROR] Failed to register FlashHSAConfig into Transformers AutoConfig mapping")
@@ -220,6 +222,3 @@ def _register_flash_hsa_autoconfig() -> None:
 
 
 _register_flash_hsa_autoconfig()
-
-
-

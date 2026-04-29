@@ -694,6 +694,7 @@ def _fwd_kernel_unified(
     mask_indptr,
     sink_ptr,
     window_start_pos,
+    Lse,
     sm_scale,
     kv_group_num,
     stride_qbs,
@@ -717,6 +718,9 @@ def _fwd_kernel_unified(
     IS_CAUSAL: tl.constexpr,
     USE_CUSTOM_MASK: tl.constexpr,
     HAS_SINK: tl.constexpr,
+    RETURN_LSE: tl.constexpr = False,
+    stride_lse_bs: tl.constexpr = 0,
+    stride_lse_h: tl.constexpr = 0,
 ):
     """
     Unified 1-stage kernel for deterministic extend attention.
@@ -931,6 +935,15 @@ def _fwd_kernel_unified(
         mask=mask_m[:, None] & mask_dv[None, :],
     )
 
+    # 可选：输出 logsumexp = e_max + log(deno)
+    if RETURN_LSE:
+        lse_val = e_max + tl.log(tl.where(deno > 0, deno, 1e-20))
+        offs_lse = (
+            (cur_seq_q_start_idx + cur_block_m * BLOCK_M + offs_m) * stride_lse_bs
+            + cur_head * stride_lse_h
+        )
+        tl.store(Lse + offs_lse, lse_val, mask=mask_m)
+
 
 def extend_attention_fwd_unified(
     q,
@@ -951,6 +964,7 @@ def extend_attention_fwd_unified(
     sinks=None,
     window_start_pos=None,
     xai_temperature_len=-1,
+    lse_output=None,
 ):
     """
     Unified 1-stage extend attention for deterministic inference.
@@ -1016,6 +1030,7 @@ def extend_attention_fwd_unified(
         mask_indptr,
         sinks,
         window_start_pos,
+        lse_output,
         sm_scale,
         kv_group_num,
         q.stride(0),
@@ -1039,6 +1054,9 @@ def extend_attention_fwd_unified(
         IS_CAUSAL=is_causal,
         USE_CUSTOM_MASK=USE_CUSTOM_MASK,
         HAS_SINK=HAS_SINK,
+        RETURN_LSE=lse_output is not None,
+        stride_lse_bs=lse_output.stride(0) if lse_output is not None else 0,
+        stride_lse_h=lse_output.stride(1) if lse_output is not None else 0,
         num_warps=num_warps,
         num_stages=num_stages,
         **extra_kargs,

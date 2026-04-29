@@ -1,9 +1,28 @@
 from __future__ import annotations
 
+import logging
+import os
+import sys
 from dataclasses import dataclass
 from typing import Optional, Tuple
 
 import torch
+
+logger = logging.getLogger(__name__)
+
+# 尝试导入 fused online topk kernel（优先路径），失败则 fallback 到 torch topk
+_online_topk_group = None
+try:
+    _hsa_kernel_ops_dir = os.path.normpath(
+        os.path.join(os.path.dirname(__file__), "..", "..", "..", "..", "..", "..", "dev", "hsa-kernel-main", "ops")
+    )
+    if _hsa_kernel_ops_dir not in sys.path:
+        sys.path.insert(0, _hsa_kernel_ops_dir)
+    from topk_group import online_topk_group as _online_topk_group
+    print("[HSA] Fused online_topk_group kernel loaded successfully.")
+except Exception as _e:
+    _online_topk_group = None
+    print(f"[HSA] Failed to import fused online_topk_group, will fallback to torch topk: {_e}")
 
 
 @dataclass
@@ -205,3 +224,71 @@ def select_topk_pages_decode(
     )
 
 
+def select_topk_pages_decode_fused(
+    *,
+    q: torch.Tensor,
+    cand_page_ids: torch.Tensor,
+    cand_mask: torch.Tensor,
+    cand_repr: torch.Tensor,
+    topk: int,
+    page_size: int,
+    sm_scale: Optional[float] = None,
+    selection_strategy: str = "group",
+) -> Optional[HSASelectionResult]:
+    """使用 fused online_topk_group kernel 进行 top-k page selection。
+
+    接口与 select_topk_pages_decode 对齐，返回 HSASelectionResult。
+    如果 fused kernel 不可用则返回 None（调用方应 fallback 到 torch 路径）。
+
+    Args:
+      q: [B, HQ*D] or [B, HQ, D]  — query tensor
+      cand_page_ids: [B, C] int32 padded with -1
+      cand_mask: [B, C] bool
+      cand_repr: [B, C, H_sel, D] — 候选 chunk 的 landmark 表示
+      topk: 选取的 top-k 数量
+      page_size: chunk/page 大小
+      sm_scale: 可选的 attention scale（fused kernel 内部处理）
+      selection_strategy: "group" or "head"（fused kernel 仅支持 group 模式）
+    """
+    if _online_topk_group is None:
+        return None
+
+    B = q.shape[0]
+    D = cand_repr.shape[-1]
+
+    # q: [B, HQ*D] or [B, HQ, D] → [B, 1, HQ, D]
+    if q.dim() == 2:
+        HQ = q.shape[1] // D
+        q_4d = q.view(B, 1, HQ, D)
+    elif q.dim() == 3:
+        q_4d = q.unsqueeze(1)  # [B, HQ, D] → [B, 1, HQ, D]
+    else:
+        return None  # 不支持的 shape，fallback
+
+    # cand_repr: [B, C_max, H_sel, D] — 已经是 [B, S, h_kv, D] 格式
+    # window 排除已在外部完成，设 window_size=0, is_causal=False
+    fused_indices, fused_scores = _online_topk_group(
+        q=q_4d,
+        lmks=cand_repr,
+        topk=topk,
+        block_size=page_size,
+        window_size=0,
+        is_causal=False,
+        q_offset=0,
+        is_training=False,
+    )
+
+    # fused_indices: [B, 1, h_shared, topk] → [B, h_shared, topk]
+    fused_indices = fused_indices.squeeze(1)
+    fused_scores = fused_scores.squeeze(1)
+
+    # 将 chunk index 映射回 page_id（候选集是 [0, C_max)，index == page_id）
+    selected_page_ids = fused_indices.to(torch.int32)
+    selected_page_ids = selected_page_ids.masked_fill(fused_indices < 0, -1)
+
+    return HSASelectionResult(
+        cand_page_ids=cand_page_ids,
+        cand_mask=cand_mask,
+        selected_page_ids=selected_page_ids,
+        selected_scores=fused_scores.to(torch.float32),
+    )

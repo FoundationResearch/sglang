@@ -27,7 +27,11 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 import torch
 from torch import nn
 
-from sglang.srt.distributed import get_pp_group
+from sglang.srt.distributed import (
+    get_pp_group,
+    split_tensor_along_last_dim,
+    tensor_model_parallel_all_gather,
+)
 from sglang.srt.layers.dp_attention import (
     get_attention_tp_rank,
     get_attention_tp_size,
@@ -170,8 +174,13 @@ class FlashHSAInnerXAttention(nn.Module):
         self.scaling = self.head_dim**-0.5
         self.layer_id = int(layer_id)
         self.alt_stream = alt_stream
+        self.tp_size = attn_tp_size
+        self.tp_rank = attn_tp_rank
 
-        # OLMo3: RMSNorm on full projected tensor
+        # OLMo3: RMSNorm on full projected tensor (all heads concatenated).
+        # Must use TOTAL head count (not TP-local) so that the norm statistics
+        # are identical regardless of TP degree.  In forward() we all-gather
+        # before norm and split back afterwards, matching OLMo2 semantics.
         self.q_norm = RMSNorm(self.total_num_heads * self.head_dim, eps=rms_norm_eps)
         self.k_norm = RMSNorm(self.total_num_kv_heads * self.head_dim, eps=rms_norm_eps)
 
@@ -210,7 +219,6 @@ class FlashHSAInnerXAttention(nn.Module):
             quant_config=quant_config,
             tp_rank=attn_tp_rank,
             tp_size=attn_tp_size,
-            reduce_results=False,
             prefix=add_prefix("o_proj", prefix),
         )
 
@@ -241,9 +249,15 @@ class FlashHSAInnerXAttention(nn.Module):
         k, _ = self.k_proj(hidden_states)
         v, _ = self.v_proj(hidden_states)
 
-        # OLMo3: norm on full projected tensor, then RoPE
+        # OLMo3 full-tensor QK norm: all-gather → norm → split (matches OLMo2).
+        if self.tp_size > 1:
+            q = tensor_model_parallel_all_gather(q.contiguous())
+            k = tensor_model_parallel_all_gather(k.contiguous())
         q = self.q_norm(q)
         k = self.k_norm(k)
+        if self.tp_size > 1:
+            q = split_tensor_along_last_dim(q, self.tp_size)[self.tp_rank]
+            k = split_tensor_along_last_dim(k, self.tp_size)[self.tp_rank]
         q, k = self.rotary_emb(positions, q, k)
 
         attn_output = self.attn(q, k, v, forward_batch)
@@ -328,8 +342,18 @@ class FlashHSAInnerXHierarchicalSparseAttention(nn.Module):
             if get_global_server_args().rl_on_policy_target is not None
             else {}
         )
-        self.q_norm = RMSNorm(self.head_dim, eps=rms_norm_eps, **norm_kwargs)
-        self.k_norm = RMSNorm(self.head_dim, eps=rms_norm_eps, **norm_kwargs)
+        # Bug 10 fix: respect layerwise_qk_norm config.
+        # - layerwise_qk_norm=True  → per-layer norm on full projected tensor [total_heads * head_dim]
+        #   (same as HSAFullAttention; weight shape = [hidden_size])
+        # - layerwise_qk_norm=False → per-head norm [head_dim], applied via reshape trick
+        #   SWA and HSA branches share the same norm weights in per-head mode.
+        self._layerwise_qk = bool(getattr(config, "layerwise_qk_norm", False))
+        if self._layerwise_qk:
+            self.q_norm = RMSNorm(self.total_num_heads * self.head_dim, eps=rms_norm_eps, **norm_kwargs)
+            self.k_norm = RMSNorm(self.total_num_kv_heads * self.head_dim, eps=rms_norm_eps, **norm_kwargs)
+        else:
+            self.q_norm = RMSNorm(self.head_dim, eps=rms_norm_eps, **norm_kwargs)
+            self.k_norm = RMSNorm(self.head_dim, eps=rms_norm_eps, **norm_kwargs)
         # lmk_q_norm is only needed when enable_lmk_q_proj=True.
         # Created conditionally below alongside lmk_q_proj.
         self.lmk_q_norm = None
@@ -402,9 +426,14 @@ class FlashHSAInnerXHierarchicalSparseAttention(nn.Module):
         retrieval_head_num_total = 1 if self.unified_retrieval else self.hk_hsa_total
         default_retrieval_dim = self.hk_hsa_total * self.head_dim
         self.retrieval_dim = int(getattr(config, "retrieval_dim", None) or default_retrieval_dim)
+        # lmk_q_norm uses the FULL (non-TP-split) retrieval_dim so that norm
+        # statistics are identical regardless of TP degree.  In forward() we
+        # all-gather before norm and split back afterwards.
+        retrieval_head_num_local = 1 if self.unified_retrieval else self.hk_hsa
+        self.lmk_q_norm_dim = self.retrieval_dim // retrieval_head_num_total
+        self.lmk_q_norm_dim_local = (self.retrieval_dim // attn_tp_size) // retrieval_head_num_local
         if self.enable_lmk_q_proj:
-            norm_dim = self.retrieval_dim // retrieval_head_num_total
-            self.lmk_q_norm = RMSNorm(norm_dim, eps=rms_norm_eps, **norm_kwargs)
+            self.lmk_q_norm = RMSNorm(self.lmk_q_norm_dim, eps=rms_norm_eps, **norm_kwargs)
             self.lmk_q_proj = ColumnParallelLinear(
                 self.hidden_size,
                 self.retrieval_dim,
@@ -438,7 +467,6 @@ class FlashHSAInnerXHierarchicalSparseAttention(nn.Module):
             quant_config=quant_config,
             tp_rank=attn_tp_rank,
             tp_size=attn_tp_size,
-            reduce_results=False,
             prefix=add_prefix("o_proj", prefix),
         )
 
@@ -468,41 +496,75 @@ class FlashHSAInnerXHierarchicalSparseAttention(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
-        # --- SWA branch (per-head QK norm + RoPE) ---
+        # --- HSA branch projections (always needed) ---
+        hsa_q, _ = self.hsa_q_proj(hidden_states)
+        hsa_k, _ = self.hsa_k_proj(hidden_states)
+        hsa_v, _ = self.hsa_v_proj(hidden_states)
+
+        # --- SWA branch projections ---
         if self.has_swa_branch:
             swa_q, _ = self.q_proj(hidden_states)
             swa_k, _ = self.k_proj(hidden_states)
             swa_v, _ = self.v_proj(hidden_states)
-            # Per-head RMSNorm: reshape to [..., head_dim], norm, reshape back
-            swa_q = self.q_norm(swa_q.view(-1, self.head_dim)).view(swa_q.shape)
-            swa_k = self.k_norm(swa_k.view(-1, self.head_dim)).view(swa_k.shape)
-            swa_q, swa_k = self.rotary_emb(positions, swa_q, swa_k)
 
-        # --- HSA branch (per-head QK norm; RoPE only when apply_hsa_rope=True) ---
-        hsa_q, _ = self.hsa_q_proj(hidden_states)
-        hsa_k, _ = self.hsa_k_proj(hidden_states)
-        hsa_v, _ = self.hsa_v_proj(hidden_states)
-        hsa_q = self.q_norm(hsa_q.view(-1, self.head_dim)).view(hsa_q.shape)
-        hsa_k = self.k_norm(hsa_k.view(-1, self.head_dim)).view(hsa_k.shape)
+        # --- QK norm ---
+        if self._layerwise_qk:
+            # Per-layer norm: concat SWA + HSA, norm with full [hidden_size] weight, split back
+            if self.has_swa_branch:
+                swa_q_dim = swa_q.shape[-1]
+                swa_k_dim = swa_k.shape[-1]
+                full_q = torch.cat([swa_q, hsa_q], dim=-1)
+                full_k = torch.cat([swa_k, hsa_k], dim=-1)
+                full_q = self.q_norm(full_q)
+                full_k = self.k_norm(full_k)
+                swa_q = full_q[..., :swa_q_dim].contiguous()
+                hsa_q = full_q[..., swa_q_dim:].contiguous()
+                swa_k = full_k[..., :swa_k_dim].contiguous()
+                hsa_k = full_k[..., swa_k_dim:].contiguous()
+            else:
+                hsa_q = self.q_norm(hsa_q)
+                hsa_k = self.k_norm(hsa_k)
+        else:
+            # Per-head norm: reshape to [..., head_dim], norm, reshape back
+            if self.has_swa_branch:
+                swa_q = self.q_norm(swa_q.view(-1, self.head_dim)).view(swa_q.shape)
+                swa_k = self.k_norm(swa_k.view(-1, self.head_dim)).view(swa_k.shape)
+            hsa_q = self.q_norm(hsa_q.view(-1, self.head_dim)).view(hsa_q.shape)
+            hsa_k = self.k_norm(hsa_k.view(-1, self.head_dim)).view(hsa_k.shape)
+
+        # --- RoPE ---
+        if self.has_swa_branch:
+            swa_q, swa_k = self.rotary_emb(positions, swa_q, swa_k)
         if self.apply_hsa_rope:
             hsa_q, hsa_k = self.rotary_emb(positions, hsa_q, hsa_k)
 
         # --- Selection query ---
         if self.enable_lmk_q_proj and self.lmk_q_proj is not None:
             # Separate lmk_q_proj for page selection (NO RoPE).
-            lmk_q, _ = self.lmk_q_proj(hidden_states)  # [T, retrieval_dim]
+            lmk_q, _ = self.lmk_q_proj(hidden_states)  # [T, retrieval_dim // tp_size]
             rhn = self.retrieval_head_num  # 1 for unified, hk_hsa for standard
-            retrieval_head_num_total = 1 if self.unified_retrieval else self.hk_hsa_total
-            norm_dim = self.retrieval_dim // retrieval_head_num_total
-            lmk_q_3 = lmk_q.view(-1, rhn, norm_dim)
+            # All-gather → norm → split to match training semantics.
+            attn_tp_size = get_attention_tp_size()
+            if attn_tp_size > 1:
+                lmk_q = tensor_model_parallel_all_gather(lmk_q.contiguous())
+            norm_dim = self.lmk_q_norm_dim  # full (non-TP-split) norm dim
+            rhn_for_norm = 1 if self.unified_retrieval else (self.hk_hsa * attn_tp_size if attn_tp_size > 1 else self.hk_hsa)
+            lmk_q_3 = lmk_q.view(-1, rhn_for_norm, norm_dim)
             # RMSNorm expects 2D; apply over norm_dim with flatten/unflatten.
             lmk_q_norm = self.lmk_q_norm(lmk_q_3.reshape(-1, norm_dim)).reshape(
                 lmk_q_3.shape[0], lmk_q_3.shape[1], lmk_q_3.shape[2]
-            )  # [T, rhn, norm_dim]
+            )  # [T, rhn_for_norm, norm_dim]
+            if attn_tp_size > 1:
+                # Split back to local heads.
+                tp_rank = get_attention_tp_rank()
+                lmk_q_flat = lmk_q_norm.reshape(lmk_q_norm.shape[0], -1)  # [T, retrieval_dim]
+                lmk_q_flat = split_tensor_along_last_dim(lmk_q_flat, attn_tp_size)[tp_rank]
+                local_norm_dim = self.lmk_q_norm_dim_local
+                lmk_q_norm = lmk_q_flat.view(-1, rhn, local_norm_dim)  # [T, rhn, local_norm_dim]
             if self.unified_retrieval:
-                # unified_retrieval: keep as single retrieval head [T, 1, retrieval_dim].
-                # The backend will group+sum the KV cache to match this dim.
-                sel_q = lmk_q_norm  # [T, 1, retrieval_dim]
+                # unified_retrieval: keep as single retrieval head [T, 1, retrieval_dim // tp].
+                # The backend will all-gather + group+sum the KV cache to match this dim.
+                sel_q = lmk_q_norm  # [T, 1, retrieval_dim // tp_size]
             else:
                 # Standard: expand kv heads to q-head space for selector: [T, hq_hsa, D]
                 assert self.hq_hsa % self.hk_hsa == 0
@@ -884,6 +946,25 @@ class HSAForCausalLM(nn.Module):
             if handled_stacked:
                 continue
 
+            # TP 切分 attention norm 权重（q_norm / k_norm / lmk_q_norm）
+            # SWA 层的 OLMo3 风格 QK norm 和 HSA 层的 lmk_q_norm 在 TP 模式下
+            # param 维度 = total / tp_size，需要从 checkpoint 的完整权重中切出
+            # 当前 rank 对应的分片。HSA 层的 per-head q_norm/k_norm 维度为
+            # head_dim，不受 TP 影响，通过 param.shape != loaded_weight.shape
+            # 条件自动跳过切分。
+            if (
+                name in params_dict
+                and ("q_norm" in name or "k_norm" in name)
+            ):
+                param = params_dict[name]
+                if param.shape != loaded_weight.shape:
+                    tp_rank = get_attention_tp_rank()
+                    shard_size = param.shape[0]
+                    start = tp_rank * shard_size
+                    loaded_weight = loaded_weight[start : start + shard_size]
+                param.data.copy_(loaded_weight)
+                continue
+
             # Direct load
             if name.endswith(".bias") and name not in params_dict:
                 continue
@@ -899,5 +980,3 @@ class HSAForCausalLM(nn.Module):
 
 # Model registry entrypoint
 EntryClass = HSAForCausalLM
-
-

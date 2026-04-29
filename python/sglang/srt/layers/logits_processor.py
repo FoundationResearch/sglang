@@ -481,6 +481,12 @@ class LogitsProcessor(nn.Module):
                     logits_metadata.extend_seq_lens_cpu,
                 )
             ):
+                # 防御性检查：跳过 extend_len=0 的序列（不应出现，由 scheduler 保证）
+                if extend_len == 0:
+                    pt += extend_len
+                    sample_indices.append(sample_index_pt)
+                    continue
+
                 # It can happen in chunked prefill. We still need to sample 1 token,
                 # But we don't want to include it in input logprob.
                 if extend_len == extend_logprob_start_len:
