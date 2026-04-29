@@ -442,8 +442,13 @@ class RadixCache(BasePrefixCache):
             return
 
         token_ids = (req.origin_input_ids + req.output_ids)[:kv_committed_len]
+
+        # Bug 8 fix: For HSA models, KV cache is allocated in fill_ids space
+        # (which includes LMK tokens), so kv_indices length = len(fill_ids) + output_len.
+        # We must use kv_committed_len (fill_ids space) to index into req_to_token,
+        # not len(token_ids) (origin_input_ids space, which is shorter).
         kv_indices = self.req_to_token_pool.req_to_token[
-            req.req_pool_idx, : len(token_ids)
+            req.req_pool_idx, :kv_committed_len
         ]
 
         # Maybe convert to bigram keys for EAGLE

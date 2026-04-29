@@ -444,7 +444,12 @@ class SWARadixCache(BasePrefixCache):
             self.req_to_token_pool.free(req.req_pool_idx)
             return
 
-        token_ids = (req.origin_input_ids + req.output_ids)[:kv_committed_len]
+        # Bug 8 fix: For HSA models, KV cache is allocated in fill_ids space
+        # (with LMK tokens inserted), and match_prefix uses fill_ids as the key.
+        # So insert must also use fill_ids as the key, not origin_input_ids.
+        # For non-HSA models, fill_ids == origin_input_ids + output_ids, so this
+        # is equivalent to the original code.
+        token_ids = (req.fill_ids + req.output_ids)[:kv_committed_len]
         # For EAGLE radix cache, we will convert the key to bigram key, e.g. [1,2,3,4] -> [(1,2), (2,3), (3,4)], the length will -1. ((len([(1,2), (2,3), (3,4)]) = len([1,2,3,4]) - 1))
         # So for the corresponding kv length should also -1. Then we get the actual_kv_len, and use it to do later calculation and slicing.
         actual_kv_len = kv_committed_len - 1 if self.is_eagle else kv_committed_len

@@ -867,6 +867,18 @@ class Req:
         out.extend(token_ids[n_full * chunk :])
         return out
 
+    def _hsa_origin_to_fill_pos(self, origin_pos: int) -> int:
+        """将 origin_input_ids 空间的位置转换为 fill_ids 空间（含 LMK）。
+
+        HSA 每 (page_size-1) 个 token 后插入一个 LMK，
+        所以 origin 位置 pos 对应 fill 位置 = pos + pos // (page_size - 1)。
+        非 HSA 模型直接返回原值。
+        """
+        if origin_pos <= 0 or not self.hsa_lmk_enabled:
+            return origin_pos
+        chunk = self.hsa_page_size - 1
+        return origin_pos + (origin_pos // chunk)
+
     @property
     def is_prefill_only(self) -> bool:
         """Check if this request is prefill-only (no token generation needed)."""
@@ -942,8 +954,12 @@ class Req:
         else:
             if self.hsa_lmk_enabled:
                 # For HSA, `fill_ids` is the engine-visible token sequence including LMK.
-                # It is maintained incrementally during decode; only initialize it once here.
-                if not self.fill_ids:
+                # During decode it is maintained incrementally via hsa_decode_postprocess_sampled_token.
+                # During prefill (output_ids is empty), always rebuild from origin_input_ids
+                # to handle chunked prefill truncation — the PrefillAdder may have truncated
+                # fill_ids to fit within chunked_prefill_size, so the second chunk would
+                # otherwise see a truncated fill_ids and have no new tokens to extend.
+                if not self.fill_ids or not self.output_ids:
                     assert self.hsa_page_size is not None and self.hsa_lmk_id is not None
                     self.fill_ids = self._hsa_insert_lmk_prompt(
                         self.origin_input_ids,
@@ -957,7 +973,8 @@ class Req:
         # NOTE: the matched length is at most 1 less than the input length to enable logprob computation
         max_prefix_len = input_len - 1
         if self.return_logprob and self.logprob_start_len >= 0:
-            max_prefix_len = min(max_prefix_len, self.logprob_start_len)
+            converted = self._hsa_origin_to_fill_pos(self.logprob_start_len)
+            max_prefix_len = min(max_prefix_len, converted)
         max_prefix_len = max(max_prefix_len, 0)
         token_ids = self.fill_ids[:max_prefix_len]
 
@@ -1231,7 +1248,7 @@ class Req:
             logprob_start_len = len(self.fill_ids) - 1
         else:
             # logprob_start_len should be at least the length of the prefix indices
-            logprob_start_len = max(self.logprob_start_len, len(self.prefix_indices))
+            logprob_start_len = max(self._hsa_origin_to_fill_pos(self.logprob_start_len), len(self.prefix_indices))
         self.extend_logprob_start_len = min(
             logprob_start_len - len(self.prefix_indices),
             self.extend_input_len,
@@ -1681,16 +1698,43 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                     len(req.fill_ids),
                 )
                 if req.logprob_start_len == -1:
-                    logprob_start_len = len(req.origin_input_ids) - 1
+                    logprob_start_len = len(req.fill_ids) - 1
                 else:
-                    logprob_start_len = req.logprob_start_len
+                    logprob_start_len = req._hsa_origin_to_fill_pos(req.logprob_start_len)
                 # Apply logprob_start_len
                 if global_start_idx < logprob_start_len:
                     global_start_idx = logprob_start_len
 
-                logprob_token_ids = req.origin_input_ids[
+                logprob_token_ids = req.fill_ids[
                     global_start_idx + 1 : global_end_idx + 1
                 ]
+                # Bug 3 + Bug 7 修复：HSA 的 fill_ids 中包含 LMK token（id = vocab_size）。
+                #
+                # Bug 3: LMK token id 会越界 input_logprobs 的 vocab 维度，需 clamp。
+                #
+                # Bug 7 (PPL correctness): logprob_token_ids[k] 是 fill position
+                # (global_start_idx + k) 的 label（即下一个 token）。当 fill_ids[pos+1]
+                # 是 LMK 时，label 被错误地设为 0，但该 position 是 real token（不会被
+                # LMK mask 过滤），导致 logprob = log P(token_0) 而非 log P(next_real_token)。
+                # 修复：LMK 位置的 label 替换为 LMK 后面的 real token（fill_ids[pos+2]）；
+                #       LMK 自身位置的 label 保持 clamp 到 0（反正会被 mask 过滤掉）。
+                if getattr(req, "hsa_lmk_enabled", False):
+                    lmk_id = req.hsa_lmk_id
+                    fill_ids = req.fill_ids
+                    new_logprob_token_ids = []
+                    for k, t in enumerate(logprob_token_ids):
+                        if t == lmk_id:
+                            # fill position = global_start_idx + k
+                            # label position = global_start_idx + k + 1 = LMK
+                            # correct label = fill_ids[global_start_idx + k + 2]
+                            next_real_pos = global_start_idx + k + 2
+                            if next_real_pos < len(fill_ids):
+                                new_logprob_token_ids.append(fill_ids[next_real_pos])
+                            else:
+                                new_logprob_token_ids.append(0)
+                        else:
+                            new_logprob_token_ids.append(t)
+                    logprob_token_ids = new_logprob_token_ids
                 extend_input_logprob_token_ids.extend(logprob_token_ids)
 
                 # We will need req.extend_input_len - req.extend_logprob_start_len number of

@@ -873,6 +873,14 @@ class TritonAttnBackend(AttentionBackend):
             kv_indices = self.forward_metadata.kv_indices
             window_kv_offsets = None
 
+        # Bug 11 fix: SWA/hybrid KV pool stores full-pool indices in req_to_token,
+        # but SWA layers use a separate smaller pool. Translate indices for SWA layers.
+        _pool = forward_batch.token_to_kv_pool
+        if hasattr(_pool, 'translate_loc_from_full_to_swa') and hasattr(_pool, 'layers_mapping'):
+            _, _is_swa = _pool.layers_mapping.get(layer.layer_id, (None, False))
+            if _is_swa and kv_indices is not None and kv_indices.numel() > 0:
+                kv_indices = _pool.translate_loc_from_full_to_swa(kv_indices).to(torch.int64)
+
         self.extend_attention_fwd(
             q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
             k.contiguous(),
@@ -943,6 +951,13 @@ class TritonAttnBackend(AttentionBackend):
             prefix_kv_indptr = self.forward_metadata.kv_indptr
             prefix_kv_indices = self.forward_metadata.kv_indices
             window_start_pos = None
+
+        # Bug 11 fix: translate full-pool indices to SWA-pool indices for SWA layers.
+        _pool = forward_batch.token_to_kv_pool
+        if hasattr(_pool, 'translate_loc_from_full_to_swa') and hasattr(_pool, 'layers_mapping'):
+            _, _is_swa = _pool.layers_mapping.get(layer.layer_id, (None, False))
+            if _is_swa and prefix_kv_indices is not None and prefix_kv_indices.numel() > 0:
+                prefix_kv_indices = _pool.translate_loc_from_full_to_swa(prefix_kv_indices).to(torch.int64)
 
         # Build unified kv_indices using fused Triton kernel
         extend_kv_indices = forward_batch.out_cache_loc
@@ -1050,6 +1065,13 @@ class TritonAttnBackend(AttentionBackend):
         else:
             kv_indptr = self.forward_metadata.kv_indptr
             kv_indices = self.forward_metadata.kv_indices
+
+        # Bug 11 fix: translate full-pool indices to SWA-pool indices for SWA layers.
+        _pool = forward_batch.token_to_kv_pool
+        if hasattr(_pool, 'translate_loc_from_full_to_swa') and hasattr(_pool, 'layers_mapping'):
+            _, _is_swa = _pool.layers_mapping.get(layer.layer_id, (None, False))
+            if _is_swa and kv_indices is not None and kv_indices.numel() > 0:
+                kv_indices = _pool.translate_loc_from_full_to_swa(kv_indices).to(torch.int64)
 
         self.decode_attention_fwd(
             q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
