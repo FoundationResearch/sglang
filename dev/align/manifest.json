@@ -1,0 +1,37 @@
+{
+  "config_path": "dev/align/config.json",
+  "config_sha256": "94c2d8be21f5194f8880eb4793e930c553404c9d9d81f17bd1c29ac1148c020d",
+  "weights_path": "dev/align/weights/model.safetensors",
+  "weights_sha256": "14719be1454d47d536560099f6eb3b54c3c4ecb7ba5774c35429c846bbd2ed7d",
+  "weights_size_bytes": 8197104,
+  "weights_dtype": "float16",
+  "training": {
+    "seed": 42,
+    "steps": 200,
+    "batch_size": 2,
+    "seq_len": 384,
+    "lr": 0.003,
+    "optimizer": "AdamW(betas=(0.9,0.95), wd=0.01, clip=1.0)",
+    "dtype": "bfloat16",
+    "final_loss": 5.544427394866943,
+    "best_loss": 5.5115838050842285,
+    "loss_first": 5.745078086853027,
+    "loss_curve_p50_p90_p99": [
+      5.555176734924316,
+      5.63444709777832,
+      5.745193004608154
+    ]
+  },
+  "env": {
+    "git_commit": "12fff820c625fb39ccc7e7af454a7c38c31181e2",
+    "git_dirty": false,
+    "torch": "2.9.1+cu128",
+    "cuda": "12.8",
+    "device_name": "NVIDIA H100 PCIe",
+    "tilelang": "0.1.9",
+    "transformers": "4.57.1",
+    "triton": "3.5.1",
+    "python": "3.12.12"
+  },
+  "trained_at_utc": "2026-04-29T00:50:45.631822+00:00"
+}
