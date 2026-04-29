@@ -92,14 +92,33 @@ def official_prefill_logits(model, tokens, page_size: int, vocab_size: int, devi
     return out.logits[:, :, :vocab_size].float()
 
 
-def sglang_prefill_and_decode(sg_model, cfg, real_base, decode_tokens, device, dtype):
+def sglang_prefill_and_decode(sg_model, cfg, real_base, decode_tokens, device, dtype,
+                              progress_every: int = 100):
     """Mirror sglang's engine path: prefill `real_base` (with engine-side LMK
-    insertion), then DECODE one token at a time. Returns
-    (prefill_logits[1, eng_len, V], decode_logits_list[V] per step)."""
+    insertion), then DECODE through the full LMK-inserted suffix one engine
+    position at a time.
+
+    Returns:
+        prefill_logits[1, eng_len, V] — fp32 logits over the prefill
+        engine_decode_outputs: list of (engine_position, logits[V] fp32) for
+            every engine step (real-token AND LMK-internal steps). The caller
+            picks which positions to compare; KL on LMK steps is also valid
+            (and informative — divergence on internal steps would point to a
+            kernel bug).
+
+    For decode > (page_size-1) real tokens, the engine inserts LMK tokens at
+    page boundaries (see Req.hsa_decode_postprocess_sampled_token). We mirror
+    that by feeding the precomputed LMK-inserted suffix `fi_full[pl:]` rather
+    than just real tokens.
+    """
     PS = cfg.chunk_size
     lmk_id = int(cfg.vocab_size)
     VS = int(cfg.vocab_size)
-    mc = max(len(real_base) * 2, 512) + len(decode_tokens) * 2 + 1024
+    # KV pool sizing: needs enough room for fi_full + some slack
+    fi_full_len_est = (len(real_base) + len(decode_tokens)) + (
+        (len(real_base) + len(decode_tokens)) // (PS - 1) + 2
+    )
+    mc = max(fi_full_len_est * 2, 512) + 1024
 
     r2t = torch.zeros((1, mc), dtype=torch.int32, device=device)
     pool = MHATokenToKVPool(
@@ -155,10 +174,17 @@ def sglang_prefill_and_decode(sg_model, cfg, real_base, decode_tokens, device, d
     h_normed = sg_model.model.norm(h_prefill)
     prefill_logits = (h_normed @ sg_model.lm_head.weight[:VS, :].t()).float().unsqueeze(0)
 
-    # Decode
+    # Decode through the full LMK-inserted suffix, NOT just the real decode
+    # tokens. fi_full[pl:] is the engine-visible token sequence to feed.
+    fi_full = Req._hsa_insert_lmk_prompt(
+        list(real_base) + list(decode_tokens), page_size=PS, lmk_id=lmk_id,
+    )
+    suffix = fi_full[pl:]  # what the decode loop will iterate over
+    n_steps = len(suffix)
+
     current_len = pl
-    decode_logits = []
-    for tok in decode_tokens:
+    engine_decode_outputs: list[tuple[int, torch.Tensor]] = []
+    for step, tok in enumerate(suffix):
         current_len += 1
         r2t[0, current_len - 1] = tl[current_len - 1]
         dp = compute_decode_positions_landmark(
@@ -181,9 +207,13 @@ def sglang_prefill_and_decode(sg_model, cfg, real_base, decode_tokens, device, d
         if isinstance(h, tuple):
             h = h[0]
         h = sg_model.model.norm(h)
-        logits = (h @ sg_model.lm_head.weight.t())[:, :VS].float()
-        decode_logits.append(logits.view(-1))
-    return prefill_logits, decode_logits
+        logits = (h @ sg_model.lm_head.weight.t())[:, :VS].float().view(-1)
+        # `current_len - 1` is the engine position the input token landed at;
+        # logits predict the token at engine position `current_len`.
+        engine_decode_outputs.append((current_len - 1, logits))
+        if progress_every and (step + 1) % progress_every == 0:
+            print(f'    decode {step + 1}/{n_steps}  engine_pos={current_len - 1}', flush=True)
+    return prefill_logits, engine_decode_outputs
 
 
 def kl_div(p_logits: torch.Tensor, q_logits: torch.Tensor) -> float:
@@ -285,6 +315,10 @@ def main() -> int:
     rng = torch.Generator(device='cpu').manual_seed(args.seed)
     decode_toks_short = torch.randint(5, VS - 5, (8,), generator=rng).tolist()
     decode_toks_long = decode_toks_short[:5]
+    # Long-decode case stresses cross-decode KV writes: the engine must add
+    # newly decoded tokens (and the LMKs auto-inserted at page boundaries) to
+    # the KV cache and have subsequent decode steps correctly attend to them.
+    decode_toks_huge = torch.randint(5, VS - 5, (1024,), generator=rng).tolist()
 
     test_cases = [
         (10, decode_toks_short, 'SHORT 10'),
@@ -295,6 +329,10 @@ def main() -> int:
         (512, decode_toks_long, 'MID 512 (8 pages)'),
         (1024, decode_toks_long, 'MID 1024 (16 pages)'),
         (2048, decode_toks_long, 'LONG 2048 (32 pages)'),
+        # Long prefill + long decode: 16 pages worth of tokens written during
+        # decode itself; later decode steps must select among pages that
+        # include freshly-written ones. This is the case the user flagged.
+        (2048, decode_toks_huge, 'XLONG 2048 + 1024 decode (cross-page decode KV)'),
     ]
 
     summary = []
@@ -313,7 +351,7 @@ def main() -> int:
             continue
 
         try:
-            sg_prefill_logits, sg_decode_logits = sglang_prefill_and_decode(
+            sg_prefill_logits, sg_engine_decode = sglang_prefill_and_decode(
                 sm, sc, real_base, decode_toks, device, dtype,
             )
         except Exception as e:
@@ -334,25 +372,71 @@ def main() -> int:
         else:
             print(f'  PREFILL: shape mismatch off={off_logits.shape} sg={sg_prefill_logits.shape}')
 
-        # Decode: per-step KL
-        all_status = []
-        for i, (tok, sg_l) in enumerate(zip(decode_toks, sg_decode_logits)):
-            current_real = real_base + decode_toks[:i + 1]
-            fi_prev = Req._hsa_insert_lmk_prompt(current_real[:-1], page_size=PS, lmk_id=VS)
-            eng_pos = len(fi_prev)
-            if eng_pos >= off_logits.shape[1]:
+        # Decode: per-engine-position KL (both real-input AND LMK-input steps).
+        # We separate the buckets in the report so a regression on cross-page
+        # decode (LMK-input steps) is easy to spot.
+        kls_real, kls_lmk = [], []
+        argmax_match_real = 0
+        argmax_total_real = 0
+        n_print = 0
+        verbose_threshold = 8  # for short cases, print each step; for long, print summary only
+        is_long = len(sg_engine_decode) > 16
+        for eng_pos, sg_l in sg_engine_decode:
+            if eng_pos >= off_logits.shape[1] - 1:
+                # Off-by-one: official has logits[i] predicting fi_full[i+1]; we
+                # need eng_pos < len(fi_full) for both prefill+decode tokens to
+                # have a defined NEXT prediction. Skip the very last step.
                 continue
             off_l = off_logits[0, eng_pos]
             kl = kl_div(off_l.unsqueeze(0), sg_l.unsqueeze(0))
             am_off = int(off_l.argmax().item())
             am_sg = int(sg_l.argmax().item())
-            mark = 'OK' if am_off == am_sg else 'MISS'
-            st = status(kl)
-            all_status.append(st)
-            print(f'  decode[{i}] tok={tok}: KL={kl:.6f}  argmax off={am_off} sg={am_sg} {mark}  [{st}]')
-        if all_status:
-            worst = max(all_status, key=lambda s: ['IDENTICAL', 'PASS', 'CLOSE', 'WARN', 'FAIL'].index(s))
-            summary.append((desc, 'decode_worst', float('nan'), float('nan'), worst))
+            input_was_lmk = (
+                eng_pos < len(Req._hsa_insert_lmk_prompt(
+                    list(real_base) + list(decode_toks), page_size=PS, lmk_id=VS,
+                )) and Req._hsa_insert_lmk_prompt(
+                    list(real_base) + list(decode_toks), page_size=PS, lmk_id=VS,
+                )[eng_pos] == VS
+            )
+            if input_was_lmk:
+                kls_lmk.append(kl)
+            else:
+                kls_real.append(kl)
+                argmax_total_real += 1
+                if am_off == am_sg:
+                    argmax_match_real += 1
+            if not is_long and n_print < verbose_threshold:
+                mark = 'OK' if am_off == am_sg else 'MISS'
+                tag = '  (LMK input)' if input_was_lmk else ''
+                print(f'  decode@{eng_pos}: KL={kl:.6f}  argmax off={am_off} sg={am_sg} {mark}{tag}  [{status(kl)}]')
+                n_print += 1
+
+        def _bucket_stats(kls):
+            if not kls:
+                return None
+            t = torch.tensor(kls)
+            return {
+                'n': int(t.numel()),
+                'mean': float(t.mean()),
+                'p50': float(t.quantile(0.5)),
+                'p95': float(t.quantile(0.95)),
+                'max': float(t.max()),
+            }
+
+        s_real = _bucket_stats(kls_real)
+        s_lmk = _bucket_stats(kls_lmk)
+        if s_real is not None:
+            print(f'  decode REAL n={s_real["n"]:4d}  KL mean={s_real["mean"]:.6f} '
+                  f'p95={s_real["p95"]:.6f} max={s_real["max"]:.6f}  '
+                  f'argmax_match={argmax_match_real}/{argmax_total_real}={argmax_match_real/max(1,argmax_total_real):.1%}  '
+                  f'[{status(s_real["max"])}]')
+            summary.append((desc, f'decode_real(n={s_real["n"]})', s_real['mean'],
+                            argmax_match_real / max(1, argmax_total_real), status(s_real['max'])))
+        if s_lmk is not None:
+            print(f'  decode LMK  n={s_lmk["n"]:4d}  KL mean={s_lmk["mean"]:.6f} '
+                  f'p95={s_lmk["p95"]:.6f} max={s_lmk["max"]:.6f}  [{status(s_lmk["max"])}]')
+            summary.append((desc, f'decode_lmk(n={s_lmk["n"]})', s_lmk['mean'],
+                            float('nan'), status(s_lmk['max'])))
 
     print(f'\n{"=" * 70}\nSUMMARY\n{"=" * 70}')
     for row in summary:
