@@ -509,7 +509,7 @@ def main() -> int:
                         help='Seed for the synthetic comparison input (independent of train seed).')
     parser.add_argument('--no-stress', action='store_true',
                         help='Skip the sequential-churn stress test at the end.')
-    parser.add_argument('--stress-n', type=int, default=16,
+    parser.add_argument('--stress-n', type=int, default=64,
                         help='Number of requests to run through the shared pool.')
     parser.add_argument('--no-singleshot', action='store_true',
                         help='Skip the per-prefill-length single-request comparison block. '
@@ -730,19 +730,19 @@ def main() -> int:
     # backend cached metadata) must stay consistent.
     # ----------------------------------------------------------------
     if not args.no_stress:
-        # Workload: a mix of short / mid / long prefills + decodes,
-        # repeated to exercise allocator recycling and any cached
-        # per-request state in the HSA backend.
+        # Workload: programmatically sample (prefill, decode) sizes from a
+        # diverse set so any --stress-n is supported. Mix of short / mid /
+        # long prefills + decodes to exercise allocator recycling and any
+        # cached per-request state in the HSA backend across many cycles.
         wl_rng = torch.Generator(device='cpu').manual_seed(args.seed + 7)
-        sizes = [
-            (128, 32), (256, 64), (64, 16), (512, 96),
-            (1024, 64), (256, 128), (128, 96), (768, 48),
-            (1536, 32), (96, 200), (512, 200), (320, 32),
-            (640, 16), (192, 64), (1024, 200), (256, 64),
-        ]
-        sizes = sizes[: args.stress_n]
+        prefill_choices = [64, 96, 128, 192, 256, 320, 384, 512, 640, 768, 1024, 1280, 1536]
+        decode_choices = [16, 32, 48, 64, 96, 128, 160, 200]
         requests: list[tuple[list[int], list[int]]] = []
-        for prefill_len, decode_len in sizes:
+        for _ in range(args.stress_n):
+            pl_idx = int(torch.randint(0, len(prefill_choices), (1,), generator=wl_rng).item())
+            dl_idx = int(torch.randint(0, len(decode_choices), (1,), generator=wl_rng).item())
+            prefill_len = prefill_choices[pl_idx]
+            decode_len = decode_choices[dl_idx]
             real_base = torch.randint(5, VS - 5, (prefill_len,), generator=wl_rng).tolist()
             decode_toks = torch.randint(5, VS - 5, (decode_len,), generator=wl_rng).tolist()
             requests.append((real_base, decode_toks))

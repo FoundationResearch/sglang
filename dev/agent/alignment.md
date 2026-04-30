@@ -97,7 +97,7 @@ git push
 
 `compare.py` runs a sequential-churn block by default (disable with
 `--no-stress`). It builds ONE shared `MHATokenToKVPool` /
-`TokenToKVPoolAllocator` / `ReqToTokenPool`, then drives N=16 requests of
+`TokenToKVPoolAllocator` / `ReqToTokenPool`, then drives N=64 requests of
 varied (prefill, decode) sizes through it back-to-back. After each
 request: alloc → prefill → decode → free → next. The block reports four
 invariants that must hold:
@@ -263,7 +263,11 @@ don't assume their intent.
 - Baseline manifest: `dev/align/manifest.json`.
 - Single-request: all 9 cases PASS, including XLONG 2048+1024 decode
   (1023 real-decode steps, max KL = 0.003634, mean KL = 0.002322).
-- Sequential churn (16 requests, varied sizes 64..1536 prefill + 16..200
-  decode): pool_leak=0, req_leak=0, peak_used=1592/8192, KL_prefill
-  max=0.0027 [PASS], KL_last_decode max=0.0104 [CLOSE on req 4 only,
-  rest PASS].
+- Sequential churn (64 requests, varied sizes 64..1536 prefill + 16..200
+  decode, programmatic workload): pool_leak=0, req_leak=0,
+  peak_used=1690/8192, peak_cuda_mem=253.9MB, cum_mem_growth=+114MB
+  (mostly tilelang JIT cache for the wider shape coverage — bounded
+  by the number of unique shapes, not monotonic per-request). KL prefill
+  max=0.002765 [PASS] (n=64, mean=0.002316, p95=0.002444). KL last-decode
+  max=0.011519 [CLOSE on 1 req of 64, rest PASS] (mean=0.003294,
+  p95=0.005313).
