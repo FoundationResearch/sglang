@@ -216,6 +216,270 @@ def sglang_prefill_and_decode(sg_model, cfg, real_base, decode_tokens, device, d
     return prefill_logits, engine_decode_outputs
 
 
+def sglang_run_one_request(
+    sg_model, cfg, real_base, decode_tokens, device, dtype,
+    *, pool, allocator, req_to_token_pool, backend,
+):
+    """Run a single prefill+decode request through an EXISTING shared pool.
+
+    Allocates KV slots and one req-pool slot at the start, frees everything at
+    the end. Returns:
+      sg_prefill_last (logits at engine pos pl-1, predicts pl)
+      sg_last_decode (logits at last engine pos, predicts the one after)
+      stats dict (used_slots, pool_avail_delta, req_avail_delta, mem_growth_bytes)
+
+    The whole point of this function is that pool/allocator/req_to_token_pool
+    are passed in — across many calls, the pool must NOT leak slots and the
+    backend must NOT carry stale per-request metadata. If either breaks, the
+    `pool_avail_delta` returned will be non-zero or sglang will assert/NaN.
+    """
+    PS = cfg.chunk_size
+    lmk_id = int(cfg.vocab_size)
+    VS = int(cfg.vocab_size)
+
+    fi_base = Req._hsa_insert_lmk_prompt(list(real_base), page_size=PS, lmk_id=lmk_id)
+    fi_full = Req._hsa_insert_lmk_prompt(list(real_base) + list(decode_tokens),
+                                          page_size=PS, lmk_id=lmk_id)
+    pl = len(fi_base)
+    suffix = fi_full[pl:]
+
+    # Baseline (BEFORE alloc)
+    avail_before = allocator.available_size()
+    req_avail_before = req_to_token_pool.available_size()
+    torch.cuda.synchronize()
+    mem_before = torch.cuda.memory_allocated()
+
+    req_idx = req_to_token_pool.alloc(1)
+    if req_idx is None:
+        raise RuntimeError('req_to_token_pool exhausted')
+    req_idx = int(req_idx[0])
+
+    prefill_slots = allocator.alloc(pl)
+    if prefill_slots is None:
+        raise RuntimeError(f'allocator exhausted on prefill: want {pl}, have {avail_before}')
+    req_to_token_pool.req_to_token[req_idx, :pl] = prefill_slots.to(torch.int32)
+    all_slots = [prefill_slots]
+
+    # Prefill
+    ep = torch.tensor([0], device=device, dtype=torch.int32)
+    es = torch.tensor([pl], device=device, dtype=torch.int32)
+    pos, esl = compute_position('hsa', ep, es, pl, page_size=PS, enable_landmark_positions=True)
+    fb = ForwardBatch(
+        forward_mode=ForwardMode.EXTEND, batch_size=1,
+        input_ids=torch.tensor(fi_base, device=device, dtype=torch.int64),
+        req_pool_indices=torch.tensor([req_idx], device=device, dtype=torch.int32),
+        seq_lens=torch.tensor([pl], device=device, dtype=torch.int32),
+        out_cache_loc=prefill_slots,
+        seq_lens_sum=pl,
+        seq_lens_cpu=torch.tensor([pl], device='cpu', dtype=torch.int32),
+        positions=pos, extend_prefix_lens=ep, extend_seq_lens=es,
+        extend_start_loc=esl, extend_prefix_lens_cpu=[0], extend_seq_lens_cpu=[pl],
+        req_to_token_pool=req_to_token_pool, token_to_kv_pool=pool, attn_backend=backend,
+    )
+    backend.init_forward_metadata(fb)
+    with torch.no_grad():
+        h = sg_model.model(fb.input_ids, fb.positions, fb)
+    if isinstance(h, tuple):
+        h = h[0]
+    h = sg_model.model.norm(h)
+    sg_prefill_last = (h[-1:] @ sg_model.lm_head.weight[:VS, :].t()).float().view(-1)
+
+    # Decode through full suffix
+    current_len = pl
+    sg_last_decode = None
+    for tok in suffix:
+        current_len += 1
+        new_slot = allocator.alloc(1)
+        if new_slot is None:
+            raise RuntimeError(f'allocator exhausted at decode pos {current_len - 1}')
+        req_to_token_pool.req_to_token[req_idx, current_len - 1] = new_slot.to(torch.int32)
+        all_slots.append(new_slot)
+        dp = compute_decode_positions_landmark(
+            torch.tensor([current_len], device=device, dtype=torch.int32), page_size=PS,
+        )
+        fbd = ForwardBatch(
+            forward_mode=ForwardMode.DECODE, batch_size=1,
+            input_ids=torch.tensor([tok], device=device, dtype=torch.int64),
+            req_pool_indices=torch.tensor([req_idx], device=device, dtype=torch.int32),
+            seq_lens=torch.tensor([current_len], device=device, dtype=torch.int32),
+            out_cache_loc=new_slot,
+            seq_lens_sum=current_len,
+            seq_lens_cpu=torch.tensor([current_len], device='cpu', dtype=torch.int32),
+            positions=dp, req_to_token_pool=req_to_token_pool,
+            token_to_kv_pool=pool, attn_backend=backend,
+        )
+        backend.init_forward_metadata(fbd)
+        with torch.no_grad():
+            h = sg_model.model(fbd.input_ids, fbd.positions, fbd)
+        if isinstance(h, tuple):
+            h = h[0]
+        h = sg_model.model.norm(h)
+        sg_last_decode = (h @ sg_model.lm_head.weight.t())[:, :VS].float().view(-1)
+
+    used_slots = sum(int(s.numel()) for s in all_slots)
+
+    # Free everything
+    all_idx = torch.cat([s.flatten() for s in all_slots]).to(torch.int64)
+    allocator.free(all_idx)
+    req_to_token_pool.free(req_idx)
+    torch.cuda.synchronize()
+    mem_after = torch.cuda.memory_allocated()
+
+    return {
+        'sg_prefill_last': sg_prefill_last,
+        'sg_last_decode': sg_last_decode,
+        'engine_len': len(fi_full),
+        'used_slots': used_slots,
+        'pool_avail_delta': avail_before - allocator.available_size(),
+        'req_avail_delta': req_avail_before - req_to_token_pool.available_size(),
+        'mem_growth': mem_after - mem_before,
+    }
+
+
+def stress_sequential_churn(sg_model, om, cfg_dict, dtype, device,
+                            requests, max_ctx=8192, num_req_slots=4):
+    """Run many requests through ONE shared sglang pool.
+
+    For each request, also forwards the same input through the official model
+    and compares prefill-end + last-decode logits via KL. The cross-request
+    invariants we're checking:
+
+      * Pool slot reuse: `pool_avail_delta` must be 0 after every request
+        (we freed exactly what we allocated).
+      * Req-pool slot reuse: same for req_to_token_pool.
+      * No CUDA memory growth across requests (a leak in the backend's
+        cached metadata would show as monotonic mem growth).
+      * Per-request alignment stays in PASS band — if cross-request state
+        pollution is corrupting one path, KL on later requests will jump.
+    """
+    from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
+    from sglang.srt.mem_cache.allocator import TokenToKVPoolAllocator
+
+    PS = cfg_dict['chunk_size']
+    VS = int(cfg_dict['vocab_size'])
+
+    pool = MHATokenToKVPool(
+        size=max_ctx, page_size=PS, dtype=dtype,
+        head_num=int(cfg_dict['num_key_value_heads']),
+        head_dim=int(cfg_dict['head_dim']),
+        layer_num=int(cfg_dict['num_hidden_layers']),
+        device=device, enable_memory_saver=False, enable_alt_stream=False,
+    )
+    allocator = TokenToKVPoolAllocator(
+        size=max_ctx, dtype=torch.int64, device=device, kvcache=pool, need_sort=False,
+    )
+    req_to_token_pool = ReqToTokenPool(
+        size=num_req_slots, max_context_len=max_ctx,
+        device=str(device), enable_memory_saver=False,
+    )
+    initial_alloc = allocator.available_size()
+    initial_req = req_to_token_pool.available_size()
+
+    # Backend wants a model_runner-shaped object; reuse the same fake one each call.
+    mr = types.SimpleNamespace(
+        device=device, page_size=PS, sliding_window_size=None, model=sg_model,
+        model_config=types.SimpleNamespace(
+            is_encoder_decoder=False, context_len=max_ctx,
+            num_attention_heads=int(cfg_dict['num_attention_heads']),
+            get_num_kv_heads=lambda tp: int(cfg_dict['num_key_value_heads']) // tp,
+        ),
+        hybrid_gdn_config=None, kimi_linear_config=None, gpu_id=0,
+        server_args=types.SimpleNamespace(
+            attention_backend='hsa', speculative_num_draft_tokens=0, speculative_num_steps=0,
+            triton_attention_num_kv_splits=8, triton_attention_split_tile_size=None,
+            enable_deterministic_inference=False, hsa_topk=None, hsa_selection_strategy=None,
+            hsa_layers=None, hsa_window_size=None, hsa_enable_swa_merging=None, hsa_lmk_id=VS,
+        ),
+    )
+    mr.req_to_token_pool = req_to_token_pool
+    mr.token_to_kv_pool = pool
+    mr.token_to_kv_pool_allocator = allocator
+    backend = HSAAttnBackend(mr)
+
+    cfg_for_request = types.SimpleNamespace(
+        chunk_size=PS, vocab_size=VS,
+        num_key_value_heads=int(cfg_dict['num_key_value_heads']),
+        head_dim=int(cfg_dict['head_dim']),
+        num_hidden_layers=int(cfg_dict['num_hidden_layers']),
+        num_attention_heads=int(cfg_dict['num_attention_heads']),
+    )
+
+    print(f'\n{"=" * 70}\nSEQUENTIAL CHURN: {len(requests)} requests through one pool '
+          f'(size={max_ctx}, req_slots={num_req_slots})\n{"=" * 70}')
+    print(f'  initial pool_avail={initial_alloc}  req_avail={initial_req}')
+
+    rows = []
+    peak_used = 0
+    peak_mem = 0
+    cum_mem_growth = 0
+
+    for i, (real_base, decode_toks) in enumerate(requests):
+        # 1) sglang run
+        out = sglang_run_one_request(
+            sg_model, cfg_for_request, real_base, decode_toks, device, dtype,
+            pool=pool, allocator=allocator, req_to_token_pool=req_to_token_pool, backend=backend,
+        )
+        cum_mem_growth += int(out['mem_growth'])
+        peak_used = max(peak_used, out['used_slots'])
+        peak_mem = max(peak_mem, int(torch.cuda.max_memory_allocated()))
+
+        # 2) official reference (single forward of full sequence)
+        real_full = list(real_base) + list(decode_toks)
+        try:
+            off_logits = official_prefill_logits(om, real_full, PS, VS, device)
+        except Exception as e:
+            print(f'  [req {i}] OFFICIAL FORWARD FAILED: {e}')
+            continue
+
+        # 3) KL on prefill-end (engine pos pl-1) and last-decode (engine pos engine_len-2)
+        fi_base = Req._hsa_insert_lmk_prompt(real_base, page_size=PS, lmk_id=VS)
+        pl = len(fi_base)
+        kl_prefill = kl_div(off_logits[0, pl - 1].unsqueeze(0),
+                            out['sg_prefill_last'].unsqueeze(0))
+        if out['sg_last_decode'] is not None and out['engine_len'] >= 2:
+            kl_decode = kl_div(off_logits[0, out['engine_len'] - 2].unsqueeze(0),
+                               out['sg_last_decode'].unsqueeze(0))
+        else:
+            kl_decode = float('nan')
+
+        leak_alloc = out['pool_avail_delta']
+        leak_req = out['req_avail_delta']
+        rows.append({
+            'i': i, 'prefill': len(real_base), 'decode': len(decode_toks),
+            'engine_len': out['engine_len'], 'used_slots': out['used_slots'],
+            'leak_alloc': leak_alloc, 'leak_req': leak_req,
+            'kl_prefill': kl_prefill, 'kl_decode': kl_decode,
+            'mem_growth_kb': int(out['mem_growth']) // 1024,
+        })
+        leak_flag = '!!LEAK!!' if (leak_alloc != 0 or leak_req != 0) else 'OK'
+        print(f'  req {i:2d}  prefill={len(real_base):5d}  decode={len(decode_toks):4d}  '
+              f'used={out["used_slots"]:5d}  leak={leak_alloc:+d}/{leak_req:+d} {leak_flag}  '
+              f'KL pf={kl_prefill:.6f} dec={kl_decode:.6f}  '
+              f'mem_growth={out["mem_growth"] / 1024:+.1f}KB')
+
+    final_alloc = allocator.available_size()
+    final_req = req_to_token_pool.available_size()
+    print(f'\n  FINAL pool_avail={final_alloc}/{initial_alloc}  '
+          f'req_avail={final_req}/{initial_req}  '
+          f'pool_leak_total={initial_alloc - final_alloc}  '
+          f'req_leak_total={initial_req - final_req}')
+    print(f'  peak_used_slots={peak_used}/{initial_alloc}  '
+          f'peak_cuda_mem={peak_mem / 1e6:.1f}MB  '
+          f'cum_mem_growth={cum_mem_growth / 1e6:+.2f}MB')
+    if rows:
+        kls_pf = [r['kl_prefill'] for r in rows]
+        kls_dec = [r['kl_decode'] for r in rows if r['kl_decode'] == r['kl_decode']]  # drop NaN
+        kp = torch.tensor(kls_pf)
+        kd = torch.tensor(kls_dec) if kls_dec else None
+        print(f'  KL prefill   n={len(kls_pf):3d}  mean={kp.mean():.6f}  '
+              f'p95={kp.quantile(0.95):.6f}  max={kp.max():.6f}  [{status(float(kp.max()))}]')
+        if kd is not None:
+            print(f'  KL last-dec  n={len(kls_dec):3d}  mean={kd.mean():.6f}  '
+                  f'p95={kd.quantile(0.95):.6f}  max={kd.max():.6f}  [{status(float(kd.max()))}]')
+    pool_leaked = (final_alloc != initial_alloc) or (final_req != initial_req)
+    return rows, pool_leaked
+
+
 def kl_div(p_logits: torch.Tensor, q_logits: torch.Tensor) -> float:
     """KL(softmax(p) || softmax(q)) — one scalar."""
     p = torch.softmax(p_logits, dim=-1)
@@ -243,6 +507,13 @@ def main() -> int:
     parser.add_argument('--no-verify-sha', action='store_true')
     parser.add_argument('--seed', type=int, default=123,
                         help='Seed for the synthetic comparison input (independent of train seed).')
+    parser.add_argument('--no-stress', action='store_true',
+                        help='Skip the sequential-churn stress test at the end.')
+    parser.add_argument('--stress-n', type=int, default=16,
+                        help='Number of requests to run through the shared pool.')
+    parser.add_argument('--no-singleshot', action='store_true',
+                        help='Skip the per-prefill-length single-request comparison block. '
+                             'Useful if you only care about pool-management correctness.')
     args = parser.parse_args()
 
     manifest_path = Path(args.manifest).resolve()
@@ -336,6 +607,9 @@ def main() -> int:
     ]
 
     summary = []
+    if args.no_singleshot:
+        print('\n[compare] --no-singleshot: skipping per-prefill-length single-request block')
+        test_cases = []
     for n_prefill, decode_toks, desc in test_cases:
         # Use deterministic synthetic input — independent rng so prompt is reproducible
         prompt_rng = torch.Generator(device='cpu').manual_seed(args.seed * 1000 + n_prefill)
@@ -447,6 +721,43 @@ def main() -> int:
     print('\nKL bands: IDENTICAL <0.001 | PASS <0.01 | CLOSE <0.1 | WARN <1.0 | FAIL >=1.0')
     print('Top-k selection noise should look like CLOSE/WARN at most for trained weights;')
     print('persistent FAIL on prefill or decode points to a real backend bug.')
+
+    # ----------------------------------------------------------------
+    # Sequential-churn stress: many requests through one shared pool.
+    # This is what the engine-level benchmark sees — each new request
+    # gets fresh slots, the previous request's slots are returned, and
+    # cross-request bookkeeping (req_to_token, allocator free list,
+    # backend cached metadata) must stay consistent.
+    # ----------------------------------------------------------------
+    if not args.no_stress:
+        # Workload: a mix of short / mid / long prefills + decodes,
+        # repeated to exercise allocator recycling and any cached
+        # per-request state in the HSA backend.
+        wl_rng = torch.Generator(device='cpu').manual_seed(args.seed + 7)
+        sizes = [
+            (128, 32), (256, 64), (64, 16), (512, 96),
+            (1024, 64), (256, 128), (128, 96), (768, 48),
+            (1536, 32), (96, 200), (512, 200), (320, 32),
+            (640, 16), (192, 64), (1024, 200), (256, 64),
+        ]
+        sizes = sizes[: args.stress_n]
+        requests: list[tuple[list[int], list[int]]] = []
+        for prefill_len, decode_len in sizes:
+            real_base = torch.randint(5, VS - 5, (prefill_len,), generator=wl_rng).tolist()
+            decode_toks = torch.randint(5, VS - 5, (decode_len,), generator=wl_rng).tolist()
+            requests.append((real_base, decode_toks))
+
+        # Reset peak so the stress block reports its own peak GPU memory.
+        torch.cuda.reset_peak_memory_stats()
+        rows, leaked = stress_sequential_churn(
+            sm, om, cfg_dict, dtype, device, requests,
+            max_ctx=8192, num_req_slots=4,
+        )
+        if leaked:
+            print('  [stress] !!! POOL LEAK DETECTED — see per-request rows above')
+        else:
+            print('  [stress] no pool leaks: every alloc was matched by a free.')
+
     return 0
 
 
