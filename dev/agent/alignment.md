@@ -93,7 +93,36 @@ git commit -m "align: retrain after <change description>
 git push
 ```
 
-## 5. The XLONG case (don't skip it)
+## 5a. Sequential-churn stress (the benchmark proxy)
+
+`compare.py` runs a sequential-churn block by default (disable with
+`--no-stress`). It builds ONE shared `MHATokenToKVPool` /
+`TokenToKVPoolAllocator` / `ReqToTokenPool`, then drives N=16 requests of
+varied (prefill, decode) sizes through it back-to-back. After each
+request: alloc → prefill → decode → free → next. The block reports four
+invariants that must hold:
+
+  * `pool_avail_delta == 0` per request: every alloc was matched by a free.
+  * `req_avail_delta == 0` per request: same for the request-pool.
+  * Cumulative CUDA memory growth bounded (workspace variation is fine;
+    monotonic growth is a leak).
+  * Per-request KL stays in PASS (with occasional CLOSE on noisy decodes
+    is acceptable; persistent CLOSE/WARN means cross-request state is
+    bleeding through).
+
+The shared pool is sized at 8192 slots; peak observed in the default
+workload is ~1600 slots, so the test exercises recycling, not capacity.
+If you change the workload to push peak slots > 4096, increase
+`max_ctx` in the call from `main()`.
+
+Why this is the right benchmark proxy: the engine-level benchmark in
+`bench_hsa_overhead.py` / `bench_hsa_vs_fullattn.py` does many requests
+through a long-lived scheduler; if the HSA backend caches per-request
+metadata across `init_forward_metadata` calls without resetting it, the
+benchmark will silently produce wrong logits on later requests. The
+churn stress catches that without spinning up the full Scheduler.
+
+## 5b. The XLONG case (don't skip it)
 
 `compare.py` includes a **XLONG 2048 + 1024 decode** test case. This is the
 only case that exercises:
@@ -182,6 +211,22 @@ Use `decode_toks_huge` (1024 random tokens) when you specifically want to
 stress decode-write KV. Use shorter lists otherwise — long decode is ~30s
 per case on H100.
 
+## 8b. Known gaps
+
+**Batch_size > 1 in a single `ForwardBatch` is not covered here.** The
+sequential-churn block uses batch_size=1 per request. The existing
+pytest e2e tests
+`test_innerx_radix_kv_reuse_end_to_end_gpu.py`,
+`test_innerx_radix_branching_prefix_reuse_end_to_end_gpu.py`,
+`test_hsa_swa_dual_pool_eviction_gpu.py`,
+and `test_innerx_model_runner_like_end_to_end_decode_gpu.py`
+exercise B>1 and currently fail with NaN (43/47 pytest pass). Don't
+add a B>1 stress to `compare.py` until those tests are green —
+otherwise this harness will start failing for the same reason and
+muddy the alignment signal. When those tests are fixed, add a
+`stress_batched_decode` block that prefills 2-4 requests separately
+then runs a single batched decode step with `batch_size=B`.
+
 ## 9. Architectural changes that need wider thought (don't auto-resolve)
 
 If the user wants to:
@@ -216,5 +261,9 @@ don't assume their intent.
 - 2026-04-28, on H100 PCIe 80GB, alexsg env (torch 2.9.1+cu128,
   tilelang 0.1.9, transformers 4.57.1, triton 3.5.1, liger_kernel 0.7.0).
 - Baseline manifest: `dev/align/manifest.json`.
-- Result: all 9 cases PASS, including XLONG 2048+1024 decode (1023
-  real-decode steps, max KL = 0.003634, mean KL = 0.002322).
+- Single-request: all 9 cases PASS, including XLONG 2048+1024 decode
+  (1023 real-decode steps, max KL = 0.003634, mean KL = 0.002322).
+- Sequential churn (16 requests, varied sizes 64..1536 prefill + 16..200
+  decode): pool_leak=0, req_leak=0, peak_used=1592/8192, KL_prefill
+  max=0.0027 [PASS], KL_last_decode max=0.0104 [CLOSE on req 4 only,
+  rest PASS].
