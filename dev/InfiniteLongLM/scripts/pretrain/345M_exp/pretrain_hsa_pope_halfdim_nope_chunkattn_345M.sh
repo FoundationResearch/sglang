@@ -1,0 +1,7 @@
+export MODEL_CONFIG="configs/flash_hsa/config_hsa_pope_halfdim_nope_chunkattn_345M.json"
+export CORPUS_PATH="/apdcephfs_sh8/share_300719895/shared/data/dolma3_mix-6T-1025-partial-tokenized/"
+export MAX_SEQ_LEN=8192
+export WANDB_NAME="lhsa_headwise_wqproj_8KA2K_wonoise_pope_halfdim_nope_chunkattn_345M"
+export OUTPUT_DIR="/apdcephfs_tj5/share_300719894/user/qqzxywei/wxy/checkpoints/lhsa_headwise_wqproj_8KA2K_wonoise_pope_halfdim_nope_chunkattn_345M"
+export GRADIENT_CKPT=true
+bash scripts/pretrain/pretrain_ruler_task_5per_345M.sh

@@ -1253,7 +1253,7 @@ def online_softmax_topk_head(
     bias: torch.Tensor = None,
     use_gumbel: bool = False,
     gumbel_noise: torch.Tensor = None,
-    G: Optional[int] = None,
+    G: int = 1,
 ):
     """
     Functional API for SoftmaxTopKMaxPooling_Fused
@@ -1269,9 +1269,11 @@ def online_softmax_topk_head(
             Query tensor。shape = [B, L, h_q, D]
         lmks (torch.Tensor):
             Landmark key tensor。shape = [B, S, h_lmk, D]
-            * 默认（``G=None``）：``h_lmk == h_kv``，按 GQA/MQA 共享 K，``G = h_q // h_lmk``。
-            * 显式传 ``G``：要求 ``h_lmk == h_q``（per-q-head lmks），
-              此时 ``h_kv = h_q // G``，K 不再在 group 内共享。
+            ``G`` 表示 lmks 头数相对 KV-head 的复制因子，即 ``h_lmk == h_kv * G``：
+            * ``G == 1``（默认）：``h_lmk == h_kv``，K 在 group 内共享（标准 GQA/MQA），
+              kernel 内部自动按 ``G_kernel = h_q // h_kv`` 划分 query group。
+            * ``G > 1``：``h_lmk == h_q``（per-q-head lmks），K 不在 group 内共享，
+              此时 ``h_kv = h_q // G``，topk 仍在 ``h_kv`` 维度上做（max over G）。
             注意: 如果 lmks 的 D 维度是 q 的整数倍（D_lmk = D_q * ratio），会自动
             reshape 为 [B, S, h_lmk * ratio, D_q] 来对齐头维度。
         lse_swa (torch.Tensor):
@@ -1303,11 +1305,11 @@ def online_softmax_topk_head(
             provided, it overrides internal generation and is useful for
             deterministic ref/fused consistency tests. No gradient is
             propagated to gumbel_noise.
-        G (int, optional):
-            Query group size. 当显式传入时强制走 per-q-head lmks 路径：
-            要求 ``lmks.shape[2] == q.shape[2] == h_q``，
-            ``h_kv = h_q // G``，topk 仍在 ``h_kv`` 维度上做（max over G）。
-            ``G=None`` 时退回旧逻辑：``h_kv = lmks.shape[2]``，``G = h_q // h_kv``。
+        G (int, optional, default=1):
+            ``lmks`` 相对 KV-head 的头数复制因子，即 ``h_lmk = h_kv * G``。
+            ``G == 1`` 走共享 K 路径（标准 GQA/MQA）；``G > 1`` 走 per-q-head 路径，
+            要求 ``lmks.shape[2] == q.shape[2] == h_q``，``h_kv = h_q // G``，
+            topk 仍在 ``h_kv`` 维度上做（max over G）。
 
     Returns:
         tuple[torch.Tensor, torch.Tensor]: (indices, scores)
@@ -1328,14 +1330,17 @@ def online_softmax_topk_head(
             lmks = lmks.reshape(lmks.shape[0], lmks.shape[1], lmks_h * d_ratio, D)
             lmks_h = lmks_h * d_ratio
         
-        if G is None:
+        if G == 1:
+            # Shared-K path: lmks already at h_kv granularity, kernel infers
+            # query-group fanout from h_q / h_kv internally.
             assert h_q % lmks_h == 0, f"h_q ({h_q}) must be divisible by lmks_h ({lmks_h})"
             h_kv = lmks_h
             G_eff = h_q // h_kv
             per_qhead_lmks = False
         else:
+            # Per-q-head lmks: lmks_h carries h_q heads, h_kv = h_q // G.
             assert lmks_h == h_q, (
-                f"when G is given, lmks must have h_q ({h_q}) heads, got {lmks_h}"
+                f"when G>1, lmks must have h_q ({h_q}) heads, got {lmks_h}"
             )
             assert h_q % G == 0, f"h_q ({h_q}) must be divisible by G ({G})"
             h_kv = h_q // G
@@ -1352,12 +1357,14 @@ def online_softmax_topk_head(
             d_ratio = D_lmk // D
             lmks = lmks.reshape(lmks.shape[0], lmks.shape[1], lmks.shape[2] * d_ratio, D)
         lmks_h = lmks.shape[2]
-        if G is None:
+        if G == 1:
+            # Shared-K path: lmks should be at h_kv granularity. Tolerate
+            # lmks_h == h_q (per-q-head lmks layout) for backward compat with
+            # callers passing 5D q without specifying G.
             if lmks_h == h_kv:
                 per_qhead_lmks = False
                 G_eff = G_in
             elif lmks_h == h_q:
-                # 5D q + per-q-head lmks 但没显式传 G：按 q 的 (h_kv, G_in) 当 GQA 处理
                 per_qhead_lmks = True
                 G_eff = G_in
             else:
@@ -1366,7 +1373,7 @@ def online_softmax_topk_head(
                 )
         else:
             assert lmks_h == h_q, (
-                f"when G is given, lmks must have h_q ({h_q}) heads, got {lmks_h}"
+                f"when G>1, lmks must have h_q ({h_q}) heads, got {lmks_h}"
             )
             assert h_q % G == 0, f"h_q ({h_q}) must be divisible by G ({G})"
             new_h_kv = h_q // G
@@ -2537,20 +2544,20 @@ if __name__ == "__main__":
         "train_perqhead_nondiv_999", 2, 999, 999, 2, 8, 128, 16, 64, 64, True, 0, True, False, True
     )
 
-    # ===== 补充覆盖：is_causal=False、推理 per_qhead、drop_mask、G=1、gumbel+非整除 =====
-    # 推理模式 per_qhead（B=1）
+    # # ===== 补充覆盖：推理 per_qhead+bias、G=1+per_qhead+bias、gumbel+非整除 =====
+    # 推理模式 per_qhead + bias（生产部署最关键路径）
     test_train_inference_correctness(
-        "infer_perqhead_prefill", 1, 1024, 1024, 2, 8, 128, 16, 64, 64, False, 0, False, False, True
+        "infer_perqhead_prefill_bias", 1, 1024, 1024, 2, 8, 128, 16, 64, 64, False, 0, True, False, True
     )
     test_train_inference_correctness(
-        "infer_perqhead_chunk2", 1, 1024, 2048, 2, 8, 128, 16, 64, 64, False, 1024, False, False, True
+        "infer_perqhead_chunk2_bias", 1, 1024, 2048, 2, 8, 128, 16, 64, 64, False, 1024, True, False, True
     )
     test_train_inference_correctness(
-        "infer_perqhead_decode", 1, 1, 2049, 2, 8, 128, 16, 64, 64, False, 2048, False, False, True
+        "infer_perqhead_decode_bias", 1, 1, 2049, 2, 8, 128, 16, 64, 64, False, 2048, True, False, True
     )
-    # G=1（无 GQA）+ per_qhead，应等价于 shared 路径
+    # G=1（无 GQA 倍率）+ per_qhead + bias，回归 immutable g 变量 bug
     test_train_inference_correctness(
-        "train_perqhead_G1", 2, 1024, 1024, 4, 1, 128, 16, 64, 64, True, 0, True, False, True
+        "train_perqhead_G1_bias", 2, 1024, 1024, 4, 1, 128, 16, 64, 64, True, 0, True, False, True
     )
     # gumbel + 非整除长度
     test_train_inference_correctness(

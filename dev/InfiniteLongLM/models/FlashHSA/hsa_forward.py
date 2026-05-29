@@ -7,6 +7,7 @@ from utils.flex_attn import cu_seqlens_to_doc_ids
 import torch
 import torch.nn.functional as F
 from transformers.cache_utils import Cache, DynamicCache, DynamicLayer
+from transformers.masking_utils import create_causal_mask, create_sliding_window_causal_mask
 from transformers.modeling_flash_attention_utils import FlashAttentionKwargs
 from transformers.modeling_outputs import BaseModelOutputWithPast, CausalLMOutputWithPast
 from transformers.processing_utils import Unpack
@@ -58,7 +59,19 @@ def hsa_model_forward(
         raise ValueError("The `past_key_values` should be either a `Cache` object or `None`.")
 
     if inputs_embeds is None:
-        inputs_embeds = self.embed_tokens(input_ids)
+        lmk_embed = getattr(self, "lmk_embed", None)
+        if lmk_embed is not None:
+            lmk_id = self.lmk_id  # guaranteed non-None when lmk_embed exists
+            lmk_mask = input_ids == lmk_id                                  # (B, L) bool
+            safe_ids = input_ids.masked_fill(lmk_mask, 0)
+            inputs_embeds = self.embed_tokens(safe_ids)                     # (B, L, D)
+            inputs_embeds = torch.where(
+                lmk_mask.unsqueeze(-1),                                     # (B, L, 1)
+                lmk_embed.to(inputs_embeds.dtype),                          # (D,) broadcast
+                inputs_embeds,
+            )
+        else:
+            inputs_embeds = self.embed_tokens(input_ids)
 
     if use_cache and past_key_values is None:
         past_key_values = DynamicCache()
@@ -89,11 +102,21 @@ def hsa_model_forward(
             {"cu_seq_lens_q": cu_q, "cu_seq_lens_k": cu_k, "max_length_q": max_q, "max_length_k": max_k, "doc_ids": doc_ids}
         )
 
-    # --- attention mask (arch-specific) ---
     if prepare_attention_mask_fn is not None:
         causal_mask_mapping = prepare_attention_mask_fn(self, attention_mask, inputs_embeds, cache_position, past_key_values, position_ids)
     else:
-        causal_mask_mapping = None
+        _mask_kwargs = {
+            "config": self.config,
+            "input_embeds": inputs_embeds,
+            "attention_mask": attention_mask,
+            "cache_position": cache_position,
+            "past_key_values": past_key_values,
+            "position_ids": position_ids,
+        }
+        causal_mask_mapping = {
+            "full_attention": create_causal_mask(**_mask_kwargs),
+            "sliding_attention": create_sliding_window_causal_mask(**_mask_kwargs),
+        }
 
     hidden_states = inputs_embeds
     position_embeddings = self.rotary_emb(hidden_states, position_ids)
@@ -105,12 +128,13 @@ def hsa_model_forward(
     all_hidden_states = () if output_hidden_states else None
     all_self_attns = () if output_attentions else None
 
-    for decoder_layer in self.layers[: self.config.num_hidden_layers]:
+    for layer_idx, decoder_layer in enumerate(self.layers[: self.config.num_hidden_layers]):
         if output_hidden_states:
             all_hidden_states += (hidden_states,)
 
         layer_outputs = decoder_layer(
             hidden_states,
+            attention_mask=causal_mask_mapping[self.config.layer_types[layer_idx]],
             position_ids=position_ids,
             past_key_values=past_key_values,
             output_attentions=output_attentions,

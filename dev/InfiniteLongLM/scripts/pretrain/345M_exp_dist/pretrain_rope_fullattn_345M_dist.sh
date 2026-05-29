@@ -1,0 +1,9 @@
+export MODEL_CONFIG="configs/swan_gpt_tiny/config_rope_full_theta10000_345M.json"
+export CORPUS_PATH="/apdcephfs_sh8/share_300719895/shared/data/dolma3_mix-6T-1025-partial-tokenized/"
+export MAX_SEQ_LEN=8192
+export WANDB_NAME="rope_full_theta10000_345M_dist"
+export OUTPUT_DIR="/apdcephfs_tj5/share_300719894/user/qqzxywei/wxy/checkpoints/rope_full_theta10000_345M_dist"
+export GRADIENT_CKPT=false
+export MICRO_BATCH_SIZE=4
+export GLOBAL_BATCH_SIZE=128
+bash scripts/pretrain/pretrain_ruler_task_5per_345M_dist.sh

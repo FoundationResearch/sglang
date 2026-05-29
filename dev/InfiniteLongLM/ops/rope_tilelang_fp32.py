@@ -247,46 +247,50 @@ def hsa_intra_chunk_rope_autograd(q, k, q_cos, q_sin, k_cos, k_sin):
     pass_configs={
         tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: True,
     })
-def single_tensor_rope_kernel(batch, seq_len, heads, dim, threads=64):
-    dtype = "bfloat16"
+def single_tensor_rope_kernel(batch, seq_len, heads, dim, cos_sin_dtype="bfloat16", threads=64):
+    # X (q/k) is always bfloat16; cos/sin and output follow cos_sin_dtype.
+    # When cos_sin_dtype == "float32", all computation stays in fp32 with no casting.
+    x_dtype = "bfloat16"
     compute_dtype = "float32"
-    
+
     assert dim % 2 == 0
     dim_half = dim // 2
 
     @T.prim_func
     def main(
-        X: T.Buffer((batch, seq_len, heads, dim), dtype),
-        X_cos: T.Buffer((seq_len, dim), dtype),
-        X_sin: T.Buffer((seq_len, dim), dtype),
-        X_out: T.Buffer((batch, seq_len, heads, dim), dtype),
+        X: T.Buffer((batch, seq_len, heads, dim), x_dtype),
+        X_cos: T.Buffer((seq_len, dim), cos_sin_dtype),
+        X_sin: T.Buffer((seq_len, dim), cos_sin_dtype),
+        X_out: T.Buffer((batch, seq_len, heads, dim), cos_sin_dtype),
     ):
         total_tokens = batch * seq_len
         with T.Kernel(total_tokens, threads=threads) as bx:
             b_idx = bx // seq_len
             l_idx = bx % seq_len
-            
+
             cos_lo = T.alloc_fragment((dim_half,), compute_dtype)
             sin_lo = T.alloc_fragment((dim_half,), compute_dtype)
             cos_hi = T.alloc_fragment((dim_half,), compute_dtype)
             sin_hi = T.alloc_fragment((dim_half,), compute_dtype)
-            
+
             for d in T.Parallel(dim_half):
+                # T.cast is a no-op when cos_sin_dtype == compute_dtype (fp32)
                 cos_lo[d] = T.cast(X_cos[l_idx, d], compute_dtype)
                 sin_lo[d] = T.cast(X_sin[l_idx, d], compute_dtype)
                 cos_hi[d] = T.cast(X_cos[l_idx, d + dim_half], compute_dtype)
                 sin_hi[d] = T.cast(X_sin[l_idx, d + dim_half], compute_dtype)
-            
+
             for h in T.unroll(heads):
                 for d in T.Parallel(dim_half):
                     x1 = T.cast(X[b_idx, l_idx, h, d], compute_dtype)
                     x2 = T.cast(X[b_idx, l_idx, h, d + dim_half], compute_dtype)
-                    
+
                     o1 = x1 * cos_lo[d] - x2 * sin_lo[d]
                     o2 = x2 * cos_hi[d] + x1 * sin_hi[d]
-                    
-                    X_out[b_idx, l_idx, h, d] = T.cast(o1, dtype)
-                    X_out[b_idx, l_idx, h, d + dim_half] = T.cast(o2, dtype)
+
+                    # cast result back to output dtype (no-op when cos_sin_dtype == fp32)
+                    X_out[b_idx, l_idx, h, d] = T.cast(o1, cos_sin_dtype)
+                    X_out[b_idx, l_idx, h, d + dim_half] = T.cast(o2, cos_sin_dtype)
 
     return main
 
@@ -300,32 +304,40 @@ def _single_tensor_rope(x, x_cos, x_sin):
         x_sin = x_sin[0]
     x_cos = x_cos.contiguous()
     x_sin = x_sin.contiguous()
-    kernel_func = single_tensor_rope_kernel(B, L, H, D)
+    # Select kernel variant based on actual cos/sin dtype
+    if x_cos.dtype == torch.float32:
+        cos_sin_dtype = "float32"
+    else:
+        cos_sin_dtype = "bfloat16"
+    kernel_func = single_tensor_rope_kernel(B, L, H, D, cos_sin_dtype)
     return kernel_func(x, x_cos, x_sin)
 
 
 class SingleTensorRoPEFunction(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x, x_cos, x_sin):
+        x_dtype = x.dtype
         x_out = _single_tensor_rope(x, x_cos, x_sin)
         ctx.save_for_backward(x_cos, x_sin)
-        return x_out
+        ctx.x_dtype = x_dtype
+        # When cos/sin are fp32 the kernel returns fp32; cast back to input dtype
+        return x_out.to(x_dtype)
 
     @staticmethod
     def backward(ctx, dx):
         x_cos, x_sin = ctx.saved_tensors
         dx_out = _single_tensor_rope(dx.contiguous(), x_cos, -x_sin)
-        return dx_out, None, None
+        return dx_out.to(ctx.x_dtype), None, None
 
 
 def single_tensor_rope_autograd(x, x_cos, x_sin):
     """
     Args:
         x:     (B, L, H, D)  — BF16
-        x_cos: (B, L, D) — BF16
-        x_sin: (B, L, D) — BF16
+        x_cos: (B, L, D) — BF16 or FP32
+        x_sin: (B, L, D) — BF16 or FP32
     Returns:
-        x_out: (B, L, H, D) — BF16
+        x_out: (B, L, H, D) — same dtype as x (BF16)
     """
     return SingleTensorRoPEFunction.apply(x, x_cos, x_sin)
 

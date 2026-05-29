@@ -23,6 +23,8 @@ def _chunk_attn_pool_impl(
     mu_q: torch.Tensor,
     k_chunked: torch.Tensor,
     sm_scale: float,
+    compact_lmk_k: bool,
+    compressed_lmk_k: bool,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Inner math of ``chunk_attn_pool`` (compileable).
 
@@ -32,16 +34,42 @@ def _chunk_attn_pool_impl(
 
     Inputs are validated by the caller; this fn assumes::
 
-        mu_q:      (B, N, H, D), any dtype
-        k_chunked: (B, N, S, H, D), any dtype, S: chunk size
+        mu_q:      (B, N,   h_q, D), any dtype
+        k_chunked: (B, N, S, h_kv, D), any dtype  -- NOT pre-expanded along
+                   the head axis; we infer the GQA group size as
+                   ``G = h_q // h_kv`` from the two head dims.
         sm_scale:  positive float
+
+    GQA strategy (set by ``compressed_lmk_k``):
+      * False (default, "MHA-style"): every q-head computes its OWN prior
+        attention + its OWN aggregated KEY  ->  lmk_k shape (B, N, h_q, D),
+        prior_b shape (B, N, h_q).  We ``repeat_interleave`` K to h_q heads
+        internally (cheap on this small tensor) so each q-head dots its own
+        copy of K.
+      * True ("compressed"): mu_q is averaged within each q-group (mean over
+        the G q-heads sharing one KV head) BEFORE the QK dot for ``lmk_k``,
+        so lmk_k comes out at h_kv head granularity (B, N, h_kv, D).  The
+        entropy bias ``prior_b`` is STILL computed in the per-q-head MHA
+        layout (B, N, h_q) -- otherwise downstream ``topk_func`` couldn't
+        accept it as a per-q-head additive bias.
     """
     in_dtype = k_chunked.dtype
-    mu_f32 = mu_q.float()                                                  # (B, N, H, D)
-    k_f32 = k_chunked.float()                                              # (B, N, S, H, D)
+    mu_f32 = mu_q.float()                                                  # (B, N, h_q, D)
+    k_f32 = k_chunked.float()                                              # (B, N, S, h_kv, D)
+    h_q = mu_f32.shape[2]
+    h_kv = k_f32.shape[3]
+    G = h_q // h_kv
 
+    # --- Per-q-head prior attention (always computed; used for prior_b
+    # always, and for non-compressed lmk_k).  We expand K along the head
+    # axis from h_kv to h_q so each q-head dots its own copy.  When
+    # ``h_q == h_kv`` (no GQA) this is a no-op view-friendly path.
+    if G != 1:
+        k_q = k_f32.repeat_interleave(G, dim=3)                            # (B, N, S, h_q, D)
+    else:
+        k_q = k_f32
     # logits[b, n, j, h] = sm_scale * <mu_q[b, n, h, :], K[b, n, j, h, :]>
-    logits = torch.einsum("bnhd,bnshd->bnsh", mu_f32, k_f32) * sm_scale     # (B, N, S, H)
+    logits = torch.einsum("bnhd,bnshd->bnsh", mu_f32, k_q) * sm_scale       # (B, N, S, h_q)
     # Mask out the LAST K token of each chunk so the prior attention does
     # not select the chunk's own boundary token (which already serves as
     # the lmk anchor and would otherwise leak next-token info).  Use
@@ -52,23 +80,43 @@ def _chunk_attn_pool_impl(
     last_mask[-1] = True
     logits = logits.masked_fill(last_mask.view(1, 1, S_chunk, 1), float('-inf'))
 
-    p = F.softmax(logits, dim=2)                                           # (B, N, S, H)
-    lmk_k = torch.einsum("bnsh,bnshd->bnhd", p, k_f32)                     # (B, N, H, D)
+    p = F.softmax(logits, dim=2)                                           # (B, N, S, h_q)
 
-    # Entropy bias via log-softmax for numerical stability.
+    # --- lmk_k (chunk-level surrogate KEY) ---
+    lmk_k = None
+    if not compact_lmk_k:
+        if not compressed_lmk_k:
+            # MHA-style: per-q-head k' = sum_j p_j * K_j (with the expanded
+            # ``k_q`` from above).  Output: (B, N, h_q, D).
+            lmk_k = torch.einsum("bnsh,bnshd->bnhd", p, k_q).to(in_dtype)
+        else:
+            # Compressed (GQA): average mu_q across each q-group and dot
+            # with the original h_kv-head K (no expansion needed -- the
+            # caller passes K with its native h_kv head count).  This gives
+            # one lmk_k per KV head -- output shape (B, N, h_kv, D).
+            B, N, _, _, D = k_f32.shape
+            mu_g = mu_f32.view(B, N, h_kv, G, D).mean(dim=3)                # (B, N, h_kv, D)
+            logits_kv = torch.einsum("bnhd,bnshd->bnsh", mu_g, k_f32) * sm_scale  # (B, N, S, h_kv)
+            logits_kv = logits_kv.masked_fill(
+                last_mask.view(1, 1, S_chunk, 1), float('-inf')
+            )
+            p_kv = F.softmax(logits_kv, dim=2)                              # (B, N, S, h_kv)
+            lmk_k = torch.einsum("bnsh,bnshd->bnhd", p_kv, k_f32).to(in_dtype)  # (B, N, h_kv, D)
+
+    # --- Entropy bias (always per-q-head, from the MHA-style ``p``) ---
     # When some logit positions are -inf (e.g. masked-out chunk-last token),
     # ``log_softmax`` puts -inf there and softmax puts 0 there, so the
     # product ``p * log_p`` evaluates to ``0 * (-inf) = NaN`` even though
     # the mathematical convention is ``0 * log 0 = 0``.  We compute the
     # entropy as ``-sum p * (log_p where finite else 0)`` to silence the
     # NaN without changing the value on valid positions.
-    log_p = F.log_softmax(logits, dim=2)                                   # (B, N, S, H)
+    log_p = F.log_softmax(logits, dim=2)                                   # (B, N, S, h_q)
     log_p_safe = torch.where(
         torch.isfinite(log_p), log_p, log_p.new_zeros(())
     )
-    lmk_b = -(p * log_p_safe).sum(dim=2)                                   # (B, N, H)
+    lmk_b = -(p * log_p_safe).sum(dim=2)                                   # (B, N, h_q)
 
-    return lmk_k.to(in_dtype), lmk_b
+    return lmk_k, lmk_b
 
 
 # Compile the inner math into one fused kernel.  Falls back to eager if the
@@ -88,6 +136,8 @@ def chunk_attn_pool(
     mu_q: torch.Tensor,
     k_chunked: torch.Tensor,
     sm_scale: Optional[float] = None,
+    compact_lmk_k: Optional[bool] = False,
+    compressed_lmk_k: Optional[bool] = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Parameter-free Taylor-expansion chunk pooling.
 
@@ -105,49 +155,67 @@ def chunk_attn_pool(
     "last-token-as-lmk", at the cost of one extra in-chunk attention.
 
     Args:
-        mu_q:      (B, num_chunks, H, d) -- prior query per (batch, chunk, head).
+        mu_q:      (B, num_chunks, h_q, d) -- prior query per (batch, chunk, q-head).
                    Caller is responsible for picking the right slice from
                    lmk_q_norm (typically: ``lmk_q_norm[:, S-1::S, :, :]``,
                    i.e. the last lmk_q in each chunk).
-        k_chunked: (B, num_chunks, S, H, d) -- K reshaped per-chunk.
+        k_chunked: (B, num_chunks, S, h_kv, d) -- K reshaped per-chunk, at
+                   the model's NATIVE KV-head count (no caller-side
+                   ``repeat_interleave``).  GQA group size ``G = h_q // h_kv``
+                   is inferred internally; ``h_q == h_kv`` (no GQA) is fine.
         sm_scale:  attention scale.  Defaults to ``1 / sqrt(d)``.
+        compact_lmk_k: if True, skip the GEMM that produces ``lmk_k``
+                   (caller will substitute its own).  Returns lmk_k=None.
+        compressed_lmk_k: if True, average mu_q within each q-group before
+                   the QK dot for ``lmk_k`` -> output at h_kv granularity
+                   (B, num_chunks, h_kv, d).  ``prior_b`` stays per-q-head
+                   in either mode.  Mutually exclusive with compact_lmk_k.
 
     Returns:
-        lmk_k: (B, num_chunks, H, d), in the SAME dtype as ``k_chunked``.
-        lmk_b: (B, num_chunks, H), in fp32 (small tensor; cheap to upcast).
+        lmk_k: shape depends on ``compressed_lmk_k``:
+                 - False: (B, num_chunks, h_q, d), in K's dtype.
+                 - True:  (B, num_chunks, h_kv, d), in K's dtype.
+                 None when ``compact_lmk_k`` is True.
+        lmk_b: (B, num_chunks, h_q), always in fp32.
 
     Notes:
         * Pure function, no parameters; the only "learnable" thing influencing
           ``mu_q`` is whatever produced ``lmk_q_norm`` upstream (lmk_q_proj +
           its norm), which the caller already trains.
         * All in-chunk math is fp32 for stable softmax/log; outputs cast back.
-        * ``mu_q`` and ``k_chunked`` MUST agree on the head count ``H`` and
-          the per-head dim ``d``.  When the model uses GQA-style retrieval
-          (``h_q != h_hsa_kv``), the caller must broadcast/
-          repeat-interleave ``mu_q`` (or ``k_chunked``) BEFORE calling this.
         * Implementation is dispatched to a ``torch.compile``'d inner kernel
           (~2x faster than eager on H100) when available; otherwise falls
           back to the plain PyTorch path transparently.
     """
     if mu_q.dim() != 4 or k_chunked.dim() != 5:
         raise ValueError(
-            f"chunk_attn_pool: expected mu_q (B, N, H, d) and k_chunked "
-            f"(B, N, S, H, d); got {tuple(mu_q.shape)} and {tuple(k_chunked.shape)}"
+            f"chunk_attn_pool: expected mu_q (B, N, h_q, d) and k_chunked "
+            f"(B, N, S, h_kv, d); got {tuple(mu_q.shape)} and {tuple(k_chunked.shape)}"
         )
-    B, N, H, D = mu_q.shape
-    Bk, Nk, S, Hk, Dk = k_chunked.shape
-    if (B, N, H, D) != (Bk, Nk, Hk, Dk):
+    B, N, h_q, D = mu_q.shape
+    Bk, Nk, S, h_kv, Dk = k_chunked.shape
+    if (B, N, D) != (Bk, Nk, Dk):
         raise ValueError(
             f"chunk_attn_pool: mu_q vs k_chunked shape mismatch on "
-            f"(B, N, H, d) -- got mu_q={tuple(mu_q.shape)}, "
+            f"(B, N, d) -- got mu_q={tuple(mu_q.shape)}, "
             f"k_chunked={tuple(k_chunked.shape)}"
+        )
+    if h_q % h_kv != 0:
+        raise ValueError(
+            f"chunk_attn_pool: mu_q h_q ({h_q}) must be a multiple of "
+            f"k_chunked h_kv ({h_kv}) for GQA grouping"
+        )
+
+    if compact_lmk_k and compressed_lmk_k:
+        raise ValueError(
+            "compact_lmk_k and compressed_lmk_k are mutually exclusive"
         )
 
     if sm_scale is None:
         sm_scale = 1.0 / math.sqrt(D)
 
     fn = _chunk_attn_pool_compiled if _chunk_attn_pool_compiled is not None else _chunk_attn_pool_impl
-    return fn(mu_q, k_chunked, sm_scale)
+    return fn(mu_q, k_chunked, sm_scale, compact_lmk_k, compressed_lmk_k)
 
 
 def create_chunk_dropout_mask(
@@ -237,11 +305,14 @@ def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
     Returns:
         `tuple(torch.Tensor)` comprising of the query and key tensors rotated using the Rotary Position Embedding.
     """
+    # Match HF Olmo3: keep cos/sin in fp32, do (q*cos)+(rotate_half(q)*sin)
+    # in fp32 (auto-upcast), then cast back to q/k's original dtype.
+    q_dtype, k_dtype = q.dtype, k.dtype
     cos = cos.unsqueeze(unsqueeze_dim)
     sin = sin.unsqueeze(unsqueeze_dim)
     q_embed = (q * cos) + (rotate_half(q) * sin)
     k_embed = (k * cos) + (rotate_half(k) * sin)
-    return q_embed, k_embed
+    return q_embed.to(q_dtype), k_embed.to(k_dtype)
 
 def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
     """
@@ -308,6 +379,8 @@ class LandmarkHSA(nn.Module):
         self.enable_lmk_q_proj = getattr(config, "enable_lmk_q_proj", False)
         self.apply_hsa_rope = getattr(config, "apply_hsa_rope", False)
         self.nope_retrieval = getattr(config, 'nope_retrieval', False)
+        self.shared_lmk_q_norm = getattr(config, "shared_lmk_q_norm", False)
+
         if self.enable_lmk_q_proj:
             self.lmk_q_lora_dim = getattr(config, 'lmk_q_lora_dim', -1)
             if self.lmk_q_lora_dim <= 0:
@@ -317,7 +390,6 @@ class LandmarkHSA(nn.Module):
                     nn.Linear(self.d_model, self.lmk_q_lora_dim, bias=False),
                     nn.Linear(self.lmk_q_lora_dim, self.d_model, bias=False)
                 )
-            self.lmk_q_norm = norm_cls(self.head_dim)
 
         if not self.enable_lmk_q_proj:
             logger.warning_once("Recommend to set enable_lmk_q_proj=True for better performance")
@@ -333,6 +405,16 @@ class LandmarkHSA(nn.Module):
             self.q_norm = norm_cls(self.d_model)
             self.k_norm = norm_cls(self.h_kv * self.head_dim)
 
+        if self.enable_lmk_q_proj:
+            if self.shared_lmk_q_norm:
+                assert not self.layerwise_qk_norm, (
+                    "shared_lmk_q_norm is incompatible with layerwise_qk_norm: "
+                    "q_norm has shape (d_model,), but lmk_q_norm needs (head_dim,)."
+                )
+                self.lmk_q_norm = self.q_norm
+            else:
+                self.lmk_q_norm = norm_cls(self.head_dim)
+
         self.hsa_visible_window = getattr(config, "hsa_visible_window", -1)
         if getattr(config, 'full_upper_hsa', False) and self.layer_idx >= config.num_hidden_layers // 2:
             self.hsa_visible_window = -1
@@ -344,6 +426,9 @@ class LandmarkHSA(nn.Module):
         self.hsa_sliding_window = getattr(config, "hsa_sliding_window", self.sliding_window)
         self.intra_chunk_rope = getattr(config, "intra_chunk_rope", False)
         self.enable_hsa_swa = getattr(config, "enable_hsa_swa", True)
+        self.compact_lmk_k = getattr(config, "compact_lmk_k", False)
+        self.compressed_lmk_k = getattr(config, "compressed_lmk_k", False)
+        assert not (self.compact_lmk_k and self.compressed_lmk_k), 'compact_lmk_k and compressed_lmk_k cannot be True at the same time'
         
         self.is_causal = True
         
@@ -558,19 +643,27 @@ class LandmarkHSA(nn.Module):
 
                 mu_q = lmk_q_norm[:, self.chunk_size - 1::self.chunk_size, :, :][:, :full_chunks]  # (B, N, h_q_lmk, d)
                 h_q_lmk = mu_q.shape[2]
-                # Expand K from h_hsa_kv to h_q_lmk along the head axis so
-                # each q-head gets its OWN prior attention over the chunk's
-                # K (no group-mean shortcut -- mean would corrupt b').  The
-                # repeat is along the KV-head axis, matching standard GQA:
-                #   K[:, :, :, kv, :] is reused by all q-heads in that group.
-                if h_q_lmk != self.h_kv:
-                    assert h_q_lmk % self.h_kv == 0, (
-                        f"lmk_q head count ({h_q_lmk}) must be a multiple of "
-                        f"h_hsa_kv ({self.h_kv}) for GQA-style chunk pool"
-                    )
-                    g = h_q_lmk // self.h_kv
-                    k_chunked = k_chunked.repeat_interleave(g, dim=3)         # (B, N, S, h_q_lmk, d)
-                lmk_k, prior_b = chunk_attn_pool(mu_q, k_chunked)         # k': (B, N, h_q_lmk, d), b': (B, N, h_q_lmk)
+                # K is passed at native h_kv head count; ``chunk_attn_pool``
+                # infers the GQA group size internally from
+                # ``mu_q.shape[2] // k_chunked.shape[3]`` and handles both
+                # MHA and GQA layouts.  ``h_q_lmk`` must be a multiple of
+                # ``self.h_kv``; both can be equal (no GQA).
+                assert h_q_lmk % self.h_kv == 0, (
+                    f"lmk_q head count ({h_q_lmk}) must be a multiple of "
+                    f"h_hsa_kv ({self.h_kv}) for GQA-style chunk pool"
+                )
+                lmk_k, prior_b = chunk_attn_pool(
+                    mu_q, k_chunked,
+                    compact_lmk_k=self.compact_lmk_k,
+                    compressed_lmk_k=self.compressed_lmk_k,
+                )
+                # Shapes:
+                #   compact_lmk_k=True  -> lmk_k=None (overridden below)
+                #   compressed_lmk_k=True -> lmk_k: (B, N, h_kv, d)
+                #   else                -> lmk_k: (B, N, h_q, d)
+                # prior_b is always (B, N, h_q).
+                if self.compact_lmk_k:
+                    lmk_k = lmk_k_source[:, self.chunk_size - 1::self.chunk_size, : ,:]  # (B, L // S, hsa_kv, d)
             else:
                 lmk_k: Any = lmk_k_source[:, self.chunk_size - 1::self.chunk_size, : ,:]  # (B, L // S, hsa_kv, d)
 
@@ -604,7 +697,7 @@ class LandmarkHSA(nn.Module):
                 drop_mask=drop_mask,
                 q_offset=q_offset,
                 use_gumbel=self.enable_gumbel_noise and self.training,
-                G=self.h_q // self.h_kv,
+                G=lmk_k.shape[2] // self.h_kv,
                 bias=prior_b
             )
             # print(f'indices shape: {indices.shape}, scores.shape: {scores.shape}')
@@ -675,7 +768,7 @@ class LandmarkHSA(nn.Module):
             if self.groupwise_topk:
                 hsa_o = self.hsa_func(hsa_q_norm, hsa_k_norm, hsa_v, weights=chunk_weights, indices=indices, block_size=self.chunk_size, mask_last_token=True, is_training=self.training)
             else:
-                hsa_o = self.hsa_func(hsa_q_norm, hsa_k_norm, hsa_v, weights=chunk_weights, indices=indices, block_size=self.chunk_size, mask_last_token=True)
+                hsa_o = self.hsa_func(hsa_q_norm, hsa_k_norm, hsa_v, weights=chunk_weights, indices=indices, block_size=self.chunk_size, mask_last_token=True, is_training=self.training)
             if self.enable_hsa_swa:
                 swa_o_weight = chunk_weights[:, :, :, swa_weight_idx]  # (B, L, h_kv)
                 # o = hsa_o + swa_o * swa_o_weight.unsqueeze(-1)

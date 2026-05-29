@@ -282,6 +282,7 @@ def hierarchical_sparse_attention_block_M(batch, heads, q_len, kv_len, head_dim,
         num_weights = num_kv_blocks
     # weight_shape = [batch, q_len, heads, num_kv_blocks]
     weight_shape = [batch, q_len, heads, num_weights]
+    scores_lse_shape = [batch, q_len, heads, num_weights]
     
     # dtype = "bfloat16"
     # accum_dtype = "float"
@@ -304,6 +305,7 @@ def hierarchical_sparse_attention_block_M(batch, heads, q_len, kv_len, head_dim,
             K: T.Tensor(kv_shape, dtype),
             V: T.Tensor(kv_shape, dtype),
             W: T.Tensor[weight_shape, dtype],
+            ScoresLSE: T.Tensor(scores_lse_shape, accum_dtype),
             Output: T.Tensor(q_shape, dtype),
     ):
         # [Modified] Grid Z = batch * heads (One block per Query Head)
@@ -389,6 +391,15 @@ def hierarchical_sparse_attention_block_M(batch, heads, q_len, kv_len, head_dim,
                     )
                 T.fill(scores_sum, 0.0)
                 T.reduce_sum(acc_s, scores_sum, dim=1, clear=True)
+
+                for r in T.Parallel(block_M):
+                    tq = base_t + r
+                    if tq < q_len:
+                        ScoresLSE[i_b, tq, i_h, k_blk_idx] = T.if_then_else(
+                            scores_sum[r] > 0,
+                            scores_max[r] * scale + T.log(scores_sum[r]) * 1.44269504,
+                            -T.infinity(accum_dtype),
+                        )
                 
                 for r, c in T.Parallel(block_M, BS):
                     # Apply HSA Weight
@@ -461,6 +472,7 @@ def hierarchical_sparse_attention_bwd_dqkv_block_M(
 
     weight_shape = [batch, q_len, heads, num_weights]
     dw_shape = [batch, q_len, heads, num_weights]
+    scores_lse_shape = [batch, q_len, heads, num_weights]
     
     # [Modified] block_M is independent of groups
     if block_M is None or block_M <= 0:
@@ -482,6 +494,7 @@ def hierarchical_sparse_attention_bwd_dqkv_block_M(
         V: T.Tensor(v_shape, dtype),
         W: T.Tensor(weight_shape, dtype),
         DO: T.Tensor(do_shape, dtype),
+        ScoresLSE: T.Tensor(scores_lse_shape, accum_dtype),
         DQ: T.Tensor(dq_shape, accum_dtype),
         DK: T.Tensor(dk_shape, dtype),
         DV: T.Tensor(dv_shape, dtype),
@@ -525,8 +538,7 @@ def hierarchical_sparse_attention_bwd_dqkv_block_M(
             delta_rows = T.alloc_fragment([M], accum_dtype)
             
             acc_s_tmp = T.alloc_fragment([M, BS], accum_dtype)
-            scores_max = T.alloc_fragment([M], accum_dtype)
-            scores_sum = T.alloc_fragment([M], accum_dtype)
+            saved_lse = T.alloc_fragment([M], accum_dtype)
             
             dw_row_sum_frag = T.alloc_fragment([M], accum_dtype)
             dw_row_sum_shared = T.alloc_shared([M], accum_dtype)
@@ -569,34 +581,22 @@ def hierarchical_sparse_attention_bwd_dqkv_block_M(
                         acc_s_tmp[i, s]  
                     )
 
-                    # 3. Reduction Max
-                    T.fill(scores_max, -T.infinity(accum_dtype))
-                    T.reduce_max(acc_s_tmp, scores_max, dim=1, clear=True)
+                    for i in T.Parallel(M):
+                        tq = base_t + i
+                        saved_lse[i] = T.if_then_else(
+                            tq < q_len,
+                            ScoresLSE[i_b, tq, i_h, i_s],
+                            -T.infinity(accum_dtype),
+                        )
 
-                    # 4. Exp with NaN Guard
                     for i, s in T.Parallel(M, BS):
                         tq = base_t + i
-                        mx = scores_max[i]
-                        acc_s_tmp[i, s] = T.if_then_else(
-                            (tq < q_len) & (mx != -T.infinity(accum_dtype)),
-                            T.exp2(acc_s_tmp[i, s] * scale_log2 - mx * scale_log2),
-                            0.0
+                        p_val = T.if_then_else(
+                            (tq < q_len) & (saved_lse[i] != -T.infinity(accum_dtype)),
+                            T.exp2(acc_s_tmp[i, s] * scale_log2 - saved_lse[i]),
+                            0.0,
                         )
-                    
-                    # 5. Sum
-                    T.reduce_sum(acc_s_tmp, scores_sum, dim=1, clear=True)
-
-                    # 6. Normalize and Write Back
-                    for i, s in T.Parallel(M, BS):
-                        # P_shared[i, s] = T.if_then_else(scores_sum[i] > 0,
-                        #                                 acc_s_tmp[i, s] / scores_sum[i],
-                        #                                 0.0)
-                        p_val = T.if_then_else(scores_sum[i] > 0,
-                                                        acc_s_tmp[i, s] / scores_sum[i],
-                                                        0.0)
-                        # 更新寄存器 (用于后续 DW 计算)
                         acc_s_tmp[i, s] = p_val
-                        # 写入 Shared Memory (用于后续 dV GEMM 和 dS 计算)
                         P_shared[i, s] = p_val
 
                     # === dV & dW Optimization ===
@@ -670,59 +670,54 @@ def hierarchical_sparse_attention_bwd_dqkv_block_M(
 
 
 
-from ops.rope_tilelang_fp32 import rope_rotary_pos_emb
 class _hsa_block_M_attention_dense(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, Q, K, V, W, block_size, sm_scale, block_M, mask_last_token , window_size,
-                dtype, accum_dtype, num_threads, enable_inverse_rope, cos, sin):
+    def forward(ctx, Q, K, V, W, block_size, sm_scale, block_M, mask_last_token, window_size,
+                dtype, accum_dtype, num_threads):
         # Q: [B, L, HQ, D]
         # K, V: [B, L, H, D]
         # W: [B, L, HQ, S]
-        
         B, SEQ_LEN, HQ, D = Q.shape
         H = K.shape[2]
         groups = HQ // H
-        
-        # 捕获真实的权重通道数
         num_weights = W.shape[-1]
-        
-        # 确保 block_M 是合理的
+
         if block_M is None or block_M <= 0:
             block_M = 64
 
-        if enable_inverse_rope:
-            assert cos.shape[1] == Q.shape[1], f"cos seq_len {cos.shape[1]} != q seq_len {Q.shape[1]}"
-            Q_in, K_in = rope_rotary_pos_emb(Q, K, cos, -sin)
-        else:
-            Q_in, K_in = Q, K
-            
         ctx.block_size = block_size
         ctx.sm_scale = sm_scale
         ctx.block_M = block_M
         ctx.mask_last_token = mask_last_token
         ctx.window_size = window_size
         ctx.groups = groups
-        ctx.enable_inverse_rope = enable_inverse_rope
         ctx.dtype = dtype
         ctx.accum_dtype = accum_dtype
         ctx.num_threads = num_threads
-        ctx.num_weights = num_weights  # 保存 num_weights
-        
-        # 前向计算
-        O = hierarchical_sparse_attention_block_M(
+        ctx.num_weights = num_weights
+
+        fwd_kernel = hierarchical_sparse_attention_block_M(
             batch=B, heads=HQ, q_len=SEQ_LEN, kv_len=SEQ_LEN, head_dim=D,
             scale=sm_scale, block_size=block_size, groups=groups,
-            selected_blocks=0, num_weights=num_weights, # 传递 num_weights
+            selected_blocks=0, num_weights=num_weights,
             block_M=block_M, mask_last_token=mask_last_token, window_size=window_size,
-            dtype=dtype, accum_dtype=accum_dtype,num_threads=num_threads,
-        )(Q_in, K_in, V, W)
-        
-        ctx.save_for_backward(Q, K, V, W, O, cos, sin)
+            dtype=dtype, accum_dtype=accum_dtype, num_threads=num_threads,
+        )
+
+        scores_lse = torch.full(
+            (B, SEQ_LEN, HQ, num_weights),
+            float("-inf"),
+            dtype=torch.float32,
+            device=Q.device,
+        )
+        O = fwd_kernel(Q, K, V, W, scores_lse)
+
+        ctx.save_for_backward(Q, K, V, W, scores_lse)
         return O
 
     @staticmethod
     def backward(ctx, grad_output):
-        Q, K, V, W, O, cos, sin = ctx.saved_tensors
+        Q, K, V, W, scores_lse = ctx.saved_tensors
         block_size = ctx.block_size
         sm_scale = ctx.sm_scale
         block_M = ctx.block_M
@@ -732,84 +727,155 @@ class _hsa_block_M_attention_dense(torch.autograd.Function):
         accum_dtype = ctx.accum_dtype
         num_threads = ctx.num_threads
         groups = ctx.groups
-        enable_inverse_rope = ctx.enable_inverse_rope
-        num_weights = ctx.num_weights  # 获取 num_weights
-        
+        num_weights = ctx.num_weights
+
         B, SEQ_LEN, HQ, D = Q.shape
         H = K.shape[2]
-
-        if enable_inverse_rope:
-            Q_in, K_in = rope_rotary_pos_emb(Q, K, cos, -sin)
-        else:
-            Q_in, K_in = Q, K
-        
-        # Shapes for intermediate gradients
-        # NV = ceil(D / 128)
-        BV = min(128, 1 << (D - 1).bit_length())
-        NS_kv = SEQ_LEN // block_size 
-        
         dq_shape = [B, SEQ_LEN, HQ, D]
         dk_shape = [groups, B, SEQ_LEN, H, D]
         dv_shape = [groups, B, SEQ_LEN, H, D]
-        # dw_shape = [B, SEQ_LEN, HQ, NS_kv]
-        dw_shape = [B, SEQ_LEN, HQ, num_weights]  # 使用 num_weights
-        
-        # [Fix] Explicitly allocate and ZERO-INITIALIZE output tensors
-        # DQ uses atomic_add, so it MUST be zeroed.
+        dw_shape = [B, SEQ_LEN, HQ, num_weights]
+
         DQ = torch.zeros(dq_shape, dtype=torch.float32, device=Q.device)
-        
-        # DW is sparsely written (masked blocks skipped), so it MUST be zeroed.
         DW = torch.zeros(dw_shape, dtype=W.dtype, device=Q.device)
-        
-        # DK/DV are fully overwritten by the grid, but using empty/zeros is safer.
         DK = torch.zeros(dk_shape, dtype=K.dtype, device=Q.device)
         DV = torch.zeros(dv_shape, dtype=V.dtype, device=Q.device)
-        
-        # Call Kernel with explicit output tensors
+
         hierarchical_sparse_attention_bwd_dqkv_block_M(
             batch=B, heads=HQ, q_len=SEQ_LEN, kv_len=SEQ_LEN, head_dim=D,
             scale=sm_scale, block_size=block_size, groups=groups,
-            selected_blocks=0, num_weights=num_weights, # 传递 num_weights
-            block_M=block_M, mask_last_token=mask_last_token,window_size=window_size,
+            selected_blocks=0, num_weights=num_weights,
+            block_M=block_M, mask_last_token=mask_last_token, window_size=window_size,
             dtype=dtype, accum_dtype=accum_dtype, num_threads=num_threads,
-        )(Q_in, K_in, V, W, grad_output, DQ, DK, DV, DW)
-        
+        )(Q, K, V, W, grad_output, scores_lse, DQ, DK, DV, DW)
+
         post_kernel = hsa_bwd_postprocess(B, SEQ_LEN, HQ, D)
-        DQ = post_kernel(DQ)
-        
-        # Reduce gradients
-        # DQ: [B, L, HQ, D] -> sum(0)
-        DQ = DQ.to(Q.dtype)
-        
-        
-        # DK: [groups, B, L, H, D] -> sum(0).sum(0)
+        DQ = post_kernel(DQ).to(Q.dtype)
         DK = DK.sum(dim=0).to(K.dtype)
-        
-        # DV: [groups, B, L, H, D] -> sum(0)
         DV = DV.sum(dim=0).to(V.dtype)
 
-        if enable_inverse_rope:
-            DQ, DK = rope_rotary_pos_emb(DQ, DK, cos, sin)
-        
-        return DQ, DK, DV, DW, None, None, None, None, None, None, None, None, None, None, None, None
-def HSA_block_M_head_dense(Q, K, V, W, block_size=64, sm_scale=None, block_M=64, mask_last_token=True, 
+        return DQ, DK, DV, DW, None, None, None, None, None, None, None, None
+
+def HSA_block_M_head_dense(Q, K, V, W, block_size=64, sm_scale=None, block_M=64, mask_last_token=True,
                            window_size=-1,
-                           dtype="bfloat16", accum_dtype="float", num_threads=128,
-                           enable_inverse_rope=False, cos=None, sin=None):
-    if enable_inverse_rope and (cos is None or sin is None):
-        raise ValueError("cos and sin cannot be None when enable_inverse_rope is True")
-    return _hsa_block_M_attention_dense.apply(Q, K, V, W, block_size, sm_scale, block_M, mask_last_token, window_size,
-                                               dtype, accum_dtype,num_threads,
-                                               enable_inverse_rope, cos, sin)
+                           dtype="bfloat16", accum_dtype="float", num_threads=128):
+    return _hsa_block_M_attention_dense.apply(
+        Q, K, V, W, block_size, sm_scale, block_M, mask_last_token, window_size,
+        dtype, accum_dtype, num_threads,
+    )
 
 
 
 
-def _create_chunk_window_mask(L: int, num_chunks: int, chunk_size: int, window_size: int, device):
-    q_idx = torch.arange(L, device=device)  # [L]
-    chunk_idx = torch.arange(num_chunks, device=device)  # [num_chunks]
-    threshold = (q_idx - window_size + 1).div(chunk_size, rounding_mode="floor")  # [L]
+def _create_chunk_window_mask(
+    L: int,
+    num_chunks: int,
+    chunk_size: int,
+    window_size: int,
+    device,
+    q_offset: int = 0,
+    is_causal: bool = True,
+):
+    if not is_causal:
+        return torch.ones((L, num_chunks), dtype=torch.bool, device=device)
+    q_idx = torch.arange(L, device=device) + q_offset
+    chunk_idx = torch.arange(num_chunks, device=device)
+    if window_size > 0:
+        threshold = (q_idx - window_size + 1).div(chunk_size, rounding_mode="floor")
+    else:
+        threshold = q_idx.div(chunk_size, rounding_mode="floor")
     return chunk_idx[None, :] < threshold[:, None]
+
+
+def _dense_head_layout(q: torch.Tensor, k: torch.Tensor, lmk: torch.Tensor, G: int = None):
+    B, L, HQ, D = q.shape
+    H = k.shape[2]
+    lmks_h = lmk.shape[2]
+    D_lmk = lmk.shape[3]
+    if D_lmk != D:
+        assert D_lmk % D == 0, f"lmk D dim ({D_lmk}) must be divisible by q D dim ({D})"
+        d_ratio = D_lmk // D
+        lmk = lmk.reshape(lmk.shape[0], lmk.shape[1], lmks_h * d_ratio, D)
+        lmks_h *= d_ratio
+    if G is None:
+        assert HQ % H == 0, f"HQ ({HQ}) must be divisible by H ({H})"
+        G_eff = HQ // H
+        if lmks_h == H:
+            per_qhead_lmks = False
+        elif lmks_h == HQ:
+            per_qhead_lmks = True
+        else:
+            raise AssertionError(f"lmk heads ({lmks_h}) must be H ({H}) or HQ ({HQ})")
+    else:
+        assert HQ % G == 0, f"HQ ({HQ}) must be divisible by G ({G})"
+        H_from_G = HQ // G
+        assert H_from_G == H, f"G ({G}) implies H ({H_from_G}), but K has H ({H})"
+        assert lmks_h == HQ, f"when G is given, lmk must have HQ ({HQ}) heads, got {lmks_h}"
+        G_eff = G
+        per_qhead_lmks = True
+    return lmk, H, G_eff, per_qhead_lmks
+
+
+def _reshape_lse_swa_head(lse_swa: torch.Tensor, B: int, L: int, H: int, G: int):
+    HQ = H * G
+    if lse_swa.dim() == 3:
+        assert lse_swa.shape == (B, L, HQ), f"lse_swa shape {tuple(lse_swa.shape)} != {(B, L, HQ)}"
+        return lse_swa
+    assert lse_swa.shape == (B, L, H, G), f"lse_swa shape {tuple(lse_swa.shape)} != {(B, L, H, G)}"
+    return lse_swa.reshape(B, L, HQ)
+
+
+def _reshape_bias_head(bias: torch.Tensor, B: int, S: int, H: int, G: int):
+    if bias is None:
+        return None
+    HQ = H * G
+    if bias.dim() == 3:
+        assert bias.shape == (B, S, HQ), f"bias shape {tuple(bias.shape)} != {(B, S, HQ)}"
+        return bias.reshape(B, S, H, G).permute(0, 2, 3, 1).reshape(B, 1, HQ, S)
+    assert bias.dim() == 4, f"bias must be [B, S, HQ] or [B, S, H, G], got {tuple(bias.shape)}"
+    assert bias.shape == (B, S, H, G), f"bias shape {tuple(bias.shape)} != {(B, S, H, G)}"
+    return bias.permute(0, 2, 3, 1).reshape(B, 1, HQ, S)
+
+
+def _compute_dense_chunk_scores_head(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    lmk: torch.Tensor,
+    block_size: int,
+    window_size: int,
+    *,
+    lmk_q: torch.Tensor = None,
+    bias: torch.Tensor = None,
+    q_offset: int = 0,
+    is_causal: bool = True,
+    drop_mask: torch.Tensor = None,
+    sm_scale: float = None,
+    G: int = None,
+):
+    score_q = lmk_q if lmk_q is not None else q
+    B, L, HQ, D = score_q.shape
+    S = lmk.shape[1]
+    if sm_scale is None:
+        sm_scale = 1.0 / math.sqrt(D)
+    lmk, H, G_eff, per_qhead_lmks = _dense_head_layout(score_q, k, lmk, G=G)
+    q_view = score_q.reshape(B, L, H, G_eff, D)
+    if per_qhead_lmks:
+        lmk_view = lmk.reshape(B, S, H, G_eff, D)
+        scores = torch.einsum("blhgd,bshgd->blhgs", q_view, lmk_view)
+    else:
+        scores = torch.einsum("blhgd,bshd->blhgs", q_view, lmk)
+    scores = scores.float() * float(sm_scale)
+    allow = _create_chunk_window_mask(L, S, block_size, window_size, q.device, q_offset=q_offset, is_causal=is_causal)
+    scores = scores.masked_fill(~allow.view(1, L, 1, 1, S), float("-inf"))
+    if drop_mask is not None:
+        assert drop_mask.shape == (B, L, S), f"drop_mask shape {tuple(drop_mask.shape)} != {(B, L, S)}"
+        scores = scores.masked_fill(drop_mask.bool().view(B, L, 1, 1, S), float("-inf"))
+    scores = scores.reshape(B, L, HQ, S)
+    bias_view = _reshape_bias_head(bias, B, S, H, G_eff)
+    if bias_view is not None:
+        scores = scores + bias_view.to(device=scores.device, dtype=scores.dtype)
+    return scores.to(q.dtype), H, G_eff
+
 
 def HSA_dense_interface(
     q: torch.Tensor,
@@ -821,31 +887,26 @@ def HSA_dense_interface(
     window_size: int,
     enable_softmax1: bool = True,
     mask_last_token: bool = True,
-    enable_inverse_rope: bool = False,
-    cos: torch.Tensor = None,
-    sin: torch.Tensor = None,
     lmk_q: torch.Tensor = None,
+    bias: torch.Tensor = None,
+    q_offset: int = 0,
+    is_causal: bool = True,
+    drop_mask: torch.Tensor = None,
+    sm_scale: float = None,
+    G: int = None,
 ):
-    
     B, L, HQ, D = q.shape
-    S = lmk.shape[1]
-    H = k.shape[2]
-
-    score_q = lmk_q if lmk_q is not None else q
-
-    G = HQ // lmk.shape[2]
-    lmk_hq = lmk.repeat_interleave(G, dim=2)
-    scores = torch.einsum("blhd,bshd->blhs", score_q, lmk_hq)
-    scores = scores * (1.0 / math.sqrt(D))
-    allow = _create_chunk_window_mask(L, S, block_size, window_size, q.device)
-    scores = scores.masked_fill(~allow.view(1, L, 1, S), float("-inf"))
-
-    lse_last = lse_swa.unsqueeze(-1)
+    scores, H, G_eff = _compute_dense_chunk_scores_head(
+        q, k, lmk, block_size, window_size,
+        lmk_q=lmk_q, bias=bias, q_offset=q_offset, is_causal=is_causal,
+        drop_mask=drop_mask, sm_scale=sm_scale, G=G,
+    )
+    lse_last = _reshape_lse_swa_head(lse_swa, B, L, H, G_eff).to(scores.dtype).unsqueeze(-1)
     if not enable_softmax1:
         cat_scores = torch.cat([scores, lse_last], dim=-1)
         lse_idx = -1
     else:
-        ones = torch.zeros((B, L, HQ, 1), device=q.device)
+        ones = torch.zeros((B, L, HQ, 1), device=q.device, dtype=scores.dtype)
         cat_scores = torch.cat([scores, lse_last, ones], dim=-1)
         lse_idx = -2
     chunk_weights_all = torch.softmax(cat_scores, dim=-1)
@@ -854,18 +915,32 @@ def HSA_dense_interface(
         Q=q,
         K=k,
         V=v,
-        W=chunk_weights_all.to(q.dtype),
+        W=chunk_weights_all.to(q.dtype).contiguous(),
         block_size=block_size,
+        sm_scale=sm_scale,
         mask_last_token=mask_last_token,
         window_size=window_size,
-        enable_inverse_rope=enable_inverse_rope,
-        cos=cos,
-        sin=sin,
     )
     return out, chunk_weights_all, lse_idx
 
 import torch.nn.functional as F
 from ops.topk_head_softmax import online_softmax_topk_head
+from ops.hsa_fwd_bwd_head import HSA_block_M_head
+
+
+def _add_gathered_bias_to_topk_scores(scores: torch.Tensor, indices: torch.Tensor, bias: torch.Tensor, H: int, G: int):
+    if bias is None:
+        return scores
+    B, L, HQ, K_topk = scores.shape
+    S = bias.shape[1]
+    bias_hq = _reshape_bias_head(bias, B, S, H, G).reshape(B, HQ, S).permute(0, 2, 1)
+    indices_hq = indices.repeat_interleave(G, dim=2) if indices.shape[2] != HQ else indices
+    safe_idx = indices_hq.clamp_min(0).long()
+    src = bias_hq.unsqueeze(-1).expand(-1, -1, -1, K_topk)
+    gathered = torch.gather(src, dim=1, index=safe_idx)
+    return scores + gathered.to(scores.dtype)
+
+
 def HSA_dense_interface_ref(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -877,20 +952,23 @@ def HSA_dense_interface_ref(
     is_causal: bool = True,
     enable_softmax1: bool = True,
     mask_last_token: bool = True,
-    enable_inverse_rope: bool = False,
-    cos: torch.Tensor = None,
-    sin: torch.Tensor = None,
     lmk_q: torch.Tensor = None,
+    bias: torch.Tensor = None,
+    q_offset: int = 0,
+    drop_mask: torch.Tensor = None,
+    sm_scale: float = None,
+    G: int = None,
+    topk: int = None,
 ):
     B, L, HQ, D = q.shape
-    S = lmk.shape[1]  # num_chunks
-    
-    # topk 必须是 2 的幂次方，向上取整
-    topk_power_of_2 = 1 << (S - 1).bit_length() if S > 0 else 1
-
+    S = lmk.shape[1]
+    lmk, H, G_eff, per_qhead_lmks = _dense_head_layout(q, k, lmk, G=G)
+    topk = S if topk is None else topk
+    topk_power_of_2 = 1 << (topk - 1).bit_length() if topk > 0 else 1
+    G_arg = G_eff if per_qhead_lmks else None
     score_q = lmk_q if lmk_q is not None else q
 
-    _, scores = online_softmax_topk_head(
+    indices, scores = online_softmax_topk_head(
         q=score_q,
         lmks=lmk,
         lse_swa=lse_swa,
@@ -898,34 +976,31 @@ def HSA_dense_interface_ref(
         block_size=block_size,
         window_size=window_size,
         is_causal=is_causal,
+        q_offset=q_offset,
+        drop_mask=drop_mask,
+        sm_scale=sm_scale,
+        bias=bias,
+        G=G_arg,
     )
-    
-    # 如果 topk_power_of_2 > S，需要截断 scores 到实际的 S
-    if topk_power_of_2 > S:
-        scores = scores[:, :, :, :S]
+    scores = _add_gathered_bias_to_topk_scores(scores, indices, bias, H, G_eff)
 
-    lse_last = lse_swa.unsqueeze(-1)
+    lse_last = _reshape_lse_swa_head(lse_swa, B, L, H, G_eff).to(scores.dtype).unsqueeze(-1)
     if not enable_softmax1:
         cat_scores = torch.cat([scores, lse_last], dim=-1)
-        lse_idx=-1
+        lse_idx = -1
     else:
         ones = torch.zeros((B, L, HQ, 1), device=q.device, dtype=scores.dtype)
         cat_scores = torch.cat([scores, lse_last, ones], dim=-1)
-        lse_idx=-2
+        lse_idx = -2
     chunk_weights_all = F.softmax(cat_scores, dim=-1)
 
-    # 3) 调用 dense HSA kernel
-    out = HSA_block_M_head_dense(
-        Q=q,
-        K=k,
-        V=v,
-        W=chunk_weights_all.to(q.dtype),
+    out = HSA_block_M_head(
+        q.contiguous(), k.contiguous(), v.contiguous(),
+        weights=chunk_weights_all.to(q.dtype).contiguous(),
+        indices=indices.contiguous(),
         block_size=block_size,
+        sm_scale=sm_scale,
         mask_last_token=mask_last_token,
-        window_size=window_size,
-        enable_inverse_rope=enable_inverse_rope,
-        cos=cos,
-        sin=sin,
     )
     return out, chunk_weights_all, lse_idx
 
@@ -933,19 +1008,31 @@ def HSA_dense_interface_ref(
 
 import pytest
 
-@pytest.mark.parametrize("B,L,H,HQ,D,block_size,window_size,is_causal,enable_softmax1,use_topk_kernel", [
-    (1, 512, 1, 8,  64, 64, 128, True,  False, False),
-    (1, 512, 1, 8,  64, 64, 128, True,  False, True),
-    (2, 1024,2, 16, 128,64, 256, True,  False, False),
+@pytest.mark.parametrize("B,L,H,HQ,D,block_size,window_size,is_causal,enable_softmax1,use_topk_kernel,per_qhead_lmks,use_bias,bias_dim,use_drop_mask", [
+    (1, 512, 1, 8,  64, 64, 128, True,  False, False, False, False, 3, False),
+    (1, 512, 1, 8,  64, 64, 128, True,  False, True,  True,  False, 3, False),
+    (1, 512, 1, 8,  64, 64, 128, True,  False, False, False, True,  3, False),
+    (1, 512, 1, 8,  64, 64, 128, True,  False, False, False, True,  3, True),
+    (2, 1024,2, 16, 128,64, 256, True,  False, False, True,  True,  3, False),
+    (1, 512, 1, 8,  64, 64, 64,  True,  True,  False, True,  True,  4, False),
+    (1, 512, 1, 8,  64, 64, 128, True,  False, False, True,  True,  3, True),
 ])
 def test_dense_interface_vs_ref(
-    B, L, H, HQ, D, block_size, window_size, is_causal, enable_softmax1, use_topk_kernel
+    B, L, H, HQ, D, block_size, window_size, is_causal, enable_softmax1, use_topk_kernel,
+    per_qhead_lmks, use_bias, bias_dim, use_drop_mask
 ):
     device = "cuda"
     torch.manual_seed(0)
 
     num_chunks = L // block_size
     assert HQ % H == 0
+    print(
+        f"\n[test_dense_interface_vs_ref] B={B} L={L} H={H} HQ={HQ} D={D} "
+        f"block_size={block_size} window_size={window_size} is_causal={is_causal} "
+        f"enable_softmax1={enable_softmax1} use_topk_kernel={use_topk_kernel} "
+        f"per_qhead_lmks={per_qhead_lmks} use_bias={use_bias} bias_dim={bias_dim} "
+        f"use_drop_mask={use_drop_mask} num_chunks={num_chunks}"
+    )
 
     q = torch.randn((B, L, HQ, D), device=device, dtype=torch.bfloat16, requires_grad=True)
     k = torch.randn((B, L, H, D),  device=device, dtype=torch.bfloat16, requires_grad=True)
@@ -954,34 +1041,69 @@ def test_dense_interface_vs_ref(
     # 构造独立的 lmk_q，避免退化成 q==lmk_q 时“测不出”接口分离逻辑
     lmk_q = (q.detach() + 0.1 * torch.randn_like(q)).requires_grad_(True)
 
-    lmk = torch.randn((B, num_chunks, H, D), device=device, dtype=torch.bfloat16)
+    lmk_heads = HQ if per_qhead_lmks else H
+    lmk = torch.randn((B, num_chunks, lmk_heads, D), device=device, dtype=torch.bfloat16)
     lse_swa = torch.randn((B, L, HQ), device=device, dtype=torch.bfloat16)
+    if use_bias:
+        if bias_dim == 4:
+            bias = torch.randn((B, num_chunks, H, HQ // H), device=device, dtype=torch.float32)
+        else:
+            bias = torch.randn((B, num_chunks, HQ), device=device, dtype=torch.float32)
+    else:
+        bias = None
+    G_arg = HQ // H if per_qhead_lmks else None
+    if use_drop_mask:
+        allow = _create_chunk_window_mask(L, num_chunks, block_size, window_size, q.device, is_causal=is_causal)
+        drop_mask = (torch.rand((B, L, num_chunks), device=device) < 0.2) & allow.view(1, L, num_chunks)
+        has_visible = allow.any(dim=-1).view(1, L, 1)
+        visible_keep = allow.view(1, L, num_chunks) & (~drop_mask)
+        bad = has_visible & (~visible_keep.any(dim=-1, keepdim=True))
+        drop_mask = torch.where(bad, torch.zeros_like(drop_mask), drop_mask).to(torch.int32)
+    else:
+        drop_mask = None
 
-    out_hsa, w_hsa, _ = HSA_dense_interface(
+    out_hsa, w_hsa, lse_idx_hsa = HSA_dense_interface(
         q=q, k=k, v=v, lmk=lmk, lse_swa=lse_swa,
         block_size=block_size, window_size=window_size,
         enable_softmax1=enable_softmax1,
         lmk_q=lmk_q,
+        bias=bias,
+        drop_mask=drop_mask,
+        G=G_arg,
     )
 
-    out_ref, w_ref, _ = HSA_dense_interface_ref(
+    out_ref, w_ref, lse_idx_ref = HSA_dense_interface_ref(
         q=q, k=k, v=v, lmk=lmk, lse_swa=lse_swa,
         block_size=block_size, window_size=window_size, is_causal=is_causal,
         enable_softmax1=enable_softmax1,
         lmk_q=lmk_q,
+        bias=bias,
+        drop_mask=drop_mask,
+        G=G_arg,
     )
 
     def rms(x):
         return x.float().flatten().square().mean().sqrt()
 
+    def check(name, a, b, thr):
+        diff = (a.float() - b.float())
+        ratio = (diff.flatten().square().mean().sqrt() / (rms(b) + 1e-12)).item()
+        mx = diff.abs().max().item()
+        print(f"[{name}] ratio={ratio:.6f} max_abs={mx:.6e}")
+        assert ratio < thr, f"{name} mismatch ratio={ratio}, max_abs={mx}"
+
+    S = num_chunks
+    if use_drop_mask:
+        check("ChunkWeightMass(einsum vs topk)", w_hsa[:, :, :, :S].sum(dim=-1), w_ref[:, :, :, :lse_idx_ref].sum(dim=-1), thr=5e-3)
+    else:
+        check("Weights(einsum vs topk)", w_hsa[:, :, :, :S], w_ref[:, :, :, :S], thr=5e-3)
+
     diff = (out_hsa.float() - out_ref.float())
     ratio = (diff.flatten().square().mean().sqrt() / (rms(out_ref) + 1e-12)).item()
     max_abs = diff.abs().max().item()
-    print(f"[dense_interface_internal_weights] ratio={ratio:.6f} max_abs={max_abs:.6e}")
+    print(f"[FWD output] ratio={ratio:.6f} max_abs={max_abs:.6e}")
+    assert ratio < 5e-2, f"FWD mismatch ratio={ratio}, max_abs={max_abs}"
 
-    assert ratio < 5e-3, f"FWD mismatch ratio={ratio}, max_abs={max_abs}"
-
-    # backward（可选）
     grad = torch.randn_like(out_hsa)
     (out_hsa * grad).sum().backward()
     dq_hsa, dk_hsa, dv_hsa = q.grad.clone(), k.grad.clone(), v.grad.clone()
@@ -990,16 +1112,9 @@ def test_dense_interface_vs_ref(
     (out_ref * grad).sum().backward()
     dq_ref, dk_ref, dv_ref = q.grad.clone(), k.grad.clone(), v.grad.clone()
 
-    def check(name, a, b, thr=1.5e-2):
-        diff = (a.float() - b.float())
-        ratio = (diff.flatten().square().mean().sqrt() / (rms(b) + 1e-12)).item()
-        mx = diff.abs().max().item()
-        print(f"[{name}] ratio={ratio:.6f} max_abs={mx:.6e}")
-        assert ratio < thr, f"{name} mismatch ratio={ratio}, max_abs={mx}"
-
-    check("DQ", dq_hsa, dq_ref)
-    check("DK", dk_hsa, dk_ref)
-    check("DV", dv_hsa, dv_ref)
+    check("DQ", dq_hsa, dq_ref, thr=5e-3)
+    check("DK", dk_hsa, dk_ref, thr=5e-3)
+    check("DV", dv_hsa, dv_ref, thr=5e-3)
 
 
 
@@ -1384,15 +1499,16 @@ def test_correctness_fp32(B, SEQ_LEN, H, HQ, D, block_size, window_size):
 import time
 def benchmark_dense_interface_weight_methods(
     B: int = 2,
-    L: int = 4096,
+    L: int = 8192,
     H: int = 2,
     HQ: int = 16,
     D: int = 128,
     block_size: int = 64,
-    window_size: int = 256,
+    window_size: int = 512,
     is_causal: bool = True,
     enable_softmax1: bool = False,
     dtype: torch.dtype = torch.bfloat16,
+    sparse_topk: int = 32,
     num_warmup: int = 20,
     num_iters: int = 50,
 ):
@@ -1411,6 +1527,11 @@ def benchmark_dense_interface_weight_methods(
 
     grad_out = torch.randn((B, L, HQ, D), device=device, dtype=dtype)
 
+    def _warmup(fn):
+        for _ in range(num_warmup):
+            fn()
+        torch.cuda.synchronize()
+
     def _time_ms(fn):
         torch.cuda.synchronize()
         t0 = time.perf_counter()
@@ -1420,24 +1541,14 @@ def benchmark_dense_interface_weight_methods(
         return (time.perf_counter() - t0) * 1e3 / num_iters
 
     # ---------------------------
-    # 1) topk-kernel weight path
+    # 1) dense score + dense HSA path
     # ---------------------------
-    for _ in range(num_warmup):
-        out, _, _ = HSA_dense_interface(
+    def fwd_a():
+        _, _, _ = HSA_dense_interface(
             q=q, k=k, v=v, lmk=lmk, lse_swa=lse_swa,
             block_size=block_size, window_size=window_size,
             enable_softmax1=enable_softmax1,
         )
-        out.backward(grad_out)
-        q.grad = k.grad = v.grad = None
-
-    def fwd_a():
-        with torch.no_grad():
-            _, _, _ = HSA_dense_interface(
-                q=q, k=k, v=v, lmk=lmk, lse_swa=lse_swa,
-                block_size=block_size, window_size=window_size,
-                enable_softmax1=enable_softmax1,
-            )
 
     def fwd_bwd_a():
         q.grad = k.grad = v.grad = None
@@ -1448,30 +1559,24 @@ def benchmark_dense_interface_weight_methods(
         )
         out.backward(grad_out)
 
+    _warmup(fwd_a)
+    _warmup(fwd_bwd_a)
     a_fwd = _time_ms(fwd_a)
     a_total = _time_ms(fwd_bwd_a)
     a_bwd = a_total - a_fwd
 
     # ---------------------------
-    # 2) torch-einsum weight path
+    # 2) sparse topk + sparse HSA path
     # ---------------------------
     q.grad = k.grad = v.grad = None
-    for _ in range(num_warmup):
-        out, _, _ = HSA_dense_interface_ref(
+
+    def fwd_b():
+        _, _, _ = HSA_dense_interface_ref(
             q=q, k=k, v=v, lmk=lmk, lse_swa=lse_swa,
             block_size=block_size, window_size=window_size,
             is_causal=is_causal, enable_softmax1=enable_softmax1,
+            topk=sparse_topk,
         )
-        out.backward(grad_out)
-        q.grad = k.grad = v.grad = None
-
-    def fwd_b():
-        with torch.no_grad():
-            _, _, _ = HSA_dense_interface_ref(
-                q=q, k=k, v=v, lmk=lmk, lse_swa=lse_swa,
-                block_size=block_size, window_size=window_size,
-                is_causal=is_causal, enable_softmax1=enable_softmax1,
-            )
 
     def fwd_bwd_b():
         q.grad = k.grad = v.grad = None
@@ -1479,17 +1584,20 @@ def benchmark_dense_interface_weight_methods(
             q=q, k=k, v=v, lmk=lmk, lse_swa=lse_swa,
             block_size=block_size, window_size=window_size,
             is_causal=is_causal, enable_softmax1=enable_softmax1,
+            topk=sparse_topk,
         )
         out.backward(grad_out)
 
+    _warmup(fwd_b)
+    _warmup(fwd_bwd_b)
     b_fwd = _time_ms(fwd_b)
     b_total = _time_ms(fwd_bwd_b)
     b_bwd = b_total - b_fwd
 
-    print("==== Benchmark: dense interface weight methods ====")
-    print(f"Config: B={B} L={L} H={H} HQ={HQ} D={D} block={block_size} chunks={num_chunks} window={window_size} causal={is_causal} softmax1={enable_softmax1} dtype={dtype}")
-    print(f"[HSA_dense_interface (torch weights)]  FWD {a_fwd:.3f} ms | BWD {a_bwd:.3f} ms | Total {a_total:.3f} ms")
-    print(f"[HSA_dense_interface_ref (topk kernel weights)]      FWD {b_fwd:.3f} ms | BWD {b_bwd:.3f} ms | Total {b_total:.3f} ms")
+    print("==== Benchmark: dense vs sparse HSA paths ====")
+    print(f"Config: B={B} L={L} H={H} HQ={HQ} D={D} block={block_size} chunks={num_chunks} sparse_topk={sparse_topk} window={window_size} causal={is_causal} softmax1={enable_softmax1} dtype={dtype}")
+    print(f"[dense scores + dense HSA]       FWD {a_fwd:.3f} ms | BWD {a_bwd:.3f} ms | Total {a_total:.3f} ms")
+    print(f"[topk kernel + sparse HSA]       FWD {b_fwd:.3f} ms | BWD {b_bwd:.3f} ms | Total {b_total:.3f} ms")
 
 
 
@@ -1508,11 +1616,14 @@ if __name__ == "__main__":
     #     test_correctness_fp32(*p)
     
     params_list = [
-        (1, 500, 1, 8,  64, 64, 128, True,  False, False),
-    (1, 512, 1, 8,  64, 64, 128, True,  False, True),
-    (1, 512, 1, 8,  64, 64, 64,  True,  True,  False),
+        (1, 500, 1, 8,  64, 64, 128, True,  False, False, False, False, 3, False),
+        (1, 512, 1, 8,  64, 64, 128, True,  False, True,  True,  False, 3, False),
+        (1, 512, 1, 8,  64, 64, 128, True,  False, False, False, True,  3, False),
+        (1, 512, 1, 8,  64, 64, 128, True,  False, False, False, True,  3, True),
+        (1, 512, 1, 8,  64, 64, 64,  True,  True,  False, True,  True,  4, False),
+        (1, 512, 1, 8,  64, 64, 128, True,  False, False, True,  True,  3, True),
     ]
     for p in params_list:
         test_dense_interface_vs_ref(*p)
     
-    # benchmark_dense_interface_weight_methods()
+    benchmark_dense_interface_weight_methods()

@@ -1,10 +1,5 @@
-from __future__ import annotations  # 2026-05-21 align patch: Qwen3Config used as type hint at L460 but not imported; PEP 563 defers annotation eval.
-
 from typing import Any, Callable, Optional, Tuple, Union
 from dataclasses import dataclass, field
-# 2026-05-21 align patch: HSAModel.__init__ references Qwen3RotaryEmbedding / HoPERotaryEmbedding at runtime but doesn't import them.
-from transformers.models.qwen3.modeling_qwen3 import Qwen3RotaryEmbedding
-from .HoPE import HoPERotaryEmbedding
 
 import torch
 import math
@@ -141,8 +136,8 @@ def next_of_y(x, y):
 
 
 def get_model_vocab_size(config) -> int:
-    insert_landmarks = getattr(config, "insert_landmarks", True)
-    if insert_landmarks:
+    enable_external_lmk_embed = getattr(config, "enable_external_lmk_embed", False)
+    if not enable_external_lmk_embed:
         return next_of_y(config.vocab_size + 1, 32)
     return config.vocab_size
 
@@ -229,11 +224,14 @@ def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
     Returns:
         `tuple(torch.Tensor)` comprising of the query and key tensors rotated using the Rotary Position Embedding.
     """
+    # Match HF Olmo3: keep cos/sin in fp32, do (q*cos)+(rotate_half(q)*sin)
+    # in fp32 (auto-upcast), then cast back to q/k's original dtype.
+    q_dtype, k_dtype = q.dtype, k.dtype
     cos = cos.unsqueeze(unsqueeze_dim)
     sin = sin.unsqueeze(unsqueeze_dim)
     q_embed = (q * cos) + (rotate_half(q) * sin)
     k_embed = (k * cos) + (rotate_half(k) * sin)
-    return q_embed, k_embed
+    return q_embed.to(q_dtype), k_embed.to(k_dtype)
 
 
 def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
@@ -462,7 +460,7 @@ class Olmo3RotaryEmbedding(nn.Module):
         self.reinit = False
 
 
-    def __init__(self, config: Qwen3Config, device=None):
+    def __init__(self, config: HSAConfig, device=None):
         super().__init__()
         # BC: "rope_type" was originally "type"
         if hasattr(config, "rope_scaling") and config.rope_scaling is not None:
@@ -572,7 +570,7 @@ class Olmo3RotaryEmbedding(nn.Module):
             cos = emb.cos() * self.attention_scaling
             sin = emb.sin() * self.attention_scaling
 
-        return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
+        return cos, sin
 
 
 class Olmo3PreTrainedModel(PreTrainedModel):
@@ -601,6 +599,13 @@ class Olmo3PreTrainedModel(PreTrainedModel):
                 module.weight.data[module.padding_idx].zero_()
         elif isinstance(module, Olmo3RMSNorm):
             module.weight.data.fill_(1.0)
+        elif isinstance(module, HSAModel):
+            # Standalone landmark embedding (when ``enable_external_lmk_embed``
+            # is on).  It plays the role of one extra row of ``embed_tokens``,
+            # so we initialize it with the same ``Normal(0, std)`` schedule
+            # as every other embedding row.
+            if getattr(module, "lmk_embed", None) is not None:
+                module.lmk_embed.data.normal_(mean=0.0, std=std)
 
 
 class HSAModel(Olmo3PreTrainedModel):
@@ -642,13 +647,22 @@ class HSAModel(Olmo3PreTrainedModel):
         )
         self.norm = Olmo3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         if not getattr(config, 'use_hope', False):
-            pos_cls = Qwen3RotaryEmbedding
+            pos_cls = Olmo3RotaryEmbedding
         else:
+            from .HoPE import HoPERotaryEmbedding
             pos_cls = HoPERotaryEmbedding
         self.rotary_emb = pos_cls(config=config)
         
         self.gradient_checkpointing = False
         self.has_sliding_layers = "sliding_attention" in self.config.layer_types
+
+        insert_landmarks = getattr(config, "insert_landmarks", True)
+        enable_external_lmk_embed = getattr(config, "enable_external_lmk_embed", False)
+        self.lmk_id = config.vocab_size if insert_landmarks else None
+        if insert_landmarks and enable_external_lmk_embed:
+            self.lmk_embed = nn.Parameter(torch.zeros(config.hidden_size))
+        else:
+            self.lmk_embed = None
 
         # Initialize weights and apply final processing
         self.post_init()
