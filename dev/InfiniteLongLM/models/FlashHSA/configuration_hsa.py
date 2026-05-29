@@ -45,8 +45,6 @@ class HSAConfig(PretrainedConfig):
             converting a multi-head checkpoint to a GQA checkpoint, each group key and value head should be constructed
             by meanpooling all the original heads within that group. For more details, check out [this
             paper](https://huggingface.co/papers/2305.13245). If it is not specified, will default to `32`.
-        head_dim (`int`, *optional*, defaults to 128):
-            The attention head dimension.
         hidden_act (`str` or `function`, *optional*, defaults to `"silu"`):
             The non-linear activation function (function or string) in the decoder.
         max_position_embeddings (`int`, *optional*, defaults to 32768):
@@ -128,7 +126,7 @@ class HSAConfig(PretrainedConfig):
     >>> configuration = model.config
     ```"""
 
-    model_type = "flash_hsa"
+    model_type = "olmo_lhsa"
     keys_to_ignore_at_inference = ["past_key_values"]
 
     # Default tensor parallel plan for base model `Qwen3`
@@ -155,7 +153,6 @@ class HSAConfig(PretrainedConfig):
         num_hidden_layers=32,
         num_attention_heads=32,
         num_key_value_heads=32,
-        head_dim=128,
         hidden_act="silu",
         max_position_embeddings=32768,
         initializer_range=0.02,
@@ -175,6 +172,8 @@ class HSAConfig(PretrainedConfig):
         hsa_mode: Literal['dense', 'sparse'] = 'sparse',
         hsa_topk: int = 16,
         full_attn_interleave: int = 4,
+        num_swa_layers: int = 0,
+        headwise_config=None,
         **kwargs,
     ):
         self.vocab_size = vocab_size
@@ -191,13 +190,16 @@ class HSAConfig(PretrainedConfig):
         self.enable_softmax1 = enable_softmax1
         self.hsa_topk = hsa_topk
         self.full_attn_interleave = full_attn_interleave
+        self.num_swa_layers = num_swa_layers
+        self.headwise_config = headwise_config
 
         # for backward compatibility
         if num_key_value_heads is None:
             num_key_value_heads = num_attention_heads
 
         self.num_key_value_heads = num_key_value_heads
-        self.head_dim = head_dim
+        assert self.hidden_size % self.num_attention_heads == 0, "hidden_size must be divisible by num_attention_heads"
+        self.head_dim = self.hidden_size // self.num_attention_heads
         self.hidden_act = hidden_act
         self.initializer_range = initializer_range
         self.rms_norm_eps = rms_norm_eps
@@ -214,12 +216,14 @@ class HSAConfig(PretrainedConfig):
 
         self.layer_types = layer_types
         if self.layer_types is None:
-            self.layer_types = [
-                "full_attention"
-                if full_attn_interleave > 0 and (i + 1) % full_attn_interleave == 0 
-                else "sliding_attention"
-                for i in range(self.num_hidden_layers)
-            ]
+            self.layer_types = []
+            for i in range(self.num_hidden_layers):
+                if i < num_swa_layers:
+                    self.layer_types.append("sliding_attention")
+                elif full_attn_interleave > 0 and (i - num_swa_layers + 1) % full_attn_interleave == 0:
+                    self.layer_types.append("full_attention")
+                else:
+                    self.layer_types.append("sliding_attention")
         layer_type_validation(self.layer_types, self.num_hidden_layers)
 
         super().__init__(

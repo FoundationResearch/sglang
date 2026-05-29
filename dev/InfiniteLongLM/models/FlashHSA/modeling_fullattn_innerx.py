@@ -938,7 +938,7 @@ class HSAForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
 
             if self.adjust_lmk_pos:
                 position_ids = create_position_ids_with_landmarks(
-                    input_ids.shape[1], self.chunk_size, input_ids.device
+                    None, input_ids.shape[1], self.chunk_size, input_ids.device
                 )
 
             input_ids = insert_special_tokens(input_ids, self.lmk_id, self.chunk_size)

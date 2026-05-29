@@ -2,7 +2,7 @@ export PYTHONPATH=./
 
 DATA_TYPE=${DTYPE:-ruler_0.05}
 
-bash train.sh tasks/ruler_sft.py configs/baselines/full_attn_tiny.yaml \
+bash train.sh tasks/pretrain_with_ruler.py configs/baselines/full_attn_tiny.yaml \
     --model.config_path $MODEL_CONFIG \
     --data.train_path $CORPUS_PATH \
     --data.max_seq_len $MAX_SEQ_LEN \
@@ -12,7 +12,7 @@ bash train.sh tasks/ruler_sft.py configs/baselines/full_attn_tiny.yaml \
     --data.num_workers 16 \
     --train.init_device meta \
     --train.use_wandb true \
-    --train.enable_gradient_checkpointing true \
+    --train.enable_gradient_checkpointing $GRADIENT_CKPT \
     --train.rmpad false \
     --train.wandb_project ruler_pretrain_5per \
     --train.wandb_name $WANDB_NAME \
@@ -23,7 +23,7 @@ bash train.sh tasks/ruler_sft.py configs/baselines/full_attn_tiny.yaml \
     --train.lr 3e-4 \
     --train.lr_min 3e-5 \
     --train.ulysses_parallel_size 1 \
-    --train.save_steps 10000 \
+    --train.save_steps 5000 \
     --train.max_steps 30000 \
     --train.load_checkpoint_path auto \
     --train.output_dir $OUTPUT_DIR

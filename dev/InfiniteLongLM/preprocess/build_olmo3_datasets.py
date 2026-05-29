@@ -83,7 +83,7 @@ def file_generator(input_path):
     生成器函数：惰性遍历目录下的所有文件
     避免一次性加载所有文件路径到内存
     """
-    for root, dirs, files in os.walk(input_path):
+    for root, dirs, files in os.walk(input_path, followlinks=True):
         for file in files:
             yield os.path.join(root, file)
 

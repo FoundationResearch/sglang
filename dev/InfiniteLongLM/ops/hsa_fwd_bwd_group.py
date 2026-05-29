@@ -4,7 +4,19 @@ import logging
 logging.getLogger("tilelang.jit.kernel").setLevel(logging.WARNING)
 logging.getLogger("tilelang").setLevel(logging.WARNING)
 import tilelang
+tilelang.set_log_level("ERROR")
 from tilelang import language as T
+from tilelang.autotuner import autotune
+import itertools
+import threading
+import tilelang.autotuner.tuner as _tuner
+_orig_rwt = _tuner.run_with_timeout
+def _safe_run_with_timeout(target_fn, timeout, *args, **kwargs):
+    if threading.current_thread() is threading.main_thread():
+        return _orig_rwt(target_fn, timeout, *args, **kwargs)
+    # Fallback: no SIGALRM in worker threads; just run the function directly.
+    return target_fn(*args, **kwargs)
+_tuner.run_with_timeout = _safe_run_with_timeout
 
 
 from einops import rearrange
@@ -274,8 +286,24 @@ def build_block_indices_block_M(
 
     return block_indices
 
+# _hsa_fwd_num_threads = [128, 256, 512]
+# _hsa_fwd_block_M = [1, 2, 4, 8, 16]
+# _hsa_fwd_configs = list(itertools.product(_hsa_fwd_num_threads, _hsa_fwd_block_M))
 
+# hsa_fwd_configs = [
+#     {
+#         "num_threads": c[0],
+#         "block_M": c[1],
+#     } for c in _hsa_fwd_configs
+# ]
+
+# @autotune(
+#     configs=hsa_fwd_configs,
+#     warmup=5,
+#     rep=10,
+# )
 @tilelang.jit(
+    execution_backend="cython",
     out_idx=[-1],
     pass_configs={
         tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: True,
@@ -283,9 +311,10 @@ def build_block_indices_block_M(
         tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
     }
 )
-def hierarchical_sparse_attention_block_M(batch, heads, q_len, kv_len, head_dim,
+def hierarchical_sparse_attention_block_M(batch, heads, head_dim, q_len=None, kv_len=None,
                                           scale=None, block_size=64, groups=16,
-                                          selected_blocks=16,  num_weights=None, block_M = 0, mask_last_token=True, dtype = "bfloat16", accum_dtype = "float", num_threads = 128):
+                                          selected_blocks=16,  num_weights=None, block_M = None, mask_last_token=True, dtype = "bfloat16", accum_dtype = "float", num_threads = None,
+                                          is_training=True):
     
     enable_last_token_mask = False
     if mask_last_token:
@@ -299,6 +328,9 @@ def hierarchical_sparse_attention_block_M(batch, heads, q_len, kv_len, head_dim,
     if num_weights is None:
         num_weights = selected_blocks
     head_kv = heads // groups
+    if not is_training:
+        q_len = T.dynamic("q_len")
+        kv_len = T.dynamic("kv_len")
     q_shape = [batch, q_len, heads, head_dim]
     kv_shape = [batch, kv_len, head_kv, head_dim]
     # weight_shape = [batch, q_len, head_kv, selected_blocks]
@@ -320,7 +352,7 @@ def hierarchical_sparse_attention_block_M(batch, heads, q_len, kv_len, head_dim,
         M = M_min
     else:
         M = max(block_M, M_min)
-    print("Using M =", M, "for fwd_block_M kernel")
+    # print(f"Using M =, {M}, for fwd_block_M kernel， batch: {batch}, heads: {heads}, head_kv: {head_kv}, q_len: {q_len}, kv_len: {kv_len}, head_dim: {head_dim}")
     M_G = M * groups  # 一次 GEMM 处理的总 head 数
 
     S = selected_blocks
@@ -328,6 +360,9 @@ def hierarchical_sparse_attention_block_M(batch, heads, q_len, kv_len, head_dim,
     BK = BV = block_T
     num_stages = 0
     # threads = 128
+
+    if num_threads is None:
+        num_threads = 128
 
     @T.prim_func
     def hsa_block_M(
@@ -570,8 +605,24 @@ def hierarchical_sparse_attention_block_M(batch, heads, q_len, kv_len, head_dim,
 
 
 
+# _hsa_fwd_num_threads = [128, 256, 512]
+# _hsa_fwd_block_M = [1, 2, 4, 8, 16]
+# _hsa_fwd_configs = list(itertools.product(_hsa_fwd_num_threads, _hsa_fwd_block_M))
 
+# hsa_fwd_configs = [
+#     {
+#         "num_threads": c[0],
+#         "block_M": c[1],
+#     } for c in _hsa_fwd_configs
+# ]
+
+# @autotune(
+#     configs=hsa_fwd_configs,
+#     warmup=5,
+#     rep=10,
+# )
 @tilelang.jit(
+    execution_backend="cython",
     pass_configs={
         tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: True,
         tilelang.PassConfigKey.TL_DISABLE_TMA_LOWER: True,
@@ -581,7 +632,7 @@ def hierarchical_sparse_attention_block_M(batch, heads, q_len, kv_len, head_dim,
 def hierarchical_sparse_attention_bwd_dqkv_block_M(
     batch, heads, q_len, kv_len, head_dim,
     scale=None, block_size=64, groups=16, selected_blocks=16,num_weights=None,
-    block_M = 0, mask_last_token=True, dtype = "bfloat16", accum_dtype = "float", num_threads = 256
+    block_M = None, mask_last_token=True, dtype = "bfloat16", accum_dtype = "float", num_threads = None
 ):
     enable_last_token_mask = False
     if mask_last_token:
@@ -634,6 +685,8 @@ def hierarchical_sparse_attention_bwd_dqkv_block_M(
     NP = tilelang.cdiv(q_len, M)
 
     # num_threads = 256
+    if num_threads is None:
+        num_threads = 256
     num_stages = 0
 
     @T.prim_func
@@ -874,7 +927,7 @@ class _hsa_block_M_attention(torch.autograd.Function):
         ctx, q, k, v, weights, indices,
         block_size, sm_scale, block_M, mask_last_token,dtype, accum_dtype, num_threads,
         enable_inverse_rope,
-        cos, sin,
+        cos, sin, is_training,
     ):
         assert q.is_contiguous()
         assert k.is_contiguous()
@@ -917,9 +970,10 @@ class _hsa_block_M_attention(torch.autograd.Function):
             scale=sm_scale,
             block_M=block_M,
             mask_last_token=mask_last_token,
-            dtype=dtype, accum_dtype=accum_dtype,num_threads=num_threads,
+            dtype=dtype, accum_dtype=accum_dtype,
+            num_threads=num_threads,
+            is_training=is_training,
         )
-
         # 执行前向
 
         o = fwd_kernel(q_in, k_in, v, weights.to(q_in.dtype), indices)
@@ -989,7 +1043,8 @@ class _hsa_block_M_attention(torch.autograd.Function):
             scale=sm_scale,
             block_M=block_M,
             mask_last_token=mask_last_token,
-            dtype=dtype, accum_dtype=accum_dtype, num_threads=num_threads,
+            dtype=dtype, accum_dtype=accum_dtype, 
+            num_threads=num_threads,
         )
 
         # 分配梯度缓冲
@@ -1019,14 +1074,14 @@ class _hsa_block_M_attention(torch.autograd.Function):
         else:
             dq, dk = dq_in, dk_in
 
-        return dq, dk, dv, dw, None, None, None, None, None, None, None, None, None, None, None
+        return dq, dk, dv, dw, None, None, None, None, None, None, None, None, None, None, None, None
 
 
 def HSA_block_M_group(
     q, k, v, weights, indices,
-    block_size=64, sm_scale=None, block_M=0, mask_last_token=True, dtype="bfloat16", accum_dtype="float", num_threads=128,
+    block_size=64, sm_scale=None, block_M=None, mask_last_token=True, dtype="bfloat16", accum_dtype="float", num_threads=None,
     enable_inverse_rope: bool = False,
-    cos=None, sin=None,
+    cos=None, sin=None, is_training=True,
 ):
     if enable_inverse_rope and (cos is None or sin is None):
         raise ValueError("cos and sin cannot be None when enable_inverse_rope is True")
@@ -1034,7 +1089,7 @@ def HSA_block_M_group(
         q, k, v, weights, indices,
         block_size, sm_scale, block_M, mask_last_token, dtype, accum_dtype,num_threads,
         enable_inverse_rope,
-        cos, sin,
+        cos, sin, is_training,
     )
 
 
@@ -1535,8 +1590,8 @@ def main_block_M_latency():
     from ops.hsa_fwd_bwd_triton import HSA
 
     # ---------- 配置参数 ----------
-    # B, SEQ_LEN, H, HQ, D, S, block_size = 128, 1024*4, 1, 8, 128, 8, 64
-    B, SEQ_LEN, H, HQ, D, S, block_size = 32, 1024, 1, 8, 128, 8, 64
+    B, SEQ_LEN, H, HQ, D, S, block_size = 16, 1024*8, 1, 8, 128, 8, 64
+    # B, SEQ_LEN, H, HQ, D, S, block_size = 32, 1024*2, 1, 4, 128, 8, 64
     mask_last_token=True
     block_M=4
     dtype = torch.bfloat16
@@ -1648,17 +1703,17 @@ def main_block_M_latency():
     # TileLang 部分
     # =========================================================
     for _ in range(num_warmup):
-        O = HSA_block_M_group(Q_tile, K, V, W, block_indices, block_size=block_size, sm_scale=scale, block_M=block_M, mask_last_token=mask_last_token)
+        O = HSA_block_M_group(Q_tile, K, V, W, block_indices, block_size=block_size, sm_scale=scale,  mask_last_token=mask_last_token)
         O.backward(grad_output_tile)
 
     def tile_fwd():
         with torch.no_grad():
-            O = HSA_block_M_group(Q_tile, K, V, W, block_indices, block_size=block_size, sm_scale=scale, block_M=block_M, mask_last_token=mask_last_token)
+            O = HSA_block_M_group(Q_tile, K, V, W, block_indices, block_size=block_size, sm_scale=scale, mask_last_token=mask_last_token)
     tile_fwd_ms = measure_time(tile_fwd)
 
     def tile_fwd_bwd():
         Q_tile.grad = K.grad = V.grad = W.grad = None
-        O = HSA_block_M_group(Q_tile, K, V, W, block_indices, block_size=block_size, sm_scale=scale, block_M=block_M, mask_last_token=mask_last_token)
+        O = HSA_block_M_group(Q_tile, K, V, W, block_indices, block_size=block_size, sm_scale=scale,  mask_last_token=mask_last_token)
         O.backward(grad_output_tile)
     tile_total_ms = measure_time(tile_fwd_bwd)
 
@@ -2193,11 +2248,113 @@ def test_correctness_fp32(B, SEQ_LEN, H, HQ, D, S, block_size):
     print(f"FP32 Correctness Test Passed for B={B}, SEQ_LEN={SEQ_LEN}, H={H}, HQ={HQ}, D={D}, S={S}, block_size={block_size}")
 
     
+def test_recompile_different_seq_len():
+    import time
+    import torch.nn.functional as F
+
+    # ---------- 公共参数 ----------
+    B, H, HQ, D, S, block_size = 1, 1, 8, 128, 4, 64
+    block_M = 4
+    mask_last_token = True
+    dtype = torch.bfloat16
+    device = "cuda"
+    scale = 1.0 / math.sqrt(D)
+
+    is_training = False 
+    # 两组不同的序列长度
+    SEQ_LEN_1 = 512*4
+    SEQ_LEN_2 = 1024*4
+
+    def make_inputs(seq_len):
+        """根据给定 seq_len 构造一组完整的输入"""
+        torch.manual_seed(42)
+        block_indices = torch.full((B, seq_len, H, S), -1, dtype=torch.int32, device=device)
+        num_blocks = seq_len // block_size
+        for t in range(seq_len):
+            max_blocks = min(t // block_size + 1, num_blocks)
+            if max_blocks > 0:
+                num_select = min(S, max_blocks)
+                selected = torch.randperm(max_blocks, device=device)[:num_select]
+                block_indices[:, t, :, :num_select] = selected.sort()[0]
+
+        Q = torch.randn((B, seq_len, HQ, D), dtype=dtype, device=device)
+        K = torch.randn((B, seq_len, H, D), dtype=dtype, device=device)
+        V = torch.randn((B, seq_len, H, D), dtype=dtype, device=device)
+
+        logits = torch.randn((B, seq_len, H, S), dtype=dtype, device=device)
+        logits.masked_fill_(block_indices == -1, float('-inf'))
+        W = F.softmax(logits, dim=-1)
+        W = torch.nan_to_num(W, nan=0.0).detach()
+
+        return Q, K, V, W, block_indices
+
+    # ========== 第一次调用：SEQ_LEN_1 ==========
+    print("=" * 70)
+    print(f"[第1次调用] SEQ_LEN = {SEQ_LEN_1}")
+    print("=" * 70)
+    Q1, K1, V1, W1, idx1 = make_inputs(SEQ_LEN_1)
+
+    torch.cuda.synchronize()
+    t0 = time.time()
+    O1 = HSA_block_M_group(Q1, K1, V1, W1, idx1, block_size=block_size,
+                           sm_scale=scale, block_M=block_M, mask_last_token=mask_last_token,
+                           is_training=is_training)
+    torch.cuda.synchronize()
+    t1 = time.time()
+    fwd_time_1 = t1 - t0
+    print(f"  前向耗时: {fwd_time_1:.4f}s")
+
+    # ========== 第二次调用：SEQ_LEN_2（不同长度） ==========
+    print()
+    print("=" * 70)
+    print(f"[第2次调用] SEQ_LEN = {SEQ_LEN_2}")
+    print("=" * 70)
+    Q2, K2, V2, W2, idx2 = make_inputs(SEQ_LEN_2)
+
+    torch.cuda.synchronize()
+    t0 = time.time()
+    O2 = HSA_block_M_group(Q2, K2, V2, W2, idx2, block_size=block_size,
+                           sm_scale=scale, block_M=block_M, mask_last_token=mask_last_token,
+                           is_training=is_training)
+    torch.cuda.synchronize()
+    t1 = time.time()
+    fwd_time_2 = t1 - t0
+    print(f"  前向耗时: {fwd_time_2:.4f}s")
+
+    # ========== 第三次调用：再次 SEQ_LEN_1（命中缓存？） ==========
+    print()
+    print("=" * 70)
+    print(f"[第3次调用] SEQ_LEN = {SEQ_LEN_1}（与第1次相同，测试缓存命中）")
+    print("=" * 70)
+    Q3, K3, V3, W3, idx3 = make_inputs(SEQ_LEN_1)
+
+    torch.cuda.synchronize()
+    t0 = time.time()
+    O3 = HSA_block_M_group(Q3, K3, V3, W3, idx3, block_size=block_size,
+                           sm_scale=scale, block_M=block_M, mask_last_token=mask_last_token,
+                           is_training=is_training)
+    torch.cuda.synchronize()
+    t1 = time.time()
+    fwd_time_3 = t1 - t0
+    print(f"  前向耗时: {fwd_time_3:.4f}s")
+
+    # ========== 汇总 ==========
+    print()
+    print("=" * 70)
+    print("汇总对比（耗时包含编译时间，编译通常需要数秒）")
+    print("=" * 70)
+    print(f"  {'调用':<30} {'FWD (s)':<12}")
+    print(f"  {'-'*42}")
+    print(f"  {'第1次 SEQ_LEN=' + str(SEQ_LEN_1):<30} {fwd_time_1:<12.4f}")
+    print(f"  {'第2次 SEQ_LEN=' + str(SEQ_LEN_2):<30} {fwd_time_2:<12.4f}")
+    print(f"  {'第3次 SEQ_LEN=' + str(SEQ_LEN_1) + '(重复)':<30} {fwd_time_3:<12.4f}")
+    print()
+
 
 if __name__ == "__main__":
-    main_block_M_correctness()
+    # main_block_M_correctness()
     
-    # main_block_M_latency()
+    main_block_M_latency()
     
     
     # main_rope_correctness()
@@ -2214,5 +2371,6 @@ if __name__ == "__main__":
     # for p in params_list:
     #     test_correctness_fp32(*p)
     
+    # test_recompile_different_seq_len()
 
-    
+# python ops/hsa_fwd_bwd_group.py

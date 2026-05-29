@@ -27,18 +27,45 @@ class LazyChunkedLoader(object):
             split: Literal['train', 'test']='train', 
             val_ratio=0.1, 
             data_type='data', 
-            array_data_type=np.uint32
+            array_data_type=np.uint32,
+            sort_files: bool = False,
         ):
+        """
+        Args:
+            sort_files: if True, sort collected files by their full path in
+                ascending order.  This makes the file ordering deterministic
+                across different filesystems / OS / ranks, which is important
+                for reproducibility and for aligning data across distributed
+                workers.  Defaults to False to preserve backward compatibility
+                with existing checkpoints that were trained against the native
+                ``os.walk`` order (filesystem-dependent).
+        """
         self.array_data_type = array_data_type
         self.is_lazy = True
         self.split = split
         self.val_ratio = val_ratio
+        self.sort_files = sort_files
         print(f"LazyChunkedLoader: Loading {path}")
+        if not os.path.isdir(path):
+            raise FileNotFoundError(
+                f"LazyChunkedLoader: path does not exist or is not a directory: {path}\n"
+                f"Hint: if you run inside a container, make sure this path is mounted into the container."
+            )
         all_files = []
         for root, dirs, files in os.walk(path):
             for file in files:
                 if file.endswith(f".{data_type}"):
                     all_files.append(os.path.join(root, file))
+        if sort_files:
+            # Sort by full path (ascending) for deterministic ordering.
+            all_files.sort()
+            print(f"LazyChunkedLoader: sorted {len(all_files)} files by path (ascending).")
+        if len(all_files) == 0:
+            raise FileNotFoundError(
+                f"LazyChunkedLoader: no '*.{data_type}' files found under: {path}\n"
+                f"split={split}, val_ratio={val_ratio}\n"
+                f"Hint: verify DATA_PATH points to the tokenized corpus root and is accessible in this runtime."
+            )
 
         files_ptrs = []
         files_lens = []
@@ -63,7 +90,13 @@ class LazyChunkedLoader(object):
         self.files_ptrs = files_ptrs
         self.lens = files_lens
         self.ends = list(accumulate(self.lens))
-        
+        if len(self.ends) == 0:
+            raise RuntimeError(
+                "LazyChunkedLoader: all candidate files were skipped or produced empty slices.\n"
+                f"path={path}, split={split}, val_ratio={val_ratio}, data_type={data_type}\n"
+                "Hint: check file permissions, file sizes, and that memmap dtype matches the stored format."
+            )
+
         print(f"total documents: {len(self.lens)}, total tokens:{self.ends[-1]}")
         self.total_tokens = self.ends[-1]
 

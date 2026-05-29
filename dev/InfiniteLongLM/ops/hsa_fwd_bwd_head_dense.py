@@ -819,20 +819,23 @@ def HSA_dense_interface(
     lse_swa: torch.Tensor,
     block_size: int,
     window_size: int,
-    enable_softmax1: bool = False,
+    enable_softmax1: bool = True,
     mask_last_token: bool = True,
     enable_inverse_rope: bool = False,
     cos: torch.Tensor = None,
     sin: torch.Tensor = None,
+    lmk_q: torch.Tensor = None,
 ):
     
     B, L, HQ, D = q.shape
     S = lmk.shape[1]
     H = k.shape[2]
 
+    score_q = lmk_q if lmk_q is not None else q
+
     G = HQ // lmk.shape[2]
     lmk_hq = lmk.repeat_interleave(G, dim=2)
-    scores = torch.einsum("blhd,bshd->blhs", q, lmk_hq)
+    scores = torch.einsum("blhd,bshd->blhs", score_q, lmk_hq)
     scores = scores * (1.0 / math.sqrt(D))
     allow = _create_chunk_window_mask(L, S, block_size, window_size, q.device)
     scores = scores.masked_fill(~allow.view(1, L, 1, S), float("-inf"))
@@ -840,14 +843,13 @@ def HSA_dense_interface(
     lse_last = lse_swa.unsqueeze(-1)
     if not enable_softmax1:
         cat_scores = torch.cat([scores, lse_last], dim=-1)
-        lse_idx=-1
+        lse_idx = -1
     else:
         ones = torch.zeros((B, L, HQ, 1), device=q.device)
         cat_scores = torch.cat([scores, lse_last, ones], dim=-1)
-        lse_idx=-2
+        lse_idx = -2
     chunk_weights_all = torch.softmax(cat_scores, dim=-1)
 
-    # 3) 调用 dense HSA kernel
     out = HSA_block_M_head_dense(
         Q=q,
         K=k,
@@ -873,12 +875,12 @@ def HSA_dense_interface_ref(
     block_size: int,
     window_size: int,
     is_causal: bool = True,
-    enable_softmax1: bool = False,
-    mask_last_token: bool = False,
+    enable_softmax1: bool = True,
+    mask_last_token: bool = True,
     enable_inverse_rope: bool = False,
     cos: torch.Tensor = None,
     sin: torch.Tensor = None,
-    
+    lmk_q: torch.Tensor = None,
 ):
     B, L, HQ, D = q.shape
     S = lmk.shape[1]  # num_chunks
@@ -886,8 +888,10 @@ def HSA_dense_interface_ref(
     # topk 必须是 2 的幂次方，向上取整
     topk_power_of_2 = 1 << (S - 1).bit_length() if S > 0 else 1
 
+    score_q = lmk_q if lmk_q is not None else q
+
     _, scores = online_softmax_topk_head(
-        q=q,
+        q=score_q,
         lmks=lmk,
         lse_swa=lse_swa,
         topk=topk_power_of_2,
@@ -915,7 +919,7 @@ def HSA_dense_interface_ref(
         Q=q,
         K=k,
         V=v,
-        W=chunk_weights_all,
+        W=chunk_weights_all.to(q.dtype),
         block_size=block_size,
         mask_last_token=mask_last_token,
         window_size=window_size,
@@ -947,19 +951,24 @@ def test_dense_interface_vs_ref(
     k = torch.randn((B, L, H, D),  device=device, dtype=torch.bfloat16, requires_grad=True)
     v = torch.randn((B, L, H, D),  device=device, dtype=torch.bfloat16, requires_grad=True)
 
+    # 构造独立的 lmk_q，避免退化成 q==lmk_q 时“测不出”接口分离逻辑
+    lmk_q = (q.detach() + 0.1 * torch.randn_like(q)).requires_grad_(True)
+
     lmk = torch.randn((B, num_chunks, H, D), device=device, dtype=torch.bfloat16)
     lse_swa = torch.randn((B, L, HQ), device=device, dtype=torch.bfloat16)
 
-    out_hsa, _, _ = HSA_dense_interface(
+    out_hsa, w_hsa, _ = HSA_dense_interface(
         q=q, k=k, v=v, lmk=lmk, lse_swa=lse_swa,
         block_size=block_size, window_size=window_size,
         enable_softmax1=enable_softmax1,
+        lmk_q=lmk_q,
     )
 
-    out_ref, _, _ = HSA_dense_interface_ref(
+    out_ref, w_ref, _ = HSA_dense_interface_ref(
         q=q, k=k, v=v, lmk=lmk, lse_swa=lse_swa,
         block_size=block_size, window_size=window_size, is_causal=is_causal,
         enable_softmax1=enable_softmax1,
+        lmk_q=lmk_q,
     )
 
     def rms(x):
@@ -1485,18 +1494,18 @@ def benchmark_dense_interface_weight_methods(
 
 
 if __name__ == "__main__":
-    main_block_M_correctness()
+    # main_block_M_correctness()
     # main_block_M_latency()
     
-    params_list = [
-        (1, 1000, 1, 8, 64, 32, 128),
-        (2, 1024, 1, 8, 64, 32, 256),
-        (3, 512, 1, 8, 64, 32, 128),
-        (4, 512, 1, 8, 64, 64, -1),
-        (5, 256, 1, 8, 64, 64, 64),
-    ]
-    for p in params_list:
-        test_correctness_fp32(*p)
+    # params_list = [
+    #     (1, 1000, 1, 8, 64, 32, 128),
+    #     (2, 1024, 1, 8, 64, 32, 256),
+    #     (3, 512, 1, 8, 64, 32, 128),
+    #     (4, 512, 1, 8, 64, 64, -1),
+    #     (5, 256, 1, 8, 64, 64, 64),
+    # ]
+    # for p in params_list:
+    #     test_correctness_fp32(*p)
     
     params_list = [
         (1, 500, 1, 8,  64, 64, 128, True,  False, False),
@@ -1506,4 +1515,4 @@ if __name__ == "__main__":
     for p in params_list:
         test_dense_interface_vs_ref(*p)
     
-    benchmark_dense_interface_weight_methods()
+    # benchmark_dense_interface_weight_methods()

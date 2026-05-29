@@ -271,6 +271,8 @@ class HierarchicalSparseAttention(nn.Module):
         hsa_v = rearrange(hsa_v, 'B L (h d)->B L h d', d=self.head_dim)
 
         lmk_k: Any = hsa_k_norm[:, self.chunk_size - 1::self.chunk_size, : ,:]  # (B, L // S, h_kv // 2, d
+        B, S,  H, D = lmk_k.shape
+        lmk_k = lmk_k.reshape(B, S, H, D)
         if L >= self.chunk_size:
             hsa_visible_window = self.hsa_visible_window if self.training else -1
             indices, scores = self.topk_func(
@@ -279,7 +281,6 @@ class HierarchicalSparseAttention(nn.Module):
                 self.topk, 
                 block_size=self.chunk_size, 
                 window_size=0,
-                memory_window_size=hsa_visible_window,
                 is_causal=True
             )
             # print(f'scores shape: {scores.shape}, lmk q shape: {lmk_q_norm.shape}, kv_shape: {lmk_k.shape}')
@@ -881,7 +882,7 @@ class HSAForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
 
             if self.adjust_lmk_pos:
                 position_ids = create_position_ids_with_landmarks(
-                    input_ids.shape[1], self.chunk_size, input_ids.device
+                    None, input_ids.shape[1], self.chunk_size, input_ids.device
                 )
 
             input_ids = insert_special_tokens(input_ids, self.lmk_id, self.chunk_size)

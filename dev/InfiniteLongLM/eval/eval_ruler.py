@@ -52,52 +52,7 @@ def assert_close(prefix, ref, tri, ratio):
 from veomni.models import build_foundation_model
 from veomni.checkpoint import build_checkpointer
 from models.FlashHSA.configuration_hsa import HSAConfig
-
-def insert_special_tokens(input_ids, fill_id, chunk_size):
-    """每隔 chunk_size - 1 插入一个特殊 token"""
-    N, L = input_ids.shape
-    full_chunks = L // (chunk_size - 1)
-    remainder = L % (chunk_size - 1)
-    
-    parts = []
-    if full_chunks > 0:
-        chunk_part = input_ids[:, :full_chunks * (chunk_size - 1)].view(N, full_chunks, chunk_size - 1)
-        fill_tokens = torch.full((N, full_chunks, 1), fill_id, device=input_ids.device, dtype=input_ids.dtype)
-        parts.append(torch.cat([chunk_part, fill_tokens], dim=2).view(N, -1))
-    
-    if remainder > 0:
-        parts.append(input_ids[:, full_chunks * (chunk_size - 1):])
-    
-    return torch.cat(parts, dim=1)
-
-
-
-
-def create_position_ids_with_landmarks(seq_length, chunk_size, device):
-    L = seq_length
-    position_ids = torch.arange(0, seq_length, device=device)
-
-    full_chunks = L // (chunk_size - 1)
-    remainder = L % (chunk_size - 1)
-
-    result_parts = []
-
-    if full_chunks > 0:
-        full_part = position_ids[:full_chunks * (chunk_size - 1)]
-
-        # repeat lmk pos
-        full_part = full_part.view(-1, chunk_size - 1)
-        last_pos = full_part[:, -1:] + 1 
-        full_part = torch.cat([full_part, last_pos], dim=-1) 
-        full_part = full_part.view(-1)
-        result_parts.append(full_part)
-    
-    if remainder > 0:
-        remainder_part = position_ids[full_chunks * chunk_size:]  # (N, remainder)
-        result_parts.append(remainder_part)
-    
-    pos = torch.cat(result_parts, dim=0)
-    return pos.unsqueeze(0)
+from utils.landmark_utils import insert_special_tokens, create_position_ids_with_landmarks
 
 
 def main(args):
@@ -184,7 +139,12 @@ def main(args):
     if args.num_queries > 0:
         task_kwargs['num_queries'] = args.num_queries
         
-    ruler_synthesizer = RulerSynthesizer(tokenizer, task_id=args.task_id, **task_kwargs)
+    ruler_synthesizer = RulerSynthesizer(
+        tokenizer,
+        task_id=args.task_id,
+        enable_ruler_plus=args.enable_ruler_plus or args.task_id in (4, 5),
+        **task_kwargs,
+    )
     
     # 构建 DataLoader
     dataloader = data.DataLoader(
@@ -203,7 +163,14 @@ def main(args):
     # segment_size <= 0 表示不切分，全量推理
     use_chunk_prefill = args.segment_size > 0
     segment_size = args.segment_size if args.segment_size > 0 else args.max_seq_len
-    task_names = {0: "Single NIAH", 1: "Multi Query", 2: "Variable Tracking", 3: "FWE"}
+    task_names = {
+        0: "Single NIAH",
+        1: "Multi Query",
+        2: "Variable Tracking",
+        3: "FWE",
+        4: "PMVL",
+        5: "PCVL",
+    }
     task_name = task_names.get(args.task_id, f"Task {args.task_id}")
 
     print(f"\n{'='*60}")
@@ -236,50 +203,36 @@ def main(args):
             print(f"  Prompt: {prompt_text[:200]}")  # 只打印前200字符
             print(f"  Answer token ids: {labels[0].tolist()}")
             print(f"  Answer text: {answer_text}\n")
-        if args.insert_lmk:
-            
-            # 记录原始序列长度和 answer 起始位置
-            orig_seq_len = input_ids.shape[1]
-            orig_answer_start = orig_seq_len - answer_len  # answer 在原始序列中的起始位置
-            
-            label_ids = input_ids.clone()
-            input_ids = insert_special_tokens(input_ids, fill_id=lmk_id, chunk_size=chunk_size)
-            # 与 eval_ppl.py 保持一致的 label 构造方式
-            label_ids = torch.roll(label_ids, shifts=-1, dims=-1)  # 先左移一位
-            label_ids[:, -1] = -100                                 # 最后一位设为 -100
-            label_ids = insert_special_tokens(label_ids, fill_id=-100, chunk_size=chunk_size)  # 插入 lmk 位置用 -100 填充
-            label_ids = torch.roll(label_ids, shifts=1, dims=-1)   # 再右移一位
+        original_input_ids = input_ids
+        orig_seq_len = input_ids.shape[1]
+        orig_answer_start = orig_seq_len - answer_len
+        pos_ids = None
 
+        if args.insert_lmk:
+            input_ids = insert_special_tokens(input_ids, fill_id=lmk_id, chunk_size=chunk_size)
             if args.adjust_lmk_pos:
-                pos_ids = create_position_ids_with_landmarks(orig_seq_len, chunk_size=chunk_size, device=device)
-            
-            # 计算 answer 起始位置在插入 lmk 后的新位置
-            # 每 (chunk_size-1) 个 token 后会插入 1 个 lmk
-            # 所以位置 i 之前插入了 i // (chunk_size - 1) 个 lmk
-            answer_start_with_lmk = orig_answer_start + (orig_answer_start // (chunk_size - 1))
-            new_seq_len = input_ids.shape[1]
-            answer_len_with_lmk = new_seq_len - answer_start_with_lmk
-        else:
-            label_ids = input_ids.clone()
-            answer_start_with_lmk = input_ids.shape[1] - answer_len
-            answer_len_with_lmk = answer_len
+                pos_ids = create_position_ids_with_landmarks(None, orig_seq_len, chunk_size=chunk_size, device=device)
         
         seq_len = input_ids.shape[1]
         num_segments = (seq_len + segment_size - 1) // segment_size
-        # # [DEBUG] 打印输入序列末尾：答案前3个token + 答案
-        # if batch_idx < 3:
-        #     debug_start = max(0, seq_len - answer_len_with_lmk - 3)
-        #     debug_ids = input_ids[0, debug_start:].tolist()
-        #     print(f"\n[INPUT DEBUG] Sample {batch_idx + 1}: answer前3 + answer")
-        #     for i, tid in enumerate(debug_ids):
-        #         marker = " <-- answer start" if i == 3 else ""
-        #         print(f"  {tid:>8} | {repr(tokenizer.decode([tid]))}{marker}")
-        
-        # 计算 answer 部分的起始位置（用于判断哪些 segment 需要保留 logits）
-        # logits[i] 预测 position i+1，所以预测 answer 需要 logits[answer_start-1:answer_end-1]
-        # 即需要保留从 position (answer_start_with_lmk - 1) 开始的 logits
-        answer_logits_start = seq_len - answer_len_with_lmk - 1  # 需要的 logits 起始位置
-        first_answer_segment = answer_logits_start // segment_size  # 第一个包含 answer logits 的 segment
+
+        # Each answer token is supervised by the logits at its previous original position.
+        # Map those original logit positions to positions after LMK insertion, then gather exactly those logits.
+        orig_answer_token_pos = torch.arange(
+            orig_answer_start,
+            orig_answer_start + answer_len,
+            device=device,
+        )
+        orig_logit_pos = orig_answer_token_pos - 1
+        if torch.any(orig_logit_pos < 0):
+            raise ValueError(f"Invalid answer start: orig_answer_start={orig_answer_start}")
+        if args.insert_lmk:
+            answer_logit_pos = orig_logit_pos + (orig_logit_pos // (chunk_size - 1))
+        else:
+            answer_logit_pos = orig_logit_pos
+        logits_start_pos = int(answer_logit_pos.min().item())
+        logits_to_keep = seq_len - logits_start_pos
+        first_answer_segment = logits_start_pos // segment_size
         
         past_key_values = None
         answer_logits_cpu = None
@@ -296,17 +249,17 @@ def main(args):
                     input_ids=input_ids,
                     cache_position=cache_pos,
                     use_cache=False,
-                    logits_to_keep=answer_len_with_lmk + 1,
-                    position_ids=pos_ids if args.adjust_lmk_pos else None,
+                    logits_to_keep=logits_to_keep,
+                    position_ids=pos_ids,
                 )
                 end_time.record()
                 torch.cuda.synchronize()
                 elapsed_ms = start_time.elapsed_time(end_time)
                 if batch_idx==0:
                     print(f"[Full] seq_len={seq_len}, time={elapsed_ms:.2f}ms")
-                # 只保留 answer 部分的 logits 并立即移到 CPU，释放 GPU 显存
-                # logits[i] 预测 position i+1 的 token，所以取 -(answer_len_with_lmk+1):-1
-                answer_logits_cpu = out.logits[:, :-1, :].cpu()
+                # 只保留 answer 部分对应位置的 logits 并立即移到 CPU，释放 GPU 显存
+                offsets = answer_logit_pos - logits_start_pos
+                answer_logits_cpu = out.logits[:, offsets, :].cpu()
                 del out
                 torch.cuda.empty_cache()
             else:
@@ -332,13 +285,16 @@ def main(args):
                         # 不需要 logits 的 segment，只保留 1 个 token 的 logits 以最小化显存占用
                         seg_logits_to_keep = 1
                     
+                    # 切片 position_ids 以匹配当前 segment
+                    seg_pos_ids = pos_ids[:, start_idx:end_idx] if pos_ids is not None else None
+                    
                     out = model(
                         input_ids=seg_input_ids,
                         cache_position=seg_cache_pos,
                         use_cache=True,
                         past_key_values=past_key_values,
                         logits_to_keep=seg_logits_to_keep,
-                        position_ids=pos_ids if args.adjust_lmk_pos else None,
+                        position_ids=seg_pos_ids,
                     )
                     past_key_values = out.past_key_values
                     
@@ -360,32 +316,24 @@ def main(args):
                 del answer_logits_list
                 
                 # 从 answer_region_logits 中提取真正的 answer logits
-                # answer_region 起始于 first_answer_segment * segment_size
-                # 需要的 logits 起始于 answer_logits_start
-                offset_in_region = answer_logits_start - first_answer_segment * segment_size
-                answer_logits_cpu = answer_region_logits[:, offset_in_region:offset_in_region + answer_len_with_lmk, :]
+                answer_region_start = first_answer_segment * segment_size
+                offsets = (answer_logit_pos - answer_region_start).cpu()
+                answer_logits_cpu = answer_region_logits[:, offsets, :]
                 del answer_region_logits
                 torch.cuda.empty_cache()
         
-        # 提取 answer 部分的 logits 和 labels
+        # 提取 answer 部分的 logits，并直接使用原始 labels 作为 ground truth
         answer_logits = answer_logits_cpu.to(device)
-        answer_labels = label_ids[:, -answer_len_with_lmk:]  # (1, answer_len_with_lmk)
+        answer_labels = labels
         del answer_logits_cpu
         
-        pred_tokens = torch.argmax(answer_logits, dim=-1)  # (1, answer_len_with_lmk)
+        pred_tokens = torch.argmax(answer_logits, dim=-1)  # (1, answer_len)
+        if pred_tokens.shape != answer_labels.shape:
+            raise RuntimeError(f"Shape mismatch: pred={pred_tokens.shape}, label={answer_labels.shape}")
         
-        if args.insert_lmk:
-            # 过滤掉 label=-100 的位置（lmk 插入位置）
-            valid_mask = (answer_labels != -100)
-            # print(f"  valid_mask.sum()={valid_mask.sum().item()} (非 -100 的位置数)")
-            valid_pred = pred_tokens[valid_mask][:-1]  # 用索引截去最后一个 token (EOS)
-            valid_label = answer_labels[valid_mask][:-1]
-            # print(f"  valid_pred.shape={valid_pred.shape}, valid_label.shape={valid_label.shape}")
-        
-        else:
-            # 不插入 lmk 时，也用索引截去最后一个 token (EOS)
-            valid_pred = pred_tokens.flatten()[:-1]
-            valid_label = answer_labels.flatten()[:-1]
+        # 截去最后一个 token (EOS)
+        valid_pred = pred_tokens.flatten()[:-1]
+        valid_label = answer_labels.flatten()[:-1]
         
         # 计算准确率
         correct = (valid_pred == valid_label).sum().item()
@@ -418,6 +366,30 @@ def main(args):
                 # 逐个对比
                 match_status = ['✓' if p == l else '✗' for p, l in zip(valid_pred.tolist(), valid_label.tolist())]
                 print(f"  Match status:    {match_status}\n")
+
+                try:
+                    pred_text = tokenizer.decode(valid_pred.tolist(), skip_special_tokens=True)
+                    label_text = tokenizer.decode(valid_label.tolist(), skip_special_tokens=True)
+                    prompt_token_ids = original_input_ids[0, :-answer_len].tolist()
+                    prompt_text = tokenizer.decode(prompt_token_ids, skip_special_tokens=True)
+
+                    pred_text_clean = pred_text.strip().rstrip(".").strip()
+                    label_text_clean = label_text.strip().rstrip(".").strip()
+
+                    pred_in_prompt = pred_text_clean and pred_text_clean in prompt_text
+                    label_in_prompt = label_text_clean and label_text_clean in prompt_text
+                    pred_first_in_prompt = False
+                    if pred_text_clean:
+                        pred_first_token = pred_text_clean[: max(1, len(label_text_clean) // 2)] if label_text_clean else pred_text_clean
+                        pred_first_in_prompt = pred_first_token in prompt_text
+
+                    print(f"  Pred text:       {pred_text!r}")
+                    print(f"  Label text:      {label_text!r}")
+                    print(f"  Pred in prompt?  {bool(pred_in_prompt)} (full string)")
+                    print(f"  Label in prompt? {bool(label_in_prompt)} (sanity check)")
+                    print(f"  Pred prefix in prompt? {bool(pred_first_in_prompt)}\n")
+                except Exception as exc:
+                    print(f"  [debug decode error] {type(exc).__name__}: {exc}\n")
     
     # 最终结果
     final_token_acc = total_correct_tokens / total_tokens if total_tokens > 0 else 0
@@ -437,8 +409,8 @@ if __name__ == "__main__":
     cmd.add_argument('--vocab_dir', required=True, type=str, help='Path to tokenizer vocab')
     cmd.add_argument('--corpus_path', required=True, type=str, help='Path to tokenized numpy corpus')
     cmd.add_argument('--checkpoint_path', required=False, type=str, default=None, help='Path to checkpoint')
-    cmd.add_argument('--task_id', type=int, default=0, choices=[0, 1, 2, 3],
-                     help='Task ID: 0=Single NIAH, 1=Multi Query, 2=Variable Tracking, 3=FWE')
+    cmd.add_argument('--task_id', type=int, default=0, choices=[0, 1, 2, 3, 4, 5],
+                     help='Task ID: 0=Single NIAH, 1=Multi Query, 2=Variable Tracking, 3=FWE, 4=PMVL, 5=PCVL')
     cmd.add_argument('--max_seq_len', type=int, default=8192, help='Max sequence length')
     cmd.add_argument('--segment_size', type=int, default=4096, help='Segment size for chunk prefill. Set to 0 or negative to disable chunk prefill (full inference)')
     cmd.add_argument('--insert_lmk', action='store_true', help='Insert landmark tokens for HSA model')
@@ -450,6 +422,7 @@ if __name__ == "__main__":
     cmd.add_argument('--num_queries', type=int, default=-1, help='Number of queries for MQ task')
     cmd.add_argument('--tp_size', type=int, default=1, help='Tensor Parallel size (1=single GPU, >1=multi-GPU TP)')
     cmd.add_argument('--adjust_lmk_pos', action='store_true', help='Adjust position ids for landmarks')
+    cmd.add_argument('--enable_ruler_plus', action='store_true', help='Enable Ruler-Plus tasks')
     
     
     args = cmd.parse_args()

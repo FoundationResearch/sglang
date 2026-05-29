@@ -36,7 +36,7 @@ from veomni.utils.device import (
 )
 from veomni.utils.dist_utils import all_reduce
 from veomni.utils.loss_utils import count_loss_token, mean_global_loss
-from utils.arguments import OLmo3DataArguments
+from utils.arguments import OLmo3DataArguments, ExtendedTrainingArguments
 from data import process_numpy_example
 import models
 
@@ -48,7 +48,7 @@ logger = helper.create_logger(__name__)
 class Arguments:
     model: "ModelArguments" = field(default_factory=ModelArguments)
     data: "DataArguments" = field(default_factory=OLmo3DataArguments)
-    train: "TrainingArguments" = field(default_factory=TrainingArguments)
+    train: "TrainingArguments" = field(default_factory=ExtendedTrainingArguments)
 
 
 def main():
@@ -226,15 +226,22 @@ def main():
     )
 
     if args.train.load_checkpoint_path:
-        state = {"model": model, "optimizer": optimizer, "extra_state": {}}  # cannot be None
+        state = {"model": model, "extra_state": {}}  # extra_state cannot be None
+        if getattr(args.train, "load_optimizer_state", True):
+            state["optimizer"] = optimizer
+
         Checkpointer.load(args.train.load_checkpoint_path, state)
         global_step = state["extra_state"]["global_step"]
         start_epoch = global_step // args.train.train_steps
         start_step = global_step % args.train.train_steps
-        lr_scheduler.load_state_dict(state["extra_state"]["lr_scheduler"])
-        train_dataloader.load_state_dict(state["extra_state"]["train_dataloader"])
-        environ_meter.load_state_dict(state["extra_state"]["environ_meter"])
-        torch.set_rng_state(state["extra_state"]["torch_rng_state"])
+        if getattr(args.train, "load_lr_scheduler_state", True):
+            lr_scheduler.load_state_dict(state["extra_state"]["lr_scheduler"])
+        if getattr(args.train, "load_dataloader_state", True):
+            train_dataloader.load_state_dict(state["extra_state"]["train_dataloader"])
+        if getattr(args.train, "load_environ_meter_state", True):
+            environ_meter.load_state_dict(state["extra_state"]["environ_meter"])
+        if getattr(args.train, "load_rng_state", True):
+            torch.set_rng_state(state["extra_state"]["torch_rng_state"])
         if start_step == 0:  # resume at the end of epoch
             iter(train_dataloader)  # clear resume state and prefetch data
 

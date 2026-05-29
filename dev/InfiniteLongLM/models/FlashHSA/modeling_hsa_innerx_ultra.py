@@ -369,7 +369,9 @@ class HierarchicalSparseAttention(nn.Module):
             **kwargs,
         )  # (B, L, h_q // 2, d)
 
-        lmk_k: Any = hsa_k_norm[:, self.chunk_size - 1::self.chunk_size, : ,:]  # (B, L // S, h_kv // 2, d
+        lmk_k = hsa_k_norm[:, self.chunk_size - 1::self.chunk_size, :, :]  # (B, L // S, h_kv // 2, d
+        B, S, _, _ = lmk_k.shape
+        lmk_k = lmk_k.reshape(B, S, self.h_hsa_kv, self.head_dim) 
         if L >= self.chunk_size:
             hsa_visible_window = self.hsa_visible_window if self.training else -1
             indices, scores = self.topk_func(
@@ -378,15 +380,15 @@ class HierarchicalSparseAttention(nn.Module):
                 self.topk, 
                 block_size=self.chunk_size, 
                 window_size=0,
-                memory_window_size=hsa_visible_window,
                 q_offset=q_offset,
-                is_causal=True
+                is_causal=True,
+                is_training=self.training,
             )
             # print(f'scores shape: {scores.shape}, lmk q shape: {lmk_q_norm.shape}, kv_shape: {lmk_k.shape}')
 
             chunk_weights = self._compute_weights(scores, B, L, hidden_states)
 
-            hsa_o = self.hsa_func(hsa_q_norm, hsa_k_norm, hsa_v, weights=chunk_weights, indices=indices, block_size=self.chunk_size, mask_last_token=True)
+            hsa_o = self.hsa_func(hsa_q_norm, hsa_k_norm, hsa_v, weights=chunk_weights, indices=indices, block_size=self.chunk_size, mask_last_token=True, is_training=self.training)
         else:
             hsa_o = torch.zeros(B, L, self.hsa_heads, self.head_dim, device=hidden_states.device, dtype=hidden_states.dtype)
         o = torch.cat([swa_o, hsa_o], dim=2)
@@ -892,7 +894,7 @@ class HSAForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
     _tp_plan = {"lm_head": "colwise_rep"}
     _pp_plan = {"lm_head": (["hidden_states"], ["logits"])}
 
-    def __init__(self, config):
+    def __init__(self, config, **kwargs):
         super().__init__(config)
         self.model = HSAModel(config)
         self.vocab_size = next_of_y(config.vocab_size + 1, 32)
@@ -901,6 +903,10 @@ class HSAForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
         self.lm_head = nn.Linear(config.hidden_size, self.vocab_size, bias=False)
         self.adjust_lmk_pos = getattr(config, "adjust_lmk_pos", False)
         self.flatten_ids = getattr(config, 'flatten_ids', False)
+
+        _auto_lmk = kwargs.pop('auto_insert_lmk', None) or getattr(config, 'auto_insert_lmk', False)
+        self.auto_insert_lmk = str(_auto_lmk).lower() in ('true', '1', 'yes') if isinstance(_auto_lmk, str) else bool(_auto_lmk)
+        # print(f'auto_insert_lmk: {self.auto_insert_lmk}')
 
         # Initialize weights and apply final processing
         self.post_init()
@@ -984,7 +990,7 @@ class HSAForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
 
             if self.adjust_lmk_pos:
                 position_ids = create_position_ids_with_landmarks(
-                    input_ids.shape[1], self.chunk_size, input_ids.device
+                    None, input_ids.shape[1], self.chunk_size, input_ids.device
                 )
 
             input_ids = insert_special_tokens(input_ids, self.lmk_id, self.chunk_size)
@@ -1000,6 +1006,19 @@ class HSAForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
                 else:
                     # labels have been shifted
                     labels = insert_special_tokens(labels, -100, self.chunk_size)
+
+
+        if not self.training and self.auto_insert_lmk:
+            if self.adjust_lmk_pos:
+                position_ids = create_position_ids_with_landmarks(
+                    None, input_ids.shape[1], self.chunk_size, input_ids.device
+                )
+            input_ids = insert_special_tokens(input_ids, self.lmk_id, self.chunk_size)
+            new_seq_len = input_ids.shape[1]
+            pos_indices = torch.arange(new_seq_len, device=input_ids.device)
+            is_lmk = pos_indices % self.chunk_size == self.chunk_size - 1
+            non_lmk_mask = ~is_lmk
+
 
         # decoder outputs consists of (dec_features, layer_state, dec_hidden, dec_attn)
 
@@ -1018,6 +1037,10 @@ class HSAForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
 
         hidden_states = outputs.last_hidden_state
         # Only compute necessary logits, and do not upcast them to float if we are not computing the loss
+
+        if self.auto_insert_lmk:
+            hidden_states = hidden_states[:, non_lmk_mask, :]
+        
         slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
         hidden_states = hidden_states[:, slice_indices, :]
 

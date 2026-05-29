@@ -41,9 +41,17 @@ if is_torch_flex_attn_available():
 
 
 if is_liger_kernel_available():
-    from liger_kernel.transformers.rms_norm import LigerRMSNorm
     from liger_kernel.transformers.rope import liger_rotary_pos_emb
     from liger_kernel.transformers.swiglu import LigerSwiGLUMLP
+
+
+rms_norm_fn = None
+
+try:
+    from flash_attn.ops.triton.layer_norm import rms_norm_fn
+    USE_FLASH_ATTN_RMSNORM = True
+except ImportError:
+    USE_FLASH_ATTN_RMSNORM = False
 
 
 logger = logging.get_logger(__name__)
@@ -75,6 +83,29 @@ class Qwen3RMSNorm(nn.Module):
 
     def extra_repr(self):
         return f"{tuple(self.weight.shape)}, eps={self.variance_epsilon}"
+
+
+class Qwen3FlashAttnRMSNorm(Qwen3RMSNorm):
+    def forward(self, hidden_states):
+        global rms_norm_fn
+        if rms_norm_fn is None:
+            try:
+                from flash_attn.ops.triton.layer_norm import rms_norm_fn as flash_attn_rms_norm_fn
+            except ImportError as exc:
+                raise ImportError(
+                    "flash_attn.ops.triton.layer_norm.rms_norm_fn is required for Qwen3FlashAttnRMSNorm."
+                ) from exc
+            rms_norm_fn = flash_attn_rms_norm_fn
+
+        hidden_shape = hidden_states.shape
+        hidden_states = hidden_states.reshape(-1, hidden_shape[-1])
+        hidden_states = rms_norm_fn(
+            hidden_states,
+            self.weight,
+            None,
+            eps=self.variance_epsilon,
+        )
+        return hidden_states.reshape(hidden_shape)
 
 
 class Qwen3MLP(nn.Module):
@@ -199,6 +230,8 @@ class Qwen3Attention(nn.Module):
         else:
             self.apply_rope = getattr(config, 'rope_full_attn', False)
             self.sliding_window = None
+        
+        print(f'init Qwen3Attention, layer_idx: {layer_idx}, mode: {mode}, apply_rope: {self.apply_rope}, sliding_window: {self.sliding_window}')
 
     def forward(
         self,
@@ -774,9 +807,11 @@ class SWANGPTForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
 
 if is_liger_kernel_available():
     apply_rotary_pos_emb = liger_rotary_pos_emb
-    Qwen3RMSNorm = LigerRMSNorm
     Qwen3MLP = LigerSwiGLUMLP
     logger.info_rank0("Apply liger kernel to Qwen3.")
+if USE_FLASH_ATTN_RMSNORM:
+    Qwen3RMSNorm = Qwen3FlashAttnRMSNorm
+    logger.info_rank0("Apply flash-attn RMSNorm kernel to Qwen3.")
 
 if is_torch_npu_available() and is_transformers_version_greater_or_equal_to("4.50.4"):
     from .npu_patch import apply_qwen3_npu_patch

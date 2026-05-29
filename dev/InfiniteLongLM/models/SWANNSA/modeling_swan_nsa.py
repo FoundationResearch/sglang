@@ -3,6 +3,7 @@ from typing import Callable, Literal, Optional, Tuple, Union
 
 import torch
 from torch import nn
+import torch.nn.functional as F
 from einops import rearrange
 from transformers.activations import ACT2FN
 from transformers.cache_utils import Cache, DynamicCache
@@ -297,13 +298,38 @@ class NativeSparseAttention(nn.Module):
         self.g_proj = nn.Linear(self.hidden_size, self.num_heads * 3, bias=False)
         self.o_proj = nn.Linear(self.num_heads * self.head_dim, self.hidden_size, bias=False)
 
-        # self.rotary = RotaryEmbedding(dim=self.head_dim, base=self.rope_theta)
+        # --- NSA kernel q-head padding ---
+        # The native_sparse_attention kernel requires the q/kv head ratio (group
+        # size) to be a multiple of ``nsa_kernel_min_group_size`` (16). When the
+        # real group size (num_heads / num_kv_heads) does not satisfy this, we
+        # pad the q heads (and the corresponding gate values) up to the next
+        # multiple of 16 at runtime, run the kernel on the padded tensors, and
+        # slice the output back to the real group size. All pad slots have
+        # gate value 0 so they do not affect the real heads.
+        assert self.num_heads % self.num_kv_heads == 0, (
+            f"num_heads ({self.num_heads}) must be divisible by "
+            f"num_kv_heads ({self.num_kv_heads})."
+        )
+        self.nsa_kernel_min_group_size = 16
+        self.real_group_size = self.num_heads // self.num_kv_heads
+        # round real_group_size up to a multiple of nsa_kernel_min_group_size.
+        self.padded_group_size = (
+            (self.real_group_size + self.nsa_kernel_min_group_size - 1)
+            // self.nsa_kernel_min_group_size
+            * self.nsa_kernel_min_group_size
+        )
+        self.pad_per_group = self.padded_group_size - self.real_group_size
+        self.padded_num_heads = self.padded_group_size * self.num_kv_heads
+        # --- end NSA kernel q-head padding ---
 
-        # 只有在use_rope=True时才创建RotaryEmbedding
-        if self.use_rope:
-            self.rotary = RotaryEmbedding(dim=self.head_dim, base=self.rope_theta)
-        else:
-            self.rotary = None
+        # NOTE: We deliberately do NOT instantiate any RotaryEmbedding inside the
+        # NSA block. The fla RotaryEmbedding has a meta-init issue (inv_freq is
+        # not re-computed on real device after meta -> cuda materialization),
+        # which silently breaks RoPE during training launched with init_device=meta.
+        # Instead, RoPE (cos, sin) is produced once by the model-level
+        # Qwen3RotaryEmbedding (which has the reinit fix) and forwarded into
+        # this layer via ``position_embeddings``. See ``forward`` below.
+        self.rotary = None
 
         # # Debug: 打印NSA层的所有关键参数
         # print(
@@ -321,6 +347,7 @@ class NativeSparseAttention(nn.Module):
         past_key_values: Optional[Cache] = None,
         output_attentions: bool = False,
         use_cache: bool = False,
+        position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         **kwargs,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
         if attention_mask is not None:
@@ -354,8 +381,18 @@ class NativeSparseAttention(nn.Module):
             max_seqlen = max(max_seqlen, self.max_position_embeddings)
         
         if self.use_rope:
-            q, k = self.rotary(q, k, seqlen_offset=seqlen_offset, max_seqlen=max_seqlen, cu_seqlens=cu_seqlens)
-
+            assert position_embeddings is not None, (
+                "NativeSparseAttention with use_rope=True requires "
+                "position_embeddings (cos, sin) to be passed in from the model. "
+                "Make sure SWANNSAModel forwards position_embeddings to NSA layers."
+            )
+            cos, sin = position_embeddings
+            # apply_rotary_pos_emb expects (q, k) in [B, H, T, D]; here q/k are [B, T, H, D].
+            q = q.transpose(1, 2)
+            k = k.transpose(1, 2)
+            q, k = apply_rotary_pos_emb(q, k, cos, sin)
+            q = q.transpose(1, 2).contiguous()
+            k = k.transpose(1, 2).contiguous()
 
         if past_key_values is not None:
             cache_has_content = past_key_values.get_seq_length(self.layer_idx) > 0
@@ -370,19 +407,46 @@ class NativeSparseAttention(nn.Module):
                 k = rearrange(k, '... (h d) -> ... h d', d=self.head_dim)
                 v = rearrange(v, '... (h d) -> ... h d', d=self.head_dim)
 
+        if self.pad_per_group > 0:
+            # q: [B, L, K*G, D] -> [B, L, K, G, D] -> pad last G dim -> [B, L, K, G', D] -> [B, L, K*G', D]
+            q_nsa = rearrange(q, 'b l (k g) d -> b l k g d', k=self.num_kv_heads)
+            q_nsa = F.pad(q_nsa, (0, 0, 0, self.pad_per_group), value=0.0)
+            q_nsa = rearrange(q_nsa, 'b l k g d -> b l (k g) d')
+
+            def _pad_gate(gate):
+                gate = rearrange(gate, 'b l (k g) -> b l k g', k=self.num_kv_heads)
+                gate = F.pad(gate, (0, self.pad_per_group), value=0.0)
+                return rearrange(gate, 'b l k g -> b l (k g)')
+
+            g_cmp_nsa = _pad_gate(g_cmp)
+            g_slc_nsa = _pad_gate(g_slc)
+            g_swa_nsa = _pad_gate(g_swa)
+        else:
+            q_nsa = q
+            g_cmp_nsa = g_cmp
+            g_slc_nsa = g_slc
+            g_swa_nsa = g_swa
+
         o = parallel_nsa(
-            q=q,
+            q=q_nsa,
             k=k,
             v=v,
-            g_cmp=g_cmp,
-            g_slc=g_slc,
-            g_swa=g_swa,
+            g_cmp=g_cmp_nsa,
+            g_slc=g_slc_nsa,
+            g_swa=g_swa_nsa,
             block_size=self.block_size,
             block_counts=self.block_counts,
             window_size=self.window_size,
             cu_seqlens=cu_seqlens,
             head_first=False
         )
+
+        if self.pad_per_group > 0:
+            # o: [B, L, K*G', D] -> [B, L, K, G', D] -> take first real G -> [B, L, K*G, D]
+            o = rearrange(o, 'b l (k g) d -> b l k g d', k=self.num_kv_heads)
+            o = o[:, :, :, :self.real_group_size, :]
+            o = rearrange(o, 'b l k g d -> b l (k g) d')
+
         o = o.reshape(batch_size, seq_len, -1)
         o = self.o_proj(o)
 
@@ -459,6 +523,7 @@ class Qwen3DecoderLayer(GradientCheckpointingLayer):
                 past_key_values=past_key_value,  # 注意参数名不同
                 output_attentions=output_attentions,
                 use_cache=use_cache,
+                position_embeddings=position_embeddings,
                 **kwargs,
             )
         else:
