@@ -174,12 +174,15 @@ def main() -> int:
     gen = torch.Generator(device=device).manual_seed(args.seed)
 
     cfg, model = build_official(cfg_dict, device=device, dtype=dtype)
-    # NOTE: keep eval() mode — the model's training-mode forward path calls a
-    # 4-arg create_position_ids_with_landmarks that doesn't exist in this
-    # version of InfiniteLongLM/utils/. We pre-insert LMK in synthetic_batch,
-    # so eval mode is correct and avoids that broken branch. Dropout is off,
-    # which is fine and actually preferable for deterministic alignment runs.
+    # Outer model in eval() so hsa_forward.py skips the auto-LMK-insert branch
+    # (we pre-insert LMK in synthetic_batch). But the HSA kernel's backward
+    # needs forward to run with `is_training=True` so it stashes the merged
+    # indices / ScoresLSE — set just the LandmarkHSA modules to train().
     model.eval()
+    from models.FlashHSA.lhsa_layer import LandmarkHSA as _LandmarkHSA
+    for mod in model.modules():
+        if isinstance(mod, _LandmarkHSA):
+            mod.training = True
     for p in model.parameters():
         p.requires_grad_(True)
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
