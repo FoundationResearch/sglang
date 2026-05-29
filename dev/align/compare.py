@@ -86,7 +86,8 @@ def official_prefill_logits(model, tokens, page_size: int, vocab_size: int, devi
     """Forward the full tokens (with LMK inserted) through the official model.
     Returns logits[:, :, :vocab_size] in fp32."""
     ids = insert_special_tokens(torch.tensor([tokens]), vocab_size, page_size).to(device)
-    pos = create_position_ids_with_landmarks(len(tokens), page_size, device)
+    # 2026-05-21: new signature is (position_ids, seq_length, chunk_size, device); None reproduces old auto-arange.
+    pos = create_position_ids_with_landmarks(None, len(tokens), page_size, device)
     with torch.no_grad():
         out = model(input_ids=ids, position_ids=pos, attention_mask=None, use_cache=False)
     return out.logits[:, :, :vocab_size].float()

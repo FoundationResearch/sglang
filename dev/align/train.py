@@ -108,7 +108,9 @@ def synthetic_batch(batch_size: int, seq_len: int, vocab_size: int, page_size: i
     )
     # insert_special_tokens expects a [B, L] LongTensor on CPU (it uses python ints)
     ids_with_lmk = insert_special_tokens(real.cpu(), vocab_size, page_size).to(device)
-    pos = create_position_ids_with_landmarks(seq_len, page_size, device).expand(batch_size, -1)
+    # 2026-05-21: new utils/landmark_utils.create_position_ids_with_landmarks takes 4 args
+    # (position_ids, seq_length, chunk_size, device). Pass None to get the same auto-arange behavior.
+    pos = create_position_ids_with_landmarks(None, seq_len, page_size, device).expand(batch_size, -1)
     # Labels: shifted ids; ignore LMK positions (id == vocab_size)
     labels = ids_with_lmk.clone()
     labels[ids_with_lmk == vocab_size] = -100

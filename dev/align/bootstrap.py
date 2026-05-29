@@ -34,8 +34,19 @@ for sub in [
     'veomni.distributed.sequence_parallel', 'veomni.utils', 'veomni.utils.logging',
     'veomni.utils.import_utils', 'veomni.models', 'veomni.models.module_utils',
     'veomni.models.loader',
+    # 2026-05-21: new FlashHSA imports require these veomni submodules to exist.
+    'veomni.utils.env',
 ]:
     sys.modules[sub] = types.ModuleType(sub)
+
+
+# veomni.utils.env.get_env: in tests we want a 'key missing' behavior so the
+# code path uses its default values.
+def _get_env(name):
+    raise KeyError(name)
+
+
+sys.modules['veomni.utils.env'].get_env = _get_env
 
 
 class _PS:
@@ -107,7 +118,8 @@ def _flex_attn_ref(q, k, v, window_size, chunk_size, training=False, cu_seq_lens
 
 # Mark fake `utils` as a namespace-package by setting __path__ to the real
 # InfiniteLongLM/utils directory. This way `from utils.flex_attn import ...`
-# uses the mock, but `from utils.landmark_utils import ...` finds the real file.
+# uses the mock for `flex_attn` itself, but `from utils.landmark_utils import ...`
+# finds the real file.
 _HERE_BS = os.path.dirname(os.path.abspath(__file__))
 _ILL_UTILS = os.path.join(os.path.dirname(_HERE_BS), 'InfiniteLongLM', 'utils')
 _utils_pkg = types.ModuleType('utils')
@@ -115,6 +127,20 @@ _utils_pkg.__path__ = [_ILL_UTILS]
 sys.modules['utils'] = _utils_pkg
 _flex_mod = types.ModuleType('utils.flex_attn')
 _flex_mod.flex_attn = _flex_attn_ref
+# 2026-05-21: new hsa_forward.py imports cu_seqlens_to_doc_ids from utils.flex_attn.
+# Mock module needs to re-expose it. Inline the impl (pure tensor ops, no kernel).
+def _cu_seqlens_to_doc_ids(cu_seq_lens, total_len, device):
+    if not isinstance(cu_seq_lens, torch.Tensor):
+        cu_seq_lens = torch.tensor(cu_seq_lens, dtype=torch.int32, device=device)
+    else:
+        cu_seq_lens = cu_seq_lens.to(device)
+    doc_ids = torch.zeros(total_len, dtype=torch.int32, device=device)
+    boundaries = cu_seq_lens[1:-1]
+    if boundaries.numel() > 0:
+        doc_ids[boundaries.long()] = 1
+        doc_ids = doc_ids.cumsum(0)
+    return doc_ids
+_flex_mod.cu_seqlens_to_doc_ids = _cu_seqlens_to_doc_ids
 sys.modules['utils.flex_attn'] = _flex_mod
 
 
@@ -148,19 +174,20 @@ sys.modules['models.DRT.configuration_hsa'] = _drt_cfg
 # ---------------------------------------------------------------------------
 # 3. Import official model + apply patches
 # ---------------------------------------------------------------------------
-from models.DRT.modeling_olmo_lhsa import (
+# 2026-05-21 refactor: modeling_olmo_lhsa / lhsa_layer moved from DRT/ to FlashHSA/.
+from models.FlashHSA.modeling_olmo_lhsa import (
     HSAForCausalLM as OfficialModel,
     HSAModel,
     Olmo3Attention,
 )
-from models.DRT.lhsa_layer import LandmarkHSA
+from models.FlashHSA.lhsa_layer import LandmarkHSA
 from utils.landmark_utils import insert_special_tokens, create_position_ids_with_landmarks  # noqa: F401
 
 OfficialConfig = _HSAConfig
 
 # Eager attention path silently ignores `sliding_window` kwarg in HF.
 # Patch it to apply a real SWA mask so the reference matches FA2.
-import models.DRT.lhsa_layer as _lhsa_mod
+import models.FlashHSA.lhsa_layer as _lhsa_mod
 
 _orig_eager_attn = _lhsa_mod.eager_attention_forward
 
@@ -189,8 +216,14 @@ _orig_lhsa_init = LandmarkHSA.__init__
 
 def _patched_lhsa_init(self, config, layer_idx, norm_cls=None, **kwargs):
     _orig_lhsa_init(self, config, layer_idx, norm_cls)
+    # 2026-05-21: new architecture's SWA branch uses (h_q // hsa_denom) Q heads
+    # and the FULL h_kv KV heads, so repeat_kv must broadcast by
+    # (h_q // hsa_denom) // h_kv, not the old (h_q // h_kv).
     if not hasattr(self, 'num_key_value_groups'):
-        self.num_key_value_groups = config.num_attention_heads // config.num_key_value_heads
+        hsa_heads = getattr(config, 'hsa_heads', config.num_attention_heads // 4)
+        hsa_denom = config.num_attention_heads // hsa_heads
+        q_heads_per_branch = config.num_attention_heads // hsa_denom
+        self.num_key_value_groups = q_heads_per_branch // config.num_key_value_heads
 
 
 LandmarkHSA.__init__ = _patched_lhsa_init
@@ -206,32 +239,30 @@ def _patched_olmo3_attn_init(self, config, layer_idx, **kwargs):
 
 Olmo3Attention.__init__ = _patched_olmo3_attn_init
 
-# Wrap tilelang kernels so extra kwargs from newer DRT are accepted, and inputs
-# are made contiguous (otherwise tilelang trips on strides).
+# Wrap tilelang kernels to force inputs contiguous (tilelang trips on strides)
+# and to silently drop any old-API kwargs that the new unified signatures no
+# longer accept (e.g. `memory_window_size` was removed in the 2026-05 refactor).
 import ops.topk_group as _tm
 import ops.hsa_fwd_bwd_group as _hm
 
 _orig_topk = _tm.online_topk_group
 _orig_hsa = _hm.HSA_block_M_group
 
-
-def _patched_topk(q, k, topk, block_size, window_size, memory_window_size=-1, is_causal=True, **kw):
-    return _orig_topk(
-        q.contiguous(), k.contiguous(),
-        topk,
-        block_size=block_size,
-        window_size=window_size,
-        memory_window_size=memory_window_size,
-        is_causal=is_causal,
-    )
+# Kwargs the new APIs no longer accept; drop them silently rather than crash.
+_DROPPED_TOPK_KW = {"memory_window_size"}
+_DROPPED_HSA_KW = {"memory_window_size"}
 
 
-def _patched_hsa(q, k, v, weights, indices, block_size, mask_last_token=True, **kw):
-    return _orig_hsa(
-        q.contiguous(), k.contiguous(), v.contiguous(),
-        weights=weights, indices=indices,
-        block_size=block_size, mask_last_token=mask_last_token,
-    )
+def _patched_topk(q, k, *args, **kw):
+    for _k in _DROPPED_TOPK_KW:
+        kw.pop(_k, None)
+    return _orig_topk(q.contiguous(), k.contiguous(), *args, **kw)
+
+
+def _patched_hsa(q, k, v, *args, **kw):
+    for _k in _DROPPED_HSA_KW:
+        kw.pop(_k, None)
+    return _orig_hsa(q.contiguous(), k.contiguous(), v.contiguous(), *args, **kw)
 
 
 _tm.online_topk_group = _patched_topk
@@ -292,15 +323,40 @@ def init_sglang_dist():
 
 def transfer_official_to_sglang(src, dst):
     """Copy weights from official OLMo-LHSA into sglang flash_hsa, handling the
-    gate_proj+up_proj → gate_up_proj merge."""
+    gate_proj+up_proj → gate_up_proj merge AND the 2026-05-21 single-projection
+    rename: official uses {q,k,v}_proj where sglang's InnerX still names them
+    hsa_{q,k,v}_proj (the "hsa branch" half of the old dual-projection design;
+    with hsa_denom=1 there is no SWA branch so they're the only projections)."""
     ssd = src.state_dict()
     dsd = dst.state_dict()
+
+    # Rename map: sglang's name -> official's name. Used as a fallback when the
+    # exact name isn't in ssd; only fires if the shape matches.
+    _RENAME_SGLANG_TO_OFFICIAL = {
+        '.self_attn.hsa_q_proj.': '.self_attn.q_proj.',
+        '.self_attn.hsa_k_proj.': '.self_attn.k_proj.',
+        '.self_attn.hsa_v_proj.': '.self_attn.v_proj.',
+    }
+
+    def _renamed(name: str) -> str | None:
+        for sg_key, off_key in _RENAME_SGLANG_TO_OFFICIAL.items():
+            if sg_key in name:
+                return name.replace(sg_key, off_key)
+        return None
+
     loaded, total, skipped = 0, len(dsd), []
     for name, param in dsd.items():
         if name in ssd and ssd[name].shape == param.shape:
             param.data.copy_(ssd[name])
             loaded += 1
-        elif ('embed_tokens' in name or 'lm_head' in name) and name in ssd:
+            continue
+        # Try rename (sglang hsa_*_proj -> official *_proj).
+        rn = _renamed(name)
+        if rn is not None and rn in ssd and ssd[rn].shape == param.shape:
+            param.data.copy_(ssd[rn])
+            loaded += 1
+            continue
+        if ('embed_tokens' in name or 'lm_head' in name) and name in ssd:
             mr = min(ssd[name].shape[0], param.shape[0])
             param.data[:mr].copy_(ssd[name][:mr])
             loaded += 1

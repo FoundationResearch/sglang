@@ -423,6 +423,18 @@ class FlashHSAInnerXHierarchicalSparseAttention(nn.Module):
             prefix=add_prefix("hsa_v_proj", prefix),
         )
         self.enable_lmk_q_proj = bool(getattr(config, "enable_lmk_q_proj", False))
+        # 2026-05-21 single-projection rewrite: new upstream lhsa_layer.py uses
+        # nn.Linear(d_model, d_model) for lmk_q_proj (h_q heads × head_dim, one
+        # per attention head), then per-head RMSNorm over head_dim. The old dual-
+        # projection path here used hk_hsa-head lmk_q_proj of size retrieval_dim
+        # and broadcast kv→q in forward. We switch to the new shape when the
+        # config is in canonical "no SWA branch" mode (hsa_denom=1, i.e.
+        # hsa_heads == num_attention_heads). For configs that still have an SWA
+        # branch (hsa_denom > 1) we keep the old behaviour for back-compat.
+        _hsa_heads_cfg = int(getattr(config, "hsa_heads", self.total_num_heads))
+        _hsa_denom_cfg = self.total_num_heads // _hsa_heads_cfg if _hsa_heads_cfg > 0 else 1
+        self.lmk_q_full_dim = (_hsa_denom_cfg == 1)
+
         retrieval_head_num_total = 1 if self.unified_retrieval else self.hk_hsa_total
         default_retrieval_dim = self.hk_hsa_total * self.head_dim
         self.retrieval_dim = int(getattr(config, "retrieval_dim", None) or default_retrieval_dim)
@@ -432,11 +444,18 @@ class FlashHSAInnerXHierarchicalSparseAttention(nn.Module):
         retrieval_head_num_local = 1 if self.unified_retrieval else self.hk_hsa
         self.lmk_q_norm_dim = self.retrieval_dim // retrieval_head_num_total
         self.lmk_q_norm_dim_local = (self.retrieval_dim // attn_tp_size) // retrieval_head_num_local
+
         if self.enable_lmk_q_proj:
-            self.lmk_q_norm = RMSNorm(self.lmk_q_norm_dim, eps=rms_norm_eps, **norm_kwargs)
+            if self.lmk_q_full_dim:
+                # New-arch lmk_q_proj: one head_dim per q-head, no GQA broadcast in forward.
+                _lmk_q_out_dim_total = self.hq_hsa_total * self.head_dim
+                self.lmk_q_norm = RMSNorm(self.head_dim, eps=rms_norm_eps, **norm_kwargs)
+            else:
+                _lmk_q_out_dim_total = self.retrieval_dim
+                self.lmk_q_norm = RMSNorm(self.lmk_q_norm_dim, eps=rms_norm_eps, **norm_kwargs)
             self.lmk_q_proj = ColumnParallelLinear(
                 self.hidden_size,
-                self.retrieval_dim,
+                _lmk_q_out_dim_total,
                 bias=attention_bias,
                 quant_config=quant_config,
                 tp_rank=attn_tp_rank,
@@ -541,40 +560,60 @@ class FlashHSAInnerXHierarchicalSparseAttention(nn.Module):
         # --- Selection query ---
         if self.enable_lmk_q_proj and self.lmk_q_proj is not None:
             # Separate lmk_q_proj for page selection (NO RoPE).
-            lmk_q, _ = self.lmk_q_proj(hidden_states)  # [T, retrieval_dim // tp_size]
-            rhn = self.retrieval_head_num  # 1 for unified, hk_hsa for standard
-            # All-gather → norm → split to match training semantics.
+            lmk_q, _ = self.lmk_q_proj(hidden_states)  # [T, out_dim // tp_size]
             attn_tp_size = get_attention_tp_size()
-            if attn_tp_size > 1:
-                lmk_q = tensor_model_parallel_all_gather(lmk_q.contiguous())
-            norm_dim = self.lmk_q_norm_dim  # full (non-TP-split) norm dim
-            rhn_for_norm = 1 if self.unified_retrieval else (self.hk_hsa * attn_tp_size if attn_tp_size > 1 else self.hk_hsa)
-            lmk_q_3 = lmk_q.view(-1, rhn_for_norm, norm_dim)
-            # RMSNorm expects 2D; apply over norm_dim with flatten/unflatten.
-            lmk_q_norm = self.lmk_q_norm(lmk_q_3.reshape(-1, norm_dim)).reshape(
-                lmk_q_3.shape[0], lmk_q_3.shape[1], lmk_q_3.shape[2]
-            )  # [T, rhn_for_norm, norm_dim]
-            if attn_tp_size > 1:
-                # Split back to local heads.
-                tp_rank = get_attention_tp_rank()
-                lmk_q_flat = lmk_q_norm.reshape(lmk_q_norm.shape[0], -1)  # [T, retrieval_dim]
-                lmk_q_flat = split_tensor_along_last_dim(lmk_q_flat, attn_tp_size)[tp_rank]
-                local_norm_dim = self.lmk_q_norm_dim_local
-                lmk_q_norm = lmk_q_flat.view(-1, rhn, local_norm_dim)  # [T, rhn, local_norm_dim]
-            if self.unified_retrieval:
-                # unified_retrieval: keep as single retrieval head [T, 1, retrieval_dim // tp].
-                # The backend will all-gather + group+sum the KV cache to match this dim.
-                sel_q = lmk_q_norm  # [T, 1, retrieval_dim // tp_size]
-            else:
-                # Standard: expand kv heads to q-head space for selector: [T, hq_hsa, D]
-                assert self.hq_hsa % self.hk_hsa == 0
-                G = self.hq_hsa // self.hk_hsa
-                sel_q = (
-                    lmk_q_norm[:, :, None, :]
-                    .expand(lmk_q_norm.shape[0], self.hk_hsa, G, self.head_dim)
-                    .reshape(lmk_q_norm.shape[0], self.hq_hsa, self.head_dim)
-                    .contiguous()
+            if self.lmk_q_full_dim:
+                # 2026-05-21 new-arch path: lmk_q_proj output = hq_hsa_total * head_dim,
+                # i.e. one head_dim per attention head. Reshape per-head, RMSNorm over
+                # head_dim, then use directly as selector (no kv→q broadcast).
+                if attn_tp_size > 1:
+                    lmk_q = tensor_model_parallel_all_gather(lmk_q.contiguous())
+                # After all-gather lmk_q has hq_hsa_total heads' worth.
+                lmk_q_h = lmk_q.view(-1, self.hq_hsa_total, self.head_dim)
+                lmk_q_h_norm = self.lmk_q_norm(lmk_q_h.reshape(-1, self.head_dim)).reshape(
+                    lmk_q_h.shape
                 )
+                if attn_tp_size > 1:
+                    # Slice to local q heads.
+                    tp_rank = get_attention_tp_rank()
+                    heads_per_rank = self.hq_hsa_total // attn_tp_size
+                    lmk_q_h_norm = lmk_q_h_norm[
+                        :, tp_rank * heads_per_rank : (tp_rank + 1) * heads_per_rank, :
+                    ].contiguous()
+                sel_q = lmk_q_h_norm  # [T, hq_hsa, head_dim]
+            else:
+                rhn = self.retrieval_head_num  # 1 for unified, hk_hsa for standard
+                # All-gather → norm → split to match training semantics.
+                if attn_tp_size > 1:
+                    lmk_q = tensor_model_parallel_all_gather(lmk_q.contiguous())
+                norm_dim = self.lmk_q_norm_dim  # full (non-TP-split) norm dim
+                rhn_for_norm = 1 if self.unified_retrieval else (self.hk_hsa * attn_tp_size if attn_tp_size > 1 else self.hk_hsa)
+                lmk_q_3 = lmk_q.view(-1, rhn_for_norm, norm_dim)
+                # RMSNorm expects 2D; apply over norm_dim with flatten/unflatten.
+                lmk_q_norm = self.lmk_q_norm(lmk_q_3.reshape(-1, norm_dim)).reshape(
+                    lmk_q_3.shape[0], lmk_q_3.shape[1], lmk_q_3.shape[2]
+                )  # [T, rhn_for_norm, norm_dim]
+                if attn_tp_size > 1:
+                    # Split back to local heads.
+                    tp_rank = get_attention_tp_rank()
+                    lmk_q_flat = lmk_q_norm.reshape(lmk_q_norm.shape[0], -1)  # [T, retrieval_dim]
+                    lmk_q_flat = split_tensor_along_last_dim(lmk_q_flat, attn_tp_size)[tp_rank]
+                    local_norm_dim = self.lmk_q_norm_dim_local
+                    lmk_q_norm = lmk_q_flat.view(-1, rhn, local_norm_dim)  # [T, rhn, local_norm_dim]
+                if self.unified_retrieval:
+                    # unified_retrieval: keep as single retrieval head [T, 1, retrieval_dim // tp].
+                    # The backend will all-gather + group+sum the KV cache to match this dim.
+                    sel_q = lmk_q_norm  # [T, 1, retrieval_dim // tp_size]
+                else:
+                    # Standard: expand kv heads to q-head space for selector: [T, hq_hsa, D]
+                    assert self.hq_hsa % self.hk_hsa == 0
+                    G = self.hq_hsa // self.hk_hsa
+                    sel_q = (
+                        lmk_q_norm[:, :, None, :]
+                        .expand(lmk_q_norm.shape[0], self.hk_hsa, G, self.head_dim)
+                        .reshape(lmk_q_norm.shape[0], self.hq_hsa, self.head_dim)
+                        .contiguous()
+                    )
         else:
             # No separate lmk_q_proj: use hsa_q directly for selection
             # (matches official behavior when enable_lmk_q_proj=False).

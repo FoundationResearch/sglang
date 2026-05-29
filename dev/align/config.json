@@ -1,5 +1,5 @@
 {
-  "_comment": "1-layer OLMo-LHSA config used for HSA logits-alignment training. Keep this file deterministic — any change invalidates the trained weights and requires retraining (see README.md). The SHA-256 of this file is recorded in manifest.json so compare.py refuses to run with stale weights.",
+  "_comment": "1-layer OLMo-LHSA config used for HSA logits-alignment training. Keep this file deterministic — any change invalidates the trained weights and requires retraining (see README.md). The SHA-256 of this file is recorded in manifest.json so compare.py refuses to run with stale weights. 2026-05-21: aligned to canonical olmo3_7B config pattern (hsa_heads == num_attention_heads, hsa_qk_ratio=1, groupwise_topk=false, enable_lmk_q_proj=true, apply_hsa_rope=true) so hsa_denom=1 (no SWA branch) — the configs the user actually trains on.",
 
   "vocab_size": 256,
   "hidden_size": 512,
@@ -17,11 +17,13 @@
   "hsa_topk": 4,
   "hsa_mode": "sparse",
   "full_attn_interleave": 1,
-  "hsa_heads": 4,
-  "hsa_qk_ratio": 4,
+  "hsa_heads": 8,
+  "hsa_qk_ratio": 1,
   "use_sliding_window": true,
   "sliding_window": 64,
   "num_swa_layers": 0,
   "enable_softmax1": true,
-  "enable_lmk_q_proj": false
+  "enable_lmk_q_proj": true,
+  "apply_hsa_rope": true,
+  "groupwise_topk": false
 }
