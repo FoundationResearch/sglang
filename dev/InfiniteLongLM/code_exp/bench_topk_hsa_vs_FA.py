@@ -9,7 +9,7 @@ from transformers import AutoConfig, AutoModelForCausalLM, Qwen3Config
 from models.FlashHSA.configuration_hsa import HSAConfig
 from models.FlashHSA.modeling_qwen_lhsa_forbench import HSAForCausalLM
 
-AutoConfig.register("flash_hsa", HSAConfig)
+AutoConfig.register("olmo_lhsa", HSAConfig)
 HSAForCausalLM.config_class = HSAConfig
 AutoModelForCausalLM.register(HSAConfig, HSAForCausalLM)
 
@@ -22,10 +22,10 @@ from torch.utils.data import DataLoader, SequentialSampler
 
 # ========================= 配置 =========================
 # Full Attention 模型 (100k steps hf_ckpt)
-FULL_ATTN_HF_PATH = "/apdcephfs_fsgm/share_303843174/user/qqzxywei/wxy/checkpoints/rope-full-attn-rope-swangpt-1B-300B/checkpoints/global_step_100000/hf_ckpt"
+FULL_ATTN_HF_PATH = "/apdcephfs_sh8/share_300719895/user/qqzxywei/wxy/checkpoints/rope_full_theta10000_345M_dist/checkpoints/global_step_30000/hf_ckpt"
 
 # HSA 模型 (100k steps hf_ckpt)
-HSA_HF_PATH = "/apdcephfs_fsgm/share_303843174/user/qqzxywei/wxy/checkpoints/lsa-wqproj-interleave-disturb0.5-dropout0.5-8KA512-wounified-1B-300B/checkpoints/global_step_100000/hf_ckpt"
+HSA_HF_PATH = "/apdcephfs/share_300719895/user/qqzxywei/wxy/checkpoints/hsa_8KA2K_HoPE_full_345M_dist-priorq-wloralmkq-loradim64/checkpoints/global_step_30000/hf_ckpt"
 
 # ── 测试配置列表 ──
 # (prefill_seq_len, max_new_tokens)
@@ -36,18 +36,18 @@ DEFAULT_TEST_CONFIGS = [
     # (16384,  1),
     # (32768,  1),
     # (65536,  1),
-    (131072, 1),
-    (262144, 1),
-    (524288, 1),
+    # (131072, 1),
+    # (262144, 1),
+    # (524288, 1),
     # (1024,   128),   # 测 prefill + decode
     # (4096,   128),
-    # (8192,   128),
+    (8192,   20),
     # (16384,  128),
     # (32768,  128),
     # (65536,  128),
-    (131072, 128),
-    (262144, 128),
-    (524288, 128),
+    # (131072, 128),
+    # (262144, 128),
+    # (524288, 128),
 ]
 
 
@@ -81,12 +81,25 @@ def load_real_data(data_path, seq_len, num_samples=1):
 
 
 @torch.no_grad()
-def benchmark_generate(model, input_ids, max_new_tokens, num_runs, warmup):
+def benchmark_generate(model, input_ids, max_new_tokens, num_runs, warmup, profile_lhsa=False, profile_label=None):
     """统一使用 model.generate 测试延迟（prefill + decode）
     
     - max_new_tokens=1 时，几乎全部时间为 prefill
     - max_new_tokens>1 时，总时间 = prefill + decode
     """
+    profile_helpers = None
+    if profile_lhsa:
+        from models.FlashHSA.lhsa_layer_forbench import (
+            enable_lhsa_profile,
+            print_lhsa_profile_summary,
+            reset_lhsa_profile,
+        )
+        profile_helpers = (
+            enable_lhsa_profile,
+            print_lhsa_profile_summary,
+            reset_lhsa_profile,
+        )
+
     # warmup
     for _ in range(warmup):
         model.generate(
@@ -95,6 +108,11 @@ def benchmark_generate(model, input_ids, max_new_tokens, num_runs, warmup):
             do_sample=False,
         )
     torch.cuda.synchronize()
+
+    if profile_helpers is not None:
+        enable_lhsa_profile, _print_lhsa_profile_summary, reset_lhsa_profile = profile_helpers
+        reset_lhsa_profile()
+        enable_lhsa_profile(True)
 
     # 正式计时
     times = []
@@ -110,6 +128,12 @@ def benchmark_generate(model, input_ids, max_new_tokens, num_runs, warmup):
         end.record()
         torch.cuda.synchronize()
         times.append(start.elapsed_time(end))
+
+    if profile_helpers is not None:
+        enable_lhsa_profile, print_lhsa_profile_summary, _reset_lhsa_profile = profile_helpers
+        enable_lhsa_profile(False)
+        print_lhsa_profile_summary(total_ms=sum(times), label=profile_label)
+
     return times
 
 
@@ -177,6 +201,8 @@ def run_benchmark(args):
                     p_times = benchmark_generate(
                         model, input_ids, 1,
                         num_runs=args.num_runs, warmup=args.warmup,
+                        profile_lhsa=(args.profile_lhsa and name == "HSA"),
+                        profile_label=f"sample={sid}, prefill_len={prefill_len}, max_new_tokens=1",
                     )
                     p_avg = np.mean(p_times)
                     print(f"    sample {sid} prefill : avg={p_avg:.2f}ms  ({[f'{t:.1f}' for t in p_times]})")
@@ -184,21 +210,31 @@ def run_benchmark(args):
 
                     # ── 当 max_new_tokens > 1 时，再测 generate(N)，差值得到纯 decode ──
                     if max_new_tokens > 1:
-                        # decode 阶段：block_M 传 None，让 kernel 自动选最小值
+                        # Decode baseline and generate(N) must use the same kernel params.
                         if name == "HSA" and hasattr(model, 'set_hsa_kernel_params'):
                             model.set_hsa_kernel_params(
                                 None, None,
                                 args.num_threads_fwd, args.num_threads_bwd,
                             )
+                        p_decode_base_times = benchmark_generate(
+                            model, input_ids, 1,
+                            num_runs=args.num_runs, warmup=args.warmup,
+                            profile_lhsa=False,
+                            profile_label=None,
+                        )
+                        p_decode_base_avg = np.mean(p_decode_base_times)
                         g_times = benchmark_generate(
                             model, input_ids, max_new_tokens,
                             num_runs=args.num_runs, warmup=args.warmup,
+                            profile_lhsa=(args.profile_lhsa and name == "HSA"),
+                            profile_label=f"sample={sid}, prefill_len={prefill_len}, max_new_tokens={max_new_tokens}",
                         )
                         g_avg = np.mean(g_times)
-                        # 逐次做差：decode_time = generate(N) - generate(1)
-                        d_times = [g - p for g, p in zip(g_times, p_times)]
+                        # Subtract the prefill baseline measured with the same decode kernel params.
+                        d_times = [g - p for g, p in zip(g_times, p_decode_base_times)]
                         d_avg = np.mean(d_times)
                         per_tok = d_avg / (max_new_tokens - 1)
+                        print(f"    sample {sid} decode baseline(1tok): avg={p_decode_base_avg:.2f}ms")
                         print(f"    sample {sid} generate({max_new_tokens}tok): avg={g_avg:.2f}ms")
                         print(f"    sample {sid} decode   : avg={d_avg:.2f}ms (pure), per_token={per_tok:.2f}ms")
                         generate_times_all.extend(g_times)
@@ -259,6 +295,7 @@ if __name__ == "__main__":
     parser.add_argument('--warmup', type=int, default=3, help='每条序列的 warmup 次数')
     parser.add_argument('--skip_fullattn', action='store_true', help='跳过 FullAttn 模型测试')
     parser.add_argument('--skip_hsa', action='store_true', help='跳过 HSA 模型测试')
+    parser.add_argument('--profile_lhsa', action='store_true', help='统计 HSA layer 内部四个核心模块的耗时')
     # HSA kernel 参数（仅 prefill 阶段使用，decode 阶段自动传 None）
     parser.add_argument('--block_M_fwd', type=int, default=8,
                         help='HSA prefill 阶段的 block_M_fwd（None 则由 kernel 自动选择）')
@@ -282,4 +319,4 @@ if __name__ == "__main__":
     run_benchmark(args)
 
 
-# python code_exp/bench_topk_hsa_vs_FA.py --skip_fullattn
+# pkill -f "burner.*--gpu 6"; export CUDA_VISIBLE_DEVICES=6; python code_exp/bench_topk_hsa_vs_FA.py --skip_fullattn --profile_lhsa --num_samples 1

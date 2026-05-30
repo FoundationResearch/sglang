@@ -4,7 +4,7 @@ import tilelang.language as T
 from typing import Optional
 import math
 
-def ref_softmax_topk_max_pooling(q, k_lmks, lse_swa, topk, block_size, window_size, is_causal=False, q_offset=0, drop_mask=None, bias=None, gumbel_noise=None):
+def ref_softmax_topk_max_pooling(q, k_lmks, lse_swa, topk, block_size, window_size, is_causal=False, q_offset=0, drop_mask=None, bias=None):
     """
     Reference implementation for Softmax-then-Max Top-K strategy.
     
@@ -18,18 +18,15 @@ def ref_softmax_topk_max_pooling(q, k_lmks, lse_swa, topk, block_size, window_si
         window_size: int
         is_causal: bool
         q_offset: int (for causal masking when q does not start from 0)
-        drop_mask: [B, L, S] int32 tensor, 1 表示 drop 该 chunk
+        drop_mask: [B, L, S] int32 tensor, 1 means drop the chunk
         bias: optional per-chunk additive bias. Supported shapes are
               [B, S, h_q] or [B, S, h_kv, G]. When provided, selection logits
               and HSA LSE add bias[b, chunk, head]. Returned scores stay raw
-              scaled qk and do not include bias or Gumbel noise.
-        gumbel_noise: optional [1, 1, h_q, S] tensor. When provided, it is
-              added to per-q-head selection logits and HSA LSE logits. Returned
-              scores do not include Gumbel noise.
+              scaled qk and do not include bias.
         
     Returns:
         indices_sorted: [B, L, h_kv, topk]
-        scores_sorted: [B, L, h_kv, G, topk] (raw scaled qk, without bias or Gumbel noise)
+        scores_sorted: [B, L, h_kv, G, topk] (raw scaled qk, without bias)
     """
     B, L, h_kv, G, D = q.shape
     S = k_lmks.shape[1]
@@ -82,14 +79,6 @@ def ref_softmax_topk_max_pooling(q, k_lmks, lse_swa, topk, block_size, window_si
     else:
         bias_view = None
         logits_hsa_for_select = logits_hsa_scaled
-
-    if gumbel_noise is not None:
-        gumbel_noise = gumbel_noise.detach().to(device=q.device, dtype=torch.float32)
-        assert gumbel_noise.shape == (1, 1, h_kv * G, S), (
-            f"gumbel_noise shape {tuple(gumbel_noise.shape)} != ({1}, {1}, {h_kv * G}, {S})"
-        )
-        gumbel_view = gumbel_noise.view(1, 1, h_kv, G, S)
-        logits_hsa_for_select = logits_hsa_for_select + gumbel_view
 
     lse_hsa = torch.logsumexp(logits_hsa_for_select, dim=-1)
     
@@ -196,10 +185,15 @@ def hsa_lse_kernel(
     BLOCK_L=None, BLOCK_S=None, threads=None,
     sm_scale=None,
     use_bias=False,
-    use_gumbel=False,
     per_qhead_lmks=False,
+    is_varlen=False,
 ):
-    if not is_training:
+    if is_varlen:
+        # Varlen mode: B=1 packed, dynamic seq_len/s_len/num_seqs.
+        seq_len_var = T.dynamic("seq_len")
+        s_len_var = T.dynamic("s_len")
+        num_seqs = T.dynamic("num_seqs")
+    elif not is_training:
         seq_len_var = T.dynamic("seq_len")
         s_len_var = T.dynamic("s_len")
     else:
@@ -208,6 +202,7 @@ def hsa_lse_kernel(
 
     dtype = "bfloat16"
     accum_dtype = "float"
+    idx_dtype = "int32"
     
     # Q: [B, L, h_kv, G, D]
     q_shape = [batch, seq_len_var, h_kv, groups, head_dim]
@@ -219,7 +214,11 @@ def hsa_lse_kernel(
     # LSE Out: [B, L, h_kv, G]
     lse_shape = [batch, seq_len_var, h_kv, groups]
     bias_shape = [batch, s_len_var, h_kv, groups] if use_bias else [1, 1, 1, 1]
-    gumbel_shape = [1, 1, h_kv * groups, s_len_var] if use_gumbel else [1, 1, 1, 1]
+    # Varlen aux tensors. In dense mode Q_Offset_or_CuQ has shape [1] (legacy
+    # q_offset scalar); in varlen mode it carries cu_seq_lens_q with shape
+    # [num_seqs+1]. CuSeqLensK is only meaningful in varlen mode.
+    cu_q_shape = [num_seqs + 1] if is_varlen else [1]
+    cu_k_shape = [num_seqs + 1] if is_varlen else [1]
 
     if BLOCK_L is None:
         BLOCK_L = 16 if per_qhead_lmks else (16 + groups - 1) // groups
@@ -241,12 +240,13 @@ def hsa_lse_kernel(
         Q: T.Tensor(q_shape, dtype),
         K: T.Tensor(k_shape, dtype),
         LSE_Out: T.Tensor(lse_shape, accum_dtype),
-        Q_Offset: T.Tensor([1], "int32"),
+        Q_Offset_or_CuQ: T.Tensor(cu_q_shape, "int32"),
+        CuSeqLensK: T.Tensor(cu_k_shape, idx_dtype),
         bias: T.Tensor(bias_shape, accum_dtype),
-        GumbelNoise: T.Tensor(gumbel_shape, accum_dtype),
     ):
-        with T.Kernel(tilelang.cdiv(seq_len_var, BLOCK_L), h_kv, batch, threads=threads) as (bx, by, bz):
-            q_offset = T.if_then_else(is_training, 0, Q_Offset[0])
+        grid_batch = 1 if is_varlen else batch
+        with T.Kernel(tilelang.cdiv(seq_len_var, BLOCK_L), h_kv, grid_batch, threads=threads) as (bx, by, bz):
+            q_offset = T.if_then_else(is_training or is_varlen, 0, Q_Offset_or_CuQ[0])
             i_b, i_h = bz, by
             base_l = bx * BLOCK_L
             
@@ -269,10 +269,39 @@ def hsa_lse_kernel(
             scores_sum = T.alloc_fragment([GEMM_M], accum_dtype)
             scores_scale = T.alloc_fragment([GEMM_M], accum_dtype)
 
+            # Per-l varlen state. seq_id[l]==num_seqs marks "out-of-range" rows
+            # whose LSE will be left as -inf.
+            seq_id_arr = T.alloc_shared([BLOCK_L], idx_dtype)
+            local_q_arr = T.alloc_shared([BLOCK_L], idx_dtype)
+            k_start_arr = T.alloc_shared([BLOCK_L], idx_dtype)
+            k_end_arr = T.alloc_shared([BLOCK_L], idx_dtype)
+
             T.annotate_layout({Q_shared: tilelang.layout.make_swizzled_layout(Q_shared)})
 
             T.fill(m_prev, -T.infinity(accum_dtype))
             T.fill(l_prev, 0.0)
+
+            # ---- Varlen: per-l (seq_id, local_q, k_start, k_end) lookup ----
+            if is_varlen:
+                tx_pre = T.get_thread_binding()
+                if tx_pre < BLOCK_L:
+                    tq_packed = base_l + tx_pre
+                    sid = T.alloc_var(idx_dtype)
+                    sid = 0
+                    for si in T.serial(num_seqs):
+                        if tq_packed >= Q_Offset_or_CuQ[si + 1]:
+                            sid = si + 1
+                    seq_id_arr[tx_pre] = sid
+                    if sid < num_seqs:
+                        local_q_arr[tx_pre] = tq_packed - Q_Offset_or_CuQ[sid]
+                        k_start_arr[tx_pre] = CuSeqLensK[sid]
+                        k_end_arr[tx_pre] = CuSeqLensK[sid + 1]
+                    else:
+                        # padding row beyond last sub-sequence
+                        local_q_arr[tx_pre] = 0
+                        k_start_arr[tx_pre] = 0
+                        k_end_arr[tx_pre] = 0
+                T.sync_threads()
 
             for i, j in T.Parallel(GEMM_M, GEMM_K):
                 tq = base_l + (i // groups)
@@ -282,11 +311,13 @@ def hsa_lse_kernel(
                     Q_shared[i, j] = 0.0
 
             loop_limit_base = tilelang.cdiv(s_len_var, BLOCK_S)
-            if is_causal:
-                # 使用全局位置计算 loop_limit
+            if is_causal and (not is_varlen):
+                # Dense causal: shrink loop using max global Q position in tile.
                 global_end = q_offset + base_l + BLOCK_L
                 loop_limit = T.min(loop_limit_base, tilelang.cdiv(global_end, BLOCK_S))
             else:
+                # Varlen path always sweeps full s_len because effective_s
+                # depends on each row's k_start/k_end (not just base_l).
                 loop_limit = loop_limit_base
 
             for s_block in T.serial(loop_limit):
@@ -329,21 +360,35 @@ def hsa_lse_kernel(
                 
                 for i, j in T.Parallel(GEMM_M, GEMM_N):
                     ts = base_s + j
-                    if ts >= s_len_var:
-                        # padding 位置必须设为 -inf，避免影响 reduce_max 的数值稳定性
-                        score_shared[i, j] = -T.infinity(accum_dtype)
-                    elif is_causal:
+                    if is_varlen:
+                        # Varlen masking: each row has its own (k_start, k_end, local_q).
+                        # Out-of-range or padding-row landmarks must be -inf so they
+                        # do not pollute softmax normalization across sub-sequences.
                         l_idx = i // groups
                         tq_local = base_l + l_idx
-                        tq_global = q_offset + tq_local  # ✅ 使用全局位置
-                        if tq_local < seq_len_var:
-                            if ts >= (tq_global - window_size + 1) // block_size:  # ✅ 用全局位置计算
+                        in_range = (ts >= k_start_arr[l_idx]) and (ts < k_end_arr[l_idx])
+                        if (tq_local >= seq_len_var) or (seq_id_arr[l_idx] >= num_seqs) or (not in_range):
+                            score_shared[i, j] = -T.infinity(accum_dtype)
+                        elif is_causal:
+                            effective_s = ts - k_start_arr[l_idx]
+                            if effective_s >= (local_q_arr[l_idx] - window_size + 1) // block_size:
                                 score_shared[i, j] = -T.infinity(accum_dtype)
+                    else:
+                        if ts >= s_len_var:
+                            # Padding positions must be -inf for numerical stability
+                            score_shared[i, j] = -T.infinity(accum_dtype)
+                        elif is_causal:
+                            l_idx = i // groups
+                            tq_local = base_l + l_idx
+                            tq_global = q_offset + tq_local  # global position
+                            if tq_local < seq_len_var:
+                                if ts >= (tq_global - window_size + 1) // block_size:  # global causal
+                                    score_shared[i, j] = -T.infinity(accum_dtype)
 
                 T.sync_threads()
                 T.copy(score_shared, acc_s)
 
-                if use_bias or use_gumbel:
+                if use_bias:
                     for i, j in T.Parallel(GEMM_M, GEMM_N):
                         tq = base_l + (i // groups)
                         ts = base_s + j
@@ -352,10 +397,7 @@ def hsa_lse_kernel(
                                 acc_s[i, j] = -T.infinity(accum_dtype)
                             else:
                                 acc_s[i, j] = acc_s[i, j] * sm_scale
-                                if use_bias:
-                                    acc_s[i, j] += bias[i_b, ts, i_h, i % groups]
-                                if use_gumbel:
-                                    acc_s[i, j] += GumbelNoise[0, 0, i_h * groups + (i % groups), ts]
+                                acc_s[i, j] += bias[i_b, ts, i_h, i % groups]
                         else:
                             acc_s[i, j] = -T.infinity(accum_dtype)
                 
@@ -363,7 +405,7 @@ def hsa_lse_kernel(
                 T.reduce_max(acc_s, scores_max, dim=1, clear=False)
                 
                 for i in T.Parallel(GEMM_M):
-                    if use_bias or use_gumbel:
+                    if use_bias:
                         m_prev[i] = T.max(m_prev[i], scores_max[i])
                     else:
                         scores_max[i] = scores_max[i] * sm_scale
@@ -380,7 +422,7 @@ def hsa_lse_kernel(
                     ts = base_s + j
                     if ts < s_len_var:
                         # [FIX 4] Protect against NaN in Exp calculation (using acc_s is fine now correctly masked)
-                        if use_bias or use_gumbel:
+                        if use_bias:
                             val = acc_s[i, j]
                         else:
                             val = acc_s[i, j] * sm_scale
@@ -453,10 +495,15 @@ def weighted_select_kernel(
     BLOCK_L=None, BLOCK_S=None, threads=None,
     sm_scale=None,
     use_bias=False,
-    use_gumbel=False,
     per_qhead_lmks=False,
+    is_varlen=False,
 ):
-    if not is_training:
+    if is_varlen:
+        # Varlen: dynamic seq_len/s_len/num_seqs.
+        seq_len_var = T.dynamic("seq_len")
+        s_len_var = T.dynamic("s_len")
+        num_seqs = T.dynamic("num_seqs")
+    elif not is_training:
         seq_len_var = T.dynamic("seq_len")
         s_len_var = T.dynamic("s_len")
     else:
@@ -474,10 +521,11 @@ def weighted_select_kernel(
         k_shape = [batch, s_len_var, h_kv, head_dim]
     lse_shape = [batch, seq_len_var, h_kv, groups]
     bias_shape = [batch, s_len_var, h_kv, groups] if use_bias else [1, 1, 1, 1]
-    gumbel_shape = [1, 1, h_kv * groups, s_len_var] if use_gumbel else [1, 1, 1, 1]
     
     out_indices_shape = [batch, seq_len_var, h_kv, topk]
     drop_mask_shape = [batch, seq_len_var, s_len_var] if use_drop_mask else [1, 1, 1]
+    cu_q_shape = [num_seqs + 1] if is_varlen else [1]
+    cu_k_shape = [num_seqs + 1] if is_varlen else [1]
     if BLOCK_L is None:
         BLOCK_L = 16 if per_qhead_lmks else (16 + groups - 1) // groups
     if BLOCK_S is None: BLOCK_S = 16
@@ -494,13 +542,14 @@ def weighted_select_kernel(
         K: T.Tensor(k_shape, dtype),
         LSE_Total: T.Tensor(lse_shape, accum_dtype),
         OutIndices: T.Tensor(out_indices_shape, idx_dtype),
-        Q_Offset: T.Tensor([1], "int32"),
+        Q_Offset_or_CuQ: T.Tensor(cu_q_shape, "int32"),
+        CuSeqLensK: T.Tensor(cu_k_shape, idx_dtype),
         DropMask: T.Tensor(drop_mask_shape, idx_dtype),
         bias: T.Tensor(bias_shape, accum_dtype),
-        GumbelNoise: T.Tensor(gumbel_shape, accum_dtype),
     ):
-        with T.Kernel(tilelang.cdiv(seq_len_var, BLOCK_L), h_kv, batch, threads=threads) as (bx, by, bz):
-            q_offset = T.if_then_else(is_training, 0, Q_Offset[0])
+        grid_batch = 1 if is_varlen else batch
+        with T.Kernel(tilelang.cdiv(seq_len_var, BLOCK_L), h_kv, grid_batch, threads=threads) as (bx, by, bz):
+            q_offset = T.if_then_else(is_training or is_varlen, 0, Q_Offset_or_CuQ[0])
             i_b, i_h = bz, by
             base_l = bx * BLOCK_L
             
@@ -516,11 +565,38 @@ def weighted_select_kernel(
             topk_indices = T.alloc_local([topk], idx_dtype)
             
             lse_local = T.alloc_local([groups], accum_dtype)
-            
+
+            # Per-l varlen state (only used when is_varlen=True).
+            seq_id_arr = T.alloc_shared([BLOCK_L], idx_dtype)
+            local_q_arr = T.alloc_shared([BLOCK_L], idx_dtype)
+            k_start_arr = T.alloc_shared([BLOCK_L], idx_dtype)
+            k_end_arr = T.alloc_shared([BLOCK_L], idx_dtype)
+
             T.fill(topk_max_scores, -T.infinity(accum_dtype))
             T.fill(topk_indices, -1)
             
             tx = T.get_thread_binding()
+
+            # ---- Varlen: per-l (seq_id, local_q, k_start, k_end) lookup ----
+            if is_varlen:
+                if tx < BLOCK_L:
+                    tq_packed = base_l + tx
+                    sid = T.alloc_var(idx_dtype)
+                    sid = 0
+                    for si in T.serial(num_seqs):
+                        if tq_packed >= Q_Offset_or_CuQ[si + 1]:
+                            sid = si + 1
+                    seq_id_arr[tx] = sid
+                    if sid < num_seqs:
+                        local_q_arr[tx] = tq_packed - Q_Offset_or_CuQ[sid]
+                        k_start_arr[tx] = CuSeqLensK[sid]
+                        k_end_arr[tx] = CuSeqLensK[sid + 1]
+                    else:
+                        local_q_arr[tx] = 0
+                        k_start_arr[tx] = 0
+                        k_end_arr[tx] = 0
+                T.sync_threads()
+
             if tx < BLOCK_L and (base_l + tx) < seq_len_var:
                 for g in T.serial(groups):
                     lse_local[g] = LSE_Total[i_b, base_l + tx, i_h, g]
@@ -534,11 +610,13 @@ def weighted_select_kernel(
                     Q_shared[flat_m, d] = 0
             
             loop_limit_base = num_s_blocks
-            if is_causal:
-                # 使用全局位置计算 loop_limit
+            if is_causal and (not is_varlen):
+                # Dense causal: shrink loop using max global Q position in tile.
                 global_end = q_offset + base_l + BLOCK_L
                 loop_limit = T.min(loop_limit_base, tilelang.cdiv(global_end, BLOCK_S))
             else:
+                # Varlen always sweeps full s_len: each row's effective_s
+                # depends on its own k_start/k_end.
                 loop_limit = loop_limit_base
             for s_block in T.serial(loop_limit):
                 base_s = s_block * BLOCK_S
@@ -572,62 +650,86 @@ def weighted_select_kernel(
                     T.clear(acc_s)
                     T.gemm(Q_shared, K_shared, acc_s, transpose_B=True, policy=T.GemmWarpPolicy.FullRow)
                     T.copy(acc_s, score_shared)
-                if is_causal:
+                if is_causal and (not is_varlen):
                     for i, j in T.Parallel(GEMM_M, BLOCK_S):
                         l_idx = i // groups
                         tq_local = base_l + l_idx
-                        tq_global = q_offset + tq_local  # ✅ 使用全局位置
+                        tq_global = q_offset + tq_local  # use global position
                         ts = base_s + j
-                        # if ts >= (tq // block_size):
-                        if ts >= (tq_global - window_size + 1) // block_size:  # ✅ 用全局位置计算
+                        if ts >= (tq_global - window_size + 1) // block_size:  # global causal
                             score_shared[i, j] = -T.infinity(accum_dtype)
                 T.sync_threads()
                 
                 if tx < BLOCK_L and (base_l + tx) < seq_len_var:
                     my_l_idx = tx
                     tq = base_l + my_l_idx
-                    tq_global = q_offset + tq
-                    limit_chunk = (tq_global - window_size + 1) // block_size
+                    # Per-row varlen state when is_varlen, else global causal limit.
+                    eff_q = T.alloc_var(idx_dtype)
+                    k_lo = T.alloc_var(idx_dtype)
+                    k_hi = T.alloc_var(idx_dtype)
+                    if is_varlen:
+                        eff_q = local_q_arr[my_l_idx]
+                        k_lo = k_start_arr[my_l_idx]
+                        k_hi = k_end_arr[my_l_idx]
+                    else:
+                        eff_q = q_offset + tq
+                        k_lo = 0
+                        k_hi = s_len_var
+                    limit_chunk = (eff_q - window_size + 1) // block_size
+                    row_active = T.alloc_var("bool")
+                    if is_varlen:
+                        row_active = (seq_id_arr[my_l_idx] < num_seqs)
+                    else:
+                        row_active = True
+
                     val = T.alloc_var(accum_dtype)
                     norm_score = T.alloc_var(accum_dtype)
                     cur_max_norm_score = T.alloc_var(accum_dtype)
                     is_valid = T.alloc_var("bool")
-                    for s_idx in T.serial(BLOCK_S):
-                        ts = base_s + s_idx
-                        in_range = T.alloc_var("bool")
-                        in_range = (ts < s_len_var)
-                        if in_range:
-                            is_valid = (not is_causal) or (ts < limit_chunk)
-                            if use_drop_mask:
-                                is_valid = is_valid and (DropMask[i_b, tq, ts] == 0)
-                            if is_valid:
-                                cur_max_norm_score = -T.infinity(accum_dtype)
-                                
-                                for g in T.serial(groups):
-                                    val = score_shared[my_l_idx * groups + g, s_idx] * sm_scale
-                                    if use_bias:
-                                        val += bias[i_b, ts, i_h, g]
-                                    if use_gumbel:
-                                        val += GumbelNoise[0, 0, i_h * groups + g, ts]
-                                    if val == -T.infinity(accum_dtype):
-                                        norm_score = -T.infinity(accum_dtype)
-                                    else:
-                                        norm_score = val - lse_local[g]
-                                    cur_max_norm_score = T.max(cur_max_norm_score, norm_score)
-                                
-                                if cur_max_norm_score > topk_max_scores[topk - 1]:
-                                    moving = T.alloc_var("bool")
-                                    moving = True
-                                    for kk in T.serial(topk):
-                                        k = topk - 1 - kk
-                                        if moving:
-                                            if (k > 0) and (cur_max_norm_score > topk_max_scores[k - 1]):
-                                                topk_max_scores[k] = topk_max_scores[k - 1]
-                                                topk_indices[k] = topk_indices[k - 1]
-                                            else:
-                                                topk_max_scores[k] = cur_max_norm_score
-                                                topk_indices[k] = ts
-                                                moving = False
+                    if row_active:
+                        for s_idx in T.serial(BLOCK_S):
+                            ts = base_s + s_idx
+                            in_range = T.alloc_var("bool")
+                            if is_varlen:
+                                in_range = (ts >= k_lo) and (ts < k_hi)
+                            else:
+                                in_range = (ts < s_len_var)
+                            if in_range:
+                                # Use sub-sequence local s for varlen causal.
+                                effective_s = T.alloc_var(idx_dtype)
+                                if is_varlen:
+                                    effective_s = ts - k_lo
+                                else:
+                                    effective_s = ts
+                                is_valid = (not is_causal) or (effective_s < limit_chunk)
+                                if use_drop_mask:
+                                    is_valid = is_valid and (DropMask[i_b, tq, ts] == 0)
+                                if is_valid:
+                                    cur_max_norm_score = -T.infinity(accum_dtype)
+                                    
+                                    for g in T.serial(groups):
+                                        val = score_shared[my_l_idx * groups + g, s_idx] * sm_scale
+                                        if use_bias:
+                                            val += bias[i_b, ts, i_h, g]
+                                        if val == -T.infinity(accum_dtype):
+                                            norm_score = -T.infinity(accum_dtype)
+                                        else:
+                                            norm_score = val - lse_local[g]
+                                        cur_max_norm_score = T.max(cur_max_norm_score, norm_score)
+                                    
+                                    if cur_max_norm_score > topk_max_scores[topk - 1]:
+                                        moving = T.alloc_var("bool")
+                                        moving = True
+                                        for kk in T.serial(topk):
+                                            k = topk - 1 - kk
+                                            if moving:
+                                                if (k > 0) and (cur_max_norm_score > topk_max_scores[k - 1]):
+                                                    topk_max_scores[k] = topk_max_scores[k - 1]
+                                                    topk_indices[k] = topk_indices[k - 1]
+                                                else:
+                                                    topk_max_scores[k] = cur_max_norm_score
+                                                    topk_indices[k] = ts
+                                                    moving = False
                 T.sync_threads()
             
             if tx < BLOCK_L and (base_l + tx) < seq_len_var:
@@ -992,17 +1094,20 @@ class SoftmaxTopKMaxPoolingFusedFn(torch.autograd.Function):
                 select_kernel,
                 sort_kernel,
                 recompute_kernel,
-                q_offset_tensor,
+                cu_q_tensor,
+                cu_seq_lens_k,
                 drop_mask,
                 sm_scale,
                 bias,
-                gumbel_noise,
                 per_qhead_lmks,
+                is_varlen,
                 ):
-        # q:    [B, L, h_kv, G, D]  (已经在 API 层做过 d_reshape)
+        # q:    [B, L, h_kv, G, D]  (already d_reshape'd at API layer)
         # lmks: [B, S, h_kv, D]      (per-KV-head)
         #    or [B, S, h_kv*G, D]    (per-q-head when per_qhead_lmks=True)
         # lse_swa: [B, L, h_q] or [B, L, h_kv, G]
+        # cu_q_tensor: dense -> [1] (q_offset); varlen -> [num_seqs+1] (cu_seq_lens_q)
+        # cu_seq_lens_k: only used when is_varlen=True; dense path passes a [1] placeholder
         B, L, h_kv, G, D = q.shape
         B2, S, lmks_h, D2 = lmks.shape
         dtype = q.dtype
@@ -1016,17 +1121,20 @@ class SoftmaxTopKMaxPoolingFusedFn(torch.autograd.Function):
             assert lmks_h == h_kv, (
                 f"default mode expects lmks h dim = h_kv ({h_kv}), got {lmks_h}"
             )
+        if is_varlen:
+            assert B == 1, "Varlen TopK requires B=1 (packed sequence)"
 
         q_in = q.contiguous()
         k_in = lmks.contiguous()
         bias = bias.contiguous()
-        gumbel_noise = gumbel_noise.contiguous()
+        cu_q_tensor = cu_q_tensor.contiguous()
+        cu_seq_lens_k = cu_seq_lens_k.contiguous()
         
-        # 计算 HSA LSE
+        # Compute HSA LSE
         # lse_hsa: [B, L, h_kv, G]
-        lse_hsa = lse_kernel(q_in, k_in, q_offset_tensor, bias, gumbel_noise)
+        lse_hsa = lse_kernel(q_in, k_in, cu_q_tensor, cu_seq_lens_k, bias)
         
-        # 合并 LSE
+        # Combine LSE
         if lse_swa.dim() == 3: # [B, L, h_q]
             lse_swa_view = lse_swa.view(B, L, h_kv, G)
         else:
@@ -1038,7 +1146,7 @@ class SoftmaxTopKMaxPoolingFusedFn(torch.autograd.Function):
             drop_mask_in = torch.zeros(1, 1, 1, dtype=torch.int32, device=q.device)
         else:
             drop_mask_in = drop_mask
-        indices_raw = select_kernel(q_in, k_in, lse_total, q_offset_tensor, drop_mask_in, bias, gumbel_noise)  # int32
+        indices_raw = select_kernel(q_in, k_in, lse_total, cu_q_tensor, cu_seq_lens_k, drop_mask_in, bias)  # int32
 
         indices_sorted = sort_kernel(indices_raw)
         # indices_sorted_64 = indices_sorted.to(torch.int64)
@@ -1109,15 +1217,15 @@ class SoftmaxTopKMaxPoolingFusedFn(torch.autograd.Function):
             grad_k_sum = grad_k_grouped.sum(dim=2)
             grad_lmks = grad_k_sum.permute(0, 2, 1, 3)  # [B, S, h_kv, D]
 
-        # 返回值数量需要匹配 forward 的输入参数数量
-        # forward 参数: q, lmks, lse_swa, lse_kernel, select_kernel, sort_kernel,
-        #              recompute_kernel, q_offset_tensor, drop_mask, sm_scale,
-        #              bias, gumbel_noise, per_qhead_lmks
-        return grad_q, grad_lmks, None, None, None, None, None, None, None, None, None, None, None
+        # Return values must match the number of forward inputs.
+        # forward args: q, lmks, lse_swa, lse_kernel, select_kernel, sort_kernel,
+        #              recompute_kernel, cu_q_tensor, cu_seq_lens_k, drop_mask,
+        #              sm_scale, bias, per_qhead_lmks, is_varlen
+        return grad_q, grad_lmks, None, None, None, None, None, None, None, None, None, None, None, None
 
 
 class SoftmaxTopKMaxPooling_Fused(torch.nn.Module):
-    def __init__(self, topk, block_size, window_size, is_causal, is_training=True, use_drop_mask=False, per_qhead_lmks=False):
+    def __init__(self, topk, block_size, window_size, is_causal, is_training=True, use_drop_mask=False, per_qhead_lmks=False, is_varlen=False):
         super().__init__()
         self.topk = topk
         self.block_size = block_size
@@ -1126,17 +1234,17 @@ class SoftmaxTopKMaxPooling_Fused(torch.nn.Module):
         self.is_training = is_training
         self.use_drop_mask = use_drop_mask
         self.per_qhead_lmks = per_qhead_lmks
+        self.is_varlen = is_varlen
         self._cached_lse_kernel = None
         self._cached_select_kernel = None
         self._cached_sort_kernel = None
         self._cached_recompute_kernel = None
         self._cached_shape = None
 
-    def forward(self, q, lmks, lse_swa, q_offset, drop_mask=None, sm_scale=None, bias=None, use_gumbel=False, gumbel_noise=None):
-        # q:    [B, L, h_kv, G, D]
-        # lmks: [B, S, h_kv, D]   (per-KV-head)
-        #    or [B, S, h_kv*G, D] (per-q-head when per_qhead_lmks=True)
-        # lse_swa: [B, L, h_q]
+    def forward(self, q, lmks, lse_swa, q_offset=0, drop_mask=None, sm_scale=None, bias=None, cu_seq_lens=None):
+        # Dense: q [B, L, h_kv, G, D], lmks [B, S, h_kv(*G), D], cu_seq_lens=None.
+        # Varlen: q [1, L_total, h_kv, G, D], lmks [1, S_total, h_kv(*G), D],
+        #         cu_seq_lens [num_seqs+1] int32 token-level cumulative lengths.
         B, L, h_kv, G, D = q.shape
         _, S, _, _ = lmks.shape
         per_qhead_lmks = self.per_qhead_lmks
@@ -1146,6 +1254,11 @@ class SoftmaxTopKMaxPooling_Fused(torch.nn.Module):
         window_size = self.window_size
         is_training = self.is_training
         use_drop_mask = self.use_drop_mask
+        is_varlen = self.is_varlen
+        if is_varlen:
+            assert cu_seq_lens is not None, "Varlen mode requires cu_seq_lens"
+            assert B == 1, "Varlen mode requires packed B=1"
+            assert not use_drop_mask, "drop_mask is not supported in varlen mode"
         use_bias = bias is not None
         if use_bias:
             bias_arg = bias.to(device=q.device, dtype=torch.float32)
@@ -1165,56 +1278,49 @@ class SoftmaxTopKMaxPooling_Fused(torch.nn.Module):
                 )
         else:
             bias_arg = torch.zeros(1, 1, 1, 1, dtype=torch.float32, device=q.device)
-        use_gumbel = bool(use_gumbel) or (gumbel_noise is not None)
-        if use_gumbel:
-            assert is_training, "gumbel_noise is only supported in training mode"
-            if gumbel_noise is None:
-                u = torch.rand(1, 1, h_kv * G, S, device=q.device, dtype=torch.float32)
-                u.clamp_(min=1e-20, max=1 - 1e-7)
-                gumbel_noise_arg = -torch.log(-torch.log(u))
-            else:
-                assert gumbel_noise.shape == (1, 1, h_kv * G, S), (
-                    f"gumbel_noise shape {tuple(gumbel_noise.shape)} != ({1}, {1}, {h_kv * G}, {S})"
-                )
-                gumbel_noise_arg = gumbel_noise.detach().to(device=q.device, dtype=torch.float32).contiguous()
-        else:
-            gumbel_noise_arg = torch.zeros(1, 1, 1, 1, dtype=torch.float32, device=q.device)
 
-        # 推理模式下，L 和 S 可能动态变化，使用不同的 cache key
-        if not is_training:
-            # 推理模式：L 和 S 传 None，让 kernel 使用动态参数
-            shape_key = (B, h_kv, G, D, topk, block_size, window_size, is_causal, is_training, use_drop_mask, sm_scale, use_bias, use_gumbel, per_qhead_lmks)
+        # Cache key. Varlen always uses dynamic L/S/num_seqs, so the key only
+        # captures static dims (B=1, head dims, ...).
+        if is_varlen:
+            shape_key = (B, h_kv, G, D, topk, block_size, window_size, is_causal,
+                         is_training, use_drop_mask, sm_scale, use_bias, per_qhead_lmks, True)
+        elif not is_training:
+            # Inference: pass None for L/S so the kernel uses dynamic shapes
+            shape_key = (B, h_kv, G, D, topk, block_size, window_size, is_causal, is_training, use_drop_mask, sm_scale, use_bias, per_qhead_lmks)
         else:
-            # 训练模式：L 和 S 是编译时常量
-            shape_key = (B, L, S, h_kv, G, D, topk, block_size, window_size, is_causal, is_training, use_drop_mask, sm_scale, use_bias, use_gumbel, per_qhead_lmks)
+            # Training: L and S are compile-time constants
+            shape_key = (B, L, S, h_kv, G, D, topk, block_size, window_size, is_causal, is_training, use_drop_mask, sm_scale, use_bias, per_qhead_lmks)
         
         if self._cached_shape != shape_key:
-            # 推理模式时传 None，否则传具体值
-            seq_len_param = None if not is_training else L
-            s_len_param = None if not is_training else S
+            # Pass None in inference / varlen mode so kernels use dynamic shapes
+            seq_len_param = None if (is_varlen or not is_training) else L
+            s_len_param = None if (is_varlen or not is_training) else S
 
             self._cached_lse_kernel = hsa_lse_kernel(
                 B, seq_len=seq_len_param, s_len=s_len_param, h_kv=h_kv, groups=G, head_dim=D,
                 block_size=block_size, window_size=window_size, is_causal=is_causal,
-                is_training=is_training, sm_scale=sm_scale, use_bias=use_bias, use_gumbel=use_gumbel,
-                per_qhead_lmks=per_qhead_lmks,
+                is_training=is_training, sm_scale=sm_scale, use_bias=use_bias,
+                per_qhead_lmks=per_qhead_lmks, is_varlen=is_varlen,
             )
 
             self._cached_select_kernel = weighted_select_kernel(
                 B, seq_len=seq_len_param, s_len=s_len_param, h_kv=h_kv, groups=G, head_dim=D,
                 topk=topk, block_size=block_size, window_size=window_size, is_causal=is_causal,
-                is_training=is_training, use_drop_mask=use_drop_mask, sm_scale=sm_scale, use_bias=use_bias, use_gumbel=use_gumbel,
-                per_qhead_lmks=per_qhead_lmks,
+                is_training=is_training, use_drop_mask=use_drop_mask, sm_scale=sm_scale, use_bias=use_bias,
+                per_qhead_lmks=per_qhead_lmks, is_varlen=is_varlen,
             )
 
+            # Sort kernel reuses the inference (dynamic L) path in varlen mode.
             self._cached_sort_kernel = sort_topk_indices_kernel(
                 B, seq_len=seq_len_param, h_kv=h_kv, topk=topk,
-                is_training=is_training
+                is_training=False if is_varlen else is_training,
             )
 
+            # Recompute kernel: indices are global packed lmk ids in varlen mode,
+            # which correctly index K[1, ts, ...]. No varlen-specific changes needed.
             self._cached_recompute_kernel = recompute_topk_max_pooling_scores_kernel(
                 B, seq_len=seq_len_param, s_len=s_len_param, h_kv=h_kv, groups=G, head_dim=D, topk=topk,
-                is_training=is_training, sm_scale=sm_scale,
+                is_training=False if is_varlen else is_training, sm_scale=sm_scale,
                 per_qhead_lmks=per_qhead_lmks,
             )
             self._cached_shape = shape_key
@@ -1224,12 +1330,24 @@ class SoftmaxTopKMaxPooling_Fused(torch.nn.Module):
         sort_kernel = self._cached_sort_kernel
         recompute_kernel = self._cached_recompute_kernel
 
-        q_offset_tensor = torch.tensor([q_offset], dtype=torch.int32, device=q.device)
+        if is_varlen:
+            cu_q = cu_seq_lens.to(dtype=torch.int32, device=q.device).contiguous()
+            # Derive landmark-level cumulative lengths from token-level cu_seq_lens
+            # by floor-dividing each sub-sequence length with block_size.
+            sub_lengths = cu_q[1:] - cu_q[:-1]
+            sub_lmk_counts = sub_lengths // block_size
+            cu_k = torch.zeros_like(cu_q)
+            cu_k[1:] = sub_lmk_counts.cumsum(0).to(cu_q.dtype)
+            cu_q_tensor = cu_q
+            cu_seq_lens_k = cu_k
+        else:
+            cu_q_tensor = torch.tensor([q_offset], dtype=torch.int32, device=q.device)
+            cu_seq_lens_k = torch.zeros(1, dtype=torch.int32, device=q.device)
 
         indices, scores = SoftmaxTopKMaxPoolingFusedFn.apply(
             q, lmks, lse_swa, lse_kernel, select_kernel, sort_kernel, recompute_kernel,
-            q_offset_tensor, drop_mask, sm_scale, bias_arg, gumbel_noise_arg,
-            per_qhead_lmks,
+            cu_q_tensor, cu_seq_lens_k, drop_mask, sm_scale, bias_arg,
+            per_qhead_lmks, is_varlen,
         )
         # Reshape scores: [B, L, h_kv, G, topk] -> [B, L, h_q, topk]
         scores = scores.view(B, L, h_kv * G, -1)
@@ -1251,9 +1369,8 @@ def online_softmax_topk_head(
     drop_mask: torch.Tensor = None,
     sm_scale: float = None,
     bias: torch.Tensor = None,
-    use_gumbel: bool = False,
-    gumbel_noise: torch.Tensor = None,
-    G: int = 1,
+    cu_seq_lens: torch.Tensor = None,
+    G: Optional[int] = None,
 ):
     """
     Functional API for SoftmaxTopKMaxPooling_Fused
@@ -1269,11 +1386,9 @@ def online_softmax_topk_head(
             Query tensor。shape = [B, L, h_q, D]
         lmks (torch.Tensor):
             Landmark key tensor。shape = [B, S, h_lmk, D]
-            ``G`` 表示 lmks 头数相对 KV-head 的复制因子，即 ``h_lmk == h_kv * G``：
-            * ``G == 1``（默认）：``h_lmk == h_kv``，K 在 group 内共享（标准 GQA/MQA），
-              kernel 内部自动按 ``G_kernel = h_q // h_kv`` 划分 query group。
-            * ``G > 1``：``h_lmk == h_q``（per-q-head lmks），K 不在 group 内共享，
-              此时 ``h_kv = h_q // G``，topk 仍在 ``h_kv`` 维度上做（max over G）。
+            * 默认（``G=None``）：``h_lmk == h_kv``，按 GQA/MQA 共享 K，``G = h_q // h_lmk``。
+            * 显式传 ``G``：要求 ``h_lmk == h_q``（per-q-head lmks），
+              此时 ``h_kv = h_q // G``，K 不再在 group 内共享。
             注意: 如果 lmks 的 D 维度是 q 的整数倍（D_lmk = D_q * ratio），会自动
             reshape 为 [B, S, h_lmk * ratio, D_q] 来对齐头维度。
         lse_swa (torch.Tensor):
@@ -1297,19 +1412,18 @@ def online_softmax_topk_head(
             Per-chunk per-query-head additive bias with shape [B, S, h_q]
             or [B, S, h_kv, G]. When provided, HSA LSE and topk selection add
             bias[b, chunk, head], while returned scores stay raw scaled qk.
-        use_gumbel (bool, optional):
-            If True, enable Gumbel sampling in training mode. When
-            `gumbel_noise` is None, noise is generated internally in Python.
-        gumbel_noise (torch.Tensor, optional):
-            Optional pre-generated noise tensor with shape [1, 1, h_q, S]. When
-            provided, it overrides internal generation and is useful for
-            deterministic ref/fused consistency tests. No gradient is
-            propagated to gumbel_noise.
-        G (int, optional, default=1):
-            ``lmks`` 相对 KV-head 的头数复制因子，即 ``h_lmk = h_kv * G``。
-            ``G == 1`` 走共享 K 路径（标准 GQA/MQA）；``G > 1`` 走 per-q-head 路径，
-            要求 ``lmks.shape[2] == q.shape[2] == h_q``，``h_kv = h_q // G``，
-            topk 仍在 ``h_kv`` 维度上做（max over G）。
+        cu_seq_lens (torch.Tensor, optional):
+            Varlen mode (SFT sequence packing). Token-level cumulative
+            sequence lengths with shape [num_seqs+1], dtype int32. When
+            provided, q/lmks must be packed with B=1 and the kernel runs
+            with per-sub-sequence causal/window masks. ``q_offset`` and
+            ``drop_mask`` are ignored in this mode.
+        G (int, optional):
+            Query group size. 当 ``G > 1`` 时强制走 per-q-head lmks 路径：
+            要求 ``lmks.shape[2] == q.shape[2] == h_q``，
+            ``h_kv = h_q // G``，topk 仍在 ``h_kv`` 维度上做（max over G）。
+            ``G is None`` 或 ``G == 1`` 时退回 shared-K 旧逻辑：
+            ``h_kv = lmks.shape[2]``，``G = h_q // h_kv``（与非 culens 版默认 ``G=1`` 行为对齐）。
 
     Returns:
         tuple[torch.Tensor, torch.Tensor]: (indices, scores)
@@ -1330,15 +1444,14 @@ def online_softmax_topk_head(
             lmks = lmks.reshape(lmks.shape[0], lmks.shape[1], lmks_h * d_ratio, D)
             lmks_h = lmks_h * d_ratio
         
-        if G == 1:
-            # Shared-K path: lmks already at h_kv granularity, kernel infers
-            # query-group fanout from h_q / h_kv internally.
+        # G is None or G == 1 both denote shared-K path (aligns with the
+        # legacy non-culens API where G defaulted to 1 for shared-K).
+        if G is None or G == 1:
             assert h_q % lmks_h == 0, f"h_q ({h_q}) must be divisible by lmks_h ({lmks_h})"
             h_kv = lmks_h
             G_eff = h_q // h_kv
             per_qhead_lmks = False
         else:
-            # Per-q-head lmks: lmks_h carries h_q heads, h_kv = h_q // G.
             assert lmks_h == h_q, (
                 f"when G>1, lmks must have h_q ({h_q}) heads, got {lmks_h}"
             )
@@ -1357,14 +1470,15 @@ def online_softmax_topk_head(
             d_ratio = D_lmk // D
             lmks = lmks.reshape(lmks.shape[0], lmks.shape[1], lmks.shape[2] * d_ratio, D)
         lmks_h = lmks.shape[2]
-        if G == 1:
-            # Shared-K path: lmks should be at h_kv granularity. Tolerate
-            # lmks_h == h_q (per-q-head lmks layout) for backward compat with
-            # callers passing 5D q without specifying G.
+        # G is None or G == 1 both denote shared-K path (aligns with the
+        # legacy non-culens API where G defaulted to 1 for shared-K).
+        if G is None or G == 1:
             if lmks_h == h_kv:
                 per_qhead_lmks = False
                 G_eff = G_in
             elif lmks_h == h_q:
+                # 5D q + per-q-head lmks layout but G not explicitly given:
+                # treat as GQA using q's existing (h_kv, G_in).
                 per_qhead_lmks = True
                 G_eff = G_in
             else:
@@ -1393,16 +1507,21 @@ def online_softmax_topk_head(
             lse_swa = lse_swa.reshape(B, L, h_kv, G_eff)
     use_drop_mask = drop_mask is not None
     use_bias = bias is not None
-    use_gumbel = bool(use_gumbel) or (gumbel_noise is not None)
-    cache_key = (topk, block_size, window_size, is_causal, is_training, use_drop_mask, use_bias, use_gumbel, per_qhead_lmks)
+    is_varlen = cu_seq_lens is not None
+    if is_varlen:
+        # Varlen mode constraints (mirrors topk_group): packed B=1, no drop_mask.
+        assert not use_drop_mask, "drop_mask is not supported in varlen mode"
+        # is_training is forced to False semantically: we use dynamic shapes;
+        # autograd still works because Fn.backward is shape-agnostic.
+    cache_key = (topk, block_size, window_size, is_causal, is_training, use_drop_mask, use_bias, per_qhead_lmks, is_varlen)
     
     if cache_key not in _SOFTMAX_MODULE_CACHE:
         _SOFTMAX_MODULE_CACHE[cache_key] = SoftmaxTopKMaxPooling_Fused(
             topk, block_size, window_size, is_causal, is_training, use_drop_mask,
-            per_qhead_lmks=per_qhead_lmks,
+            per_qhead_lmks=per_qhead_lmks, is_varlen=is_varlen,
         )
 
-    return _SOFTMAX_MODULE_CACHE[cache_key](q, lmks, lse_swa, q_offset=q_offset, drop_mask=drop_mask, sm_scale=sm_scale, bias=bias, use_gumbel=use_gumbel, gumbel_noise=gumbel_noise)
+    return _SOFTMAX_MODULE_CACHE[cache_key](q, lmks, lse_swa, q_offset=q_offset, drop_mask=drop_mask, sm_scale=sm_scale, bias=bias, cu_seq_lens=cu_seq_lens)
 
 
 
@@ -1603,13 +1722,12 @@ def test_fused_softmax_topk_max_pooling_memory_and_speed(
     S: int = 128, topk: int = 32, block_size: int = 64, window_size: int = 512,
     is_causal: bool = True,
     use_bias: bool = False,
-    use_gumbel: bool = False,
     per_qhead_lmks: bool = False,
     n_iters: int = 20, n_warmup: int = 5,
     skip_ref: bool = False,
     pass_G: bool = None,  # whether to pass G to online_softmax_topk_head; defaults to True iff per_qhead_lmks
 ):
-    """Benchmark fused vs reference impl. Supports per-chunk bias / per-q-head lmks / Gumbel."""
+    """Benchmark fused vs reference impl. Supports per-chunk bias / per-q-head lmks."""
     print("\n" + "=" * 70)
     print(f"=== Benchmark [{name}] Fused Softmax TopK Max-Pooling ===")
     print("=" * 70)
@@ -1626,7 +1744,7 @@ def test_fused_softmax_topk_max_pooling_memory_and_speed(
     print(
         f"Config: B={B}, L={L}, S={S}, h_kv={h_kv}, G={G} (h_q={h_q}), D={D}, "
         f"topk={topk}, block_size={block_size}, window_size={window_size}, "
-        f"use_bias={use_bias}, use_gumbel={use_gumbel}, per_qhead_lmks={per_qhead_lmks}, "
+        f"use_bias={use_bias}, per_qhead_lmks={per_qhead_lmks}, "
         f"pass_G={pass_G}"
     )
 
@@ -1647,12 +1765,6 @@ def test_fused_softmax_topk_max_pooling_memory_and_speed(
         # bias shape [B, S, h_q] is also accepted by both fused and ref
         bias = torch.randn(B, S, h_q, dtype=torch.float32, device=device) * 0.5
 
-    gumbel_noise = None
-    if use_gumbel:
-        # Match shape used elsewhere: [1, 1, h_q, S]
-        u = torch.rand(1, 1, h_q, S, dtype=torch.float32, device=device).clamp_(1e-6, 1 - 1e-6)
-        gumbel_noise = -torch.log(-torch.log(u))
-
     def _make_inputs():
         q_t = q.detach().clone().requires_grad_(True)
         lmks_t = lmks.detach().clone().requires_grad_(True)
@@ -1668,7 +1780,7 @@ def test_fused_softmax_topk_max_pooling_memory_and_speed(
         # JIT compile + first call
         _, scores = online_softmax_topk_head(
             q_t, lmks_t, lse_swa_t, topk, block_size, window_size, is_causal,
-            bias=bias, use_gumbel=use_gumbel, gumbel_noise=gumbel_noise, G=G_arg,
+            bias=bias, G=G_arg,
         )
         loss = (scores * grad_output).sum()
         loss.backward()
@@ -1680,7 +1792,7 @@ def test_fused_softmax_topk_max_pooling_memory_and_speed(
             lmks_t.grad = None
             _, scores = online_softmax_topk_head(
                 q_t, lmks_t, lse_swa_t, topk, block_size, window_size, is_causal,
-                bias=bias, use_gumbel=use_gumbel, gumbel_noise=gumbel_noise, G=G_arg,
+                bias=bias, G=G_arg,
             )
             loss = (scores * grad_output).sum()
             loss.backward()
@@ -1691,7 +1803,7 @@ def test_fused_softmax_topk_max_pooling_memory_and_speed(
         lmks_t.grad = None
         _, scores = online_softmax_topk_head(
             q_t, lmks_t, lse_swa_t, topk, block_size, window_size, is_causal,
-            bias=bias, use_gumbel=use_gumbel, gumbel_noise=gumbel_noise, G=G_arg,
+            bias=bias, G=G_arg,
         )
         loss = (scores * grad_output).sum()
         loss.backward()
@@ -1709,7 +1821,7 @@ def test_fused_softmax_topk_max_pooling_memory_and_speed(
             lmks_t.grad = None
             _ = online_softmax_topk_head(
                 q_t, lmks_t, lse_swa_t, topk, block_size, window_size, is_causal,
-                bias=bias, use_gumbel=use_gumbel, gumbel_noise=gumbel_noise, G=G_arg,
+                bias=bias, G=G_arg,
             )
         end_fwd.record()
         torch.cuda.synchronize()
@@ -1722,7 +1834,7 @@ def test_fused_softmax_topk_max_pooling_memory_and_speed(
             lmks_t.grad = None
             _, scores = online_softmax_topk_head(
                 q_t, lmks_t, lse_swa_t, topk, block_size, window_size, is_causal,
-                bias=bias, use_gumbel=use_gumbel, gumbel_noise=gumbel_noise, G=G_arg,
+                bias=bias, G=G_arg,
             )
             loss = (scores * grad_output).sum()
             loss.backward()
@@ -1743,13 +1855,13 @@ def test_fused_softmax_topk_max_pooling_memory_and_speed(
         def forward_only():
             _ = ref_softmax_topk_max_pooling(
                 q_t, lmks_t, lse_swa_ref, topk, block_size, window_size, is_causal,
-                bias=bias, gumbel_noise=gumbel_noise,
+                bias=bias,
             )
 
         def forward_backward():
             _, scores = ref_softmax_topk_max_pooling(
                 q_t, lmks_t, lse_swa_ref, topk, block_size, window_size, is_causal,
-                bias=bias, gumbel_noise=gumbel_noise,
+                bias=bias,
             )
             loss = (scores * grad_output_ref).sum()
             loss.backward()
@@ -1943,16 +2055,15 @@ def test_topk_correctness_robust(B, L, S, h_kv, G, D, topk, block_size, window_s
 
 import pytest
 @pytest.mark.parametrize(
-    "test_name, B, q_len, kv_len, h_kv, G, D, topk, block_size, window_size, is_training, q_offset, use_bias, use_gumbel, per_qhead_lmks",
+    "test_name, B, q_len, kv_len, h_kv, G, D, topk, block_size, window_size, is_training, q_offset, use_bias, per_qhead_lmks",
     [
-        ("train_basic", 2, 1024, 1024, 2, 8, 128, 16, 64, 64, True, 0, False, False, False),
-        ("train_basic_bias", 2, 1024, 1024, 2, 8, 128, 16, 64, 64, True, 0, True, False, False),
-        ("train_basic_bias_gumbel", 2, 1024, 1024, 2, 8, 128, 16, 64, 64, True, 0, True, True, False),
-        ("train_perqhead", 2, 1024, 1024, 2, 8, 128, 16, 64, 64, True, 0, False, False, True),
-        ("train_perqhead_bias", 2, 1024, 1024, 2, 8, 128, 16, 64, 64, True, 0, True, False, True),
+        ("train_basic", 2, 1024, 1024, 2, 8, 128, 16, 64, 64, True, 0, False, False),
+        ("train_basic_bias", 2, 1024, 1024, 2, 8, 128, 16, 64, 64, True, 0, True, False),
+        ("train_perqhead", 2, 1024, 1024, 2, 8, 128, 16, 64, 64, True, 0, False, True),
+        ("train_perqhead_bias", 2, 1024, 1024, 2, 8, 128, 16, 64, 64, True, 0, True, True),
     ]
 )
-def test_train_inference_correctness(test_name, B, q_len, kv_len, h_kv, G, D, topk, block_size, window_size, is_training, q_offset, use_bias, use_gumbel, per_qhead_lmks=False, is_causal=True):
+def test_train_inference_correctness(test_name, B, q_len, kv_len, h_kv, G, D, topk, block_size, window_size, is_training, q_offset, use_bias, per_qhead_lmks=False, is_causal=True):
     """
     测试 TopK 模块在训练和推理场景下的正确性
     
@@ -1976,7 +2087,7 @@ def test_train_inference_correctness(test_name, B, q_len, kv_len, h_kv, G, D, to
     print(f"Test: {test_name}")
     print(f"Config: B={B}, q_len={q_len}, kv_len={kv_len}, h_kv={h_kv}, G={G}, D={D}")
     print(f"        topk={topk}, block_size={block_size}, window_size={window_size}")
-    print(f"        is_training={is_training}, is_causal={is_causal}, q_offset={q_offset}, use_bias={use_bias}, use_gumbel={use_gumbel}, per_qhead_lmks={per_qhead_lmks}")
+    print(f"        is_training={is_training}, is_causal={is_causal}, q_offset={q_offset}, use_bias={use_bias}, per_qhead_lmks={per_qhead_lmks}")
     print(f"{'='*70}")
     
     # 推理模式下 batch 必须为 1
@@ -2021,30 +2132,23 @@ def test_train_inference_correctness(test_name, B, q_len, kv_len, h_kv, G, D, to
         bias = (chunk_axis + head_axis + batch_axis).contiguous()
     else:
         bias = None
-    if use_gumbel:
-        assert is_training, "gumbel_noise test case must run in training mode"
-        torch.manual_seed(123)
-        u = torch.rand(1, 1, h_kv * G, S, device=device, dtype=torch.float32).clamp_(min=1e-20, max=1 - 1e-7)
-        gumbel_noise = -torch.log(-torch.log(u))
-    else:
-        gumbel_noise = None
 
-    # `online_softmax_topk_head` 走新路径需要显式 G
+    # `online_softmax_topk_head` requires explicit G when going through per-q-head path
     G_arg = G if per_qhead_lmks else None
     
-    # ============ 前向计算 ============
+    # ============ Forward ============
     print("\n--- Forward Pass ---")
     
-    # Reference  (k_lmks 形状由 ref 自动判断 per_qhead 与否)
+    # Reference (k_lmks shape decides per_qhead automatically)
     indices_ref, scores_ref = ref_softmax_topk_max_pooling(
         q_ref, lmks_ref, lse_swa.float(), topk, block_size, window_size, is_causal,
-        q_offset=q_offset, bias=bias, gumbel_noise=gumbel_noise
+        q_offset=q_offset, bias=bias,
     )
     
     # Fused Kernel
     indices_fused, scores_fused = online_softmax_topk_head(
         q_fused, lmks_fused, lse_swa, topk, block_size, window_size, is_causal,
-        q_offset=q_offset, is_training=is_training, bias=bias, use_gumbel=use_gumbel, gumbel_noise=gumbel_noise,
+        q_offset=q_offset, is_training=is_training, bias=bias,
         G=G_arg,
     )
     
@@ -2506,124 +2610,271 @@ def test_gqa_d_reshape_correctness():
         print("❌ GQA D-Reshape Backward FAILED")
 
 
-if __name__ == "__main__":
+def test_varlen_correctness(
+    sub_q_lens=(256, 384, 192),
+    h_kv=2, G=4, D=128,
+    topk=8, block_size=32, window_size=64,
+    use_bias=False, per_qhead_lmks=False,
+):
+    """
+    Varlen consistency test: pack N sub-sequences into one packed tensor and
+    compare the varlen fused output against running the dense fused path on
+    each sub-sequence independently.
+
+    Convention: each sub-sequence has q_len[i] tokens; its landmark count is
+    floor(q_len[i] / block_size). cu_seq_lens (token-level) is built from the
+    sub_q_lens prefix sum. Within each sub-sequence q_offset=0 (training-like
+    semantics), so causal/window are local to the sub-sequence.
+    """
     print("\n" + "=" * 70)
-    print("Running Per-Chunk Bias / Per-Q-Head Lmks Correctness Tests")
+    print(f"=== Varlen Consistency Test (per_qhead_lmks={per_qhead_lmks}, use_bias={use_bias}) ===")
     print("=" * 70)
 
-    # Per-chunk bias on default (per-KV-head) lmks
-    test_train_inference_correctness(
-        "train_basic_bias", 2, 1024, 1024, 2, 8, 128, 16, 64, 64, True, 0, True, False, False
+    device = "cuda"
+    dtype = torch.bfloat16
+    is_causal = True
+    h_q = h_kv * G
+
+    # Each sub-sequence q_len must be divisible by block_size for cu_seq_lens_k
+    # derivation (sub_lmk_counts = q_len // block_size) to recover the dense lmk
+    # count of each sub-sequence.
+    for ql in sub_q_lens:
+        assert ql % block_size == 0, f"sub_q_len {ql} must be divisible by block_size {block_size}"
+
+    sub_s_lens = [ql // block_size for ql in sub_q_lens]
+    L_total = sum(sub_q_lens)
+    S_total = sum(sub_s_lens)
+    num_seqs = len(sub_q_lens)
+
+    print(f"Config: sub_q_lens={list(sub_q_lens)} -> L_total={L_total}, S_total={S_total}, num_seqs={num_seqs}")
+    print(f"        h_kv={h_kv}, G={G}, D={D}, topk={topk}, block_size={block_size}, window_size={window_size}")
+
+    torch.manual_seed(42)
+
+    # Per-sub-sequence dense inputs first; we'll concatenate them for the
+    # packed varlen call and reuse the same data for the dense reference.
+    q_subs = []
+    lmks_subs = []
+    lse_swa_subs = []
+    bias_subs = [] if use_bias else None
+    for ql, sl in zip(sub_q_lens, sub_s_lens):
+        q_subs.append(torch.randn(1, ql, h_kv, G, D, dtype=dtype, device=device))
+        if per_qhead_lmks:
+            lmks_subs.append(torch.randn(1, sl, h_q, D, dtype=dtype, device=device))
+        else:
+            lmks_subs.append(torch.randn(1, sl, h_kv, D, dtype=dtype, device=device))
+        lse_swa_subs.append(torch.randn(1, ql, h_kv, G, dtype=dtype, device=device) * 5 + 10)
+        if use_bias:
+            bias_subs.append(torch.randn(1, sl, h_q, dtype=torch.float32, device=device) * 0.5)
+
+    # Packed (varlen) tensors.
+    q_packed = torch.cat(q_subs, dim=1).contiguous()
+    lmks_packed = torch.cat(lmks_subs, dim=1).contiguous()
+    lse_swa_packed = torch.cat(lse_swa_subs, dim=1).contiguous()
+    bias_packed = torch.cat(bias_subs, dim=1).contiguous() if use_bias else None
+
+    cu_seq_lens = torch.tensor([0] + list(torch.tensor(sub_q_lens).cumsum(0).tolist()),
+                               dtype=torch.int32, device=device)
+
+    G_arg = G if per_qhead_lmks else None
+
+    # ============ Varlen forward + backward ============
+    print("\n--- Varlen Forward + Backward ---")
+    q_var = q_packed.detach().clone().requires_grad_(True)
+    lmks_var = lmks_packed.detach().clone().requires_grad_(True)
+    lse_swa_var = lse_swa_packed.detach().clone()
+
+    indices_var, scores_var = online_softmax_topk_head(
+        q_var, lmks_var, lse_swa_var, topk, block_size, window_size, is_causal,
+        is_training=True, bias=bias_packed, cu_seq_lens=cu_seq_lens, G=G_arg,
     )
+    # scores_var: [1, L_total, h_q, topk]; reshape for slicing convenience
+    scores_var_view = scores_var.view(1, L_total, h_kv, G, topk)
+    grad_scores = torch.randn_like(scores_var)
+    # Mask invalid positions (causal-only with limited landmarks may produce
+    # -inf scores for very early tokens).
+    with torch.no_grad():
+        invalid = scores_var_view.float() < -1e5
+        grad_scores.view(1, L_total, h_kv, G, topk)[invalid] = 0.0
+    (scores_var * grad_scores).sum().backward()
+    dq_var = q_var.grad.clone()
+    dlmks_var = lmks_var.grad.clone()
+
+    # ============ Dense per-sub-sequence reference ============
+    print("--- Dense Per-Sub-Sequence Reference ---")
+    q_offset_l = 0
+    s_offset_l = 0
+    indices_ref_packed = torch.full_like(indices_var, -1)
+    scores_ref_packed = torch.full_like(scores_var, float("-inf"))
+    dq_ref_pieces = []
+    dlmks_ref_pieces = []
+    for i, (ql, sl) in enumerate(zip(sub_q_lens, sub_s_lens)):
+        q_sub = q_subs[i].detach().clone().requires_grad_(True)
+        lmks_sub = lmks_subs[i].detach().clone().requires_grad_(True)
+        lse_swa_sub = lse_swa_subs[i].detach().clone()
+        bias_sub = bias_subs[i] if use_bias else None
+
+        idx_sub, sc_sub = online_softmax_topk_head(
+            q_sub, lmks_sub, lse_swa_sub, topk, block_size, window_size, is_causal,
+            is_training=True, bias=bias_sub, G=G_arg,
+        )
+        # idx_sub: [1, ql, h_kv, topk]; sc_sub: [1, ql, h_q, topk].
+        # Convert sub-seq local lmk indices to global packed lmk indices.
+        idx_global = idx_sub.clone()
+        idx_global[idx_global >= 0] = idx_global[idx_global >= 0] + s_offset_l
+        indices_ref_packed[0, q_offset_l:q_offset_l + ql] = idx_global[0]
+        scores_ref_packed[0, q_offset_l:q_offset_l + ql] = sc_sub[0]
+
+        # Backward over the same grad slice
+        grad_slice = grad_scores[0, q_offset_l:q_offset_l + ql].unsqueeze(0)
+        (sc_sub * grad_slice).sum().backward()
+        dq_ref_pieces.append(q_sub.grad.detach().clone())
+        dlmks_ref_pieces.append(lmks_sub.grad.detach().clone())
+
+        q_offset_l += ql
+        s_offset_l += sl
+
+    dq_ref = torch.cat(dq_ref_pieces, dim=1)
+    dlmks_ref = torch.cat(dlmks_ref_pieces, dim=1)
+
+    # ============ Compare ============
+    def get_err_ratio(x, y):
+        mask = (x > -1e5) & (y > -1e5)
+        if mask.sum() == 0:
+            return 0.0
+        err = (x[mask] - y[mask]).square().mean().sqrt().item()
+        base = x[mask].square().mean().sqrt().item()
+        return err / (base + 1e-12)
+
+    # Forward scores
+    fwd_rel = get_err_ratio(scores_ref_packed.float(), scores_var.float())
+    print(f"FWD Scores Rel Error: {fwd_rel:.6f}")
+
+    # Indices match rate (where ref has valid)
+    valid = scores_ref_packed.view(1, L_total, h_kv, G, topk).max(dim=3).values > -1e5
+    if valid.sum() > 0:
+        match_rate = (indices_var.long() == indices_ref_packed.long())[valid].float().mean().item()
+        print(f"Indices Match Rate: {match_rate*100:.2f}%")
+    else:
+        match_rate = 1.0
+
+    # Backward grads (handle any NaNs from -inf scores)
+    dq_var = torch.nan_to_num(dq_var, 0.0)
+    dq_ref = torch.nan_to_num(dq_ref, 0.0)
+    dlmks_var = torch.nan_to_num(dlmks_var, 0.0)
+    dlmks_ref = torch.nan_to_num(dlmks_ref, 0.0)
+
+    dq_rel = get_err_ratio(dq_ref.float(), dq_var.float())
+    dlmks_rel = get_err_ratio(dlmks_ref.float(), dlmks_var.float())
+    print(f"dQ Rel Error: {dq_rel:.6f}")
+    print(f"dLmks Rel Error: {dlmks_rel:.6f}")
+
+    fwd_ok = fwd_rel < 0.02
+    idx_ok = match_rate >= 0.99
+    bwd_ok = dq_rel < 0.05 and dlmks_rel < 0.05
+    if fwd_ok and idx_ok and bwd_ok:
+        print("✅ Varlen Consistency PASSED")
+    else:
+        print(f"❌ Varlen Consistency FAILED (fwd={fwd_ok}, idx={idx_ok}, bwd={bwd_ok})")
+
+
+if __name__ == "__main__":
+    print("\n" + "=" * 70)
+    print("Regression Suite for topk_head_softmax_culens")
+    print("=" * 70)
+
+    # ----------------------------------------------------------------------
+    # Training-mode correctness (forward + backward)
+    # Signature: (test_name, B, q_len, kv_len, h_kv, G, D, topk,
+    #             block_size, window_size, is_training, q_offset, use_bias, per_qhead_lmks)
+    # ----------------------------------------------------------------------
+
+    # 1) Baseline: per-KV-head lmks, no bias
     test_train_inference_correctness(
-        "train_basic_bias_gumbel", 2, 1024, 1024, 2, 8, 128, 16, 64, 64, True, 0, True, True, False
+        "train_basic", 2, 1024, 1024, 2, 8, 128, 16, 64, 64, True, 0, False, False
     )
 
-    # 非 chunk_size 整数倍长度
+    # 2) Per-KV-head lmks + bias
     test_train_inference_correctness(
-        "train_bias_nondiv_999", 2, 999, 999, 2, 8, 128, 16, 64, 64, True, 0, True, False, False
-    )
-    test_train_inference_correctness(
-        "train_bias_nondiv_1023", 2, 1023, 1023, 2, 8, 128, 16, 64, 64, True, 0, True, False, False
-    )
-    test_train_inference_correctness(
-        "train_bias_nondiv_1100", 1, 1100, 1100, 2, 8, 128, 16, 64, 64, True, 0, True, False, False
+        "train_basic_bias", 2, 1024, 1024, 2, 8, 128, 16, 64, 64, True, 0, True, False
     )
 
-    # Per-q-head lmks (G is given explicitly)
+    # 3) Per-q-head lmks (no bias)
     test_train_inference_correctness(
-        "train_perqhead", 2, 1024, 1024, 2, 8, 128, 16, 64, 64, True, 0, False, False, True
-    )
-    test_train_inference_correctness(
-        "train_perqhead_bias", 2, 1024, 1024, 2, 8, 128, 16, 64, 64, True, 0, True, False, True
-    )
-    test_train_inference_correctness(
-        "train_perqhead_bias_gumbel", 2, 1024, 1024, 2, 8, 128, 16, 64, 64, True, 0, True, True, True
-    )
-    test_train_inference_correctness(
-        "train_perqhead_nondiv_999", 2, 999, 999, 2, 8, 128, 16, 64, 64, True, 0, True, False, True
+        "train_perqhead", 2, 1024, 1024, 2, 8, 128, 16, 64, 64, True, 0, False, True
     )
 
-    # # ===== 补充覆盖：推理 per_qhead+bias、G=1+per_qhead+bias、gumbel+非整除 =====
-    # 推理模式 per_qhead + bias（生产部署最关键路径）
+    # 4) Per-q-head lmks + bias (covers fully-loaded selection path)
     test_train_inference_correctness(
-        "infer_perqhead_prefill_bias", 1, 1024, 1024, 2, 8, 128, 16, 64, 64, False, 0, True, False, True
-    )
-    test_train_inference_correctness(
-        "infer_perqhead_chunk2_bias", 1, 1024, 2048, 2, 8, 128, 16, 64, 64, False, 1024, True, False, True
-    )
-    test_train_inference_correctness(
-        "infer_perqhead_decode_bias", 1, 1, 2049, 2, 8, 128, 16, 64, 64, False, 2048, True, False, True
-    )
-    # G=1（无 GQA 倍率）+ per_qhead + bias，回归 immutable g 变量 bug
-    test_train_inference_correctness(
-        "train_perqhead_G1_bias", 2, 1024, 1024, 4, 1, 128, 16, 64, 64, True, 0, True, False, True
-    )
-    # gumbel + 非整除长度
-    test_train_inference_correctness(
-        "train_gumbel_nondiv", 2, 999, 999, 2, 8, 128, 16, 64, 64, True, 0, False, True, False
-    )
-    test_train_inference_correctness(
-        "train_perqhead_gumbel_nondiv", 2, 999, 999, 2, 8, 128, 16, 64, 64, True, 0, True, True, True
+        "train_perqhead_bias", 2, 1024, 1024, 2, 8, 128, 16, 64, 64, True, 0, True, True
     )
 
-    # DropMask + per_qhead
+    # 5) Non-divisible seq length (padding inside kernel)
+    test_train_inference_correctness(
+        "train_bias_nondiv_999", 2, 999, 999, 2, 8, 128, 16, 64, 64, True, 0, True, False
+    )
+
+    # 6) G=1 corner case (no GQA replication) + per_qhead + bias
+    test_train_inference_correctness(
+        "train_perqhead_G1_bias", 2, 1024, 1024, 4, 1, 128, 16, 64, 64, True, 0, True, True
+    )
+
+    # ----------------------------------------------------------------------
+    # Inference-mode correctness (forward only, B=1, q_offset > 0 for chunked)
+    # ----------------------------------------------------------------------
+
+    # 7) Prefill chunk-2 with non-zero q_offset, per_qhead + bias
+    test_train_inference_correctness(
+        "infer_perqhead_chunk2_bias", 1, 1024, 2048, 2, 8, 128, 16, 64, 64, False, 1024, True, True
+    )
+
+    # 8) Decode step (q_len = 1)
+    test_train_inference_correctness(
+        "infer_perqhead_decode_bias", 1, 1, 2049, 2, 8, 128, 16, 64, 64, False, 2048, True, True
+    )
+
+    # ----------------------------------------------------------------------
+    # DropMask correctness (forward + backward)
+    # ----------------------------------------------------------------------
     test_drop_mask_correctness(per_qhead_lmks=False)
     test_drop_mask_correctness(per_qhead_lmks=True)
 
-    # ===== Per-q-head vs Shared lmks 速度对比（同一套 GQA 配置） =====
-    # h_q = h_kv * G。两边输入形状只差 lmks（[B,S,h_kv,D] vs [B,S,h_kv*G,D]），
-    # 其他配置完全一致；fused 内部走不同 kernel 路径。
-    gqa_cfg = dict(B=4, L=8192, D=128, h_kv=4, G=8, S=128, topk=32,
-                   block_size=64, window_size=512, n_iters=20, n_warmup=5,
-                   skip_ref=True)  # 只对比两条 fused 路径，跳过 ref
-    test_fused_softmax_topk_max_pooling_memory_and_speed(
-        name="gqa_shared_lmks", per_qhead_lmks=False, **gqa_cfg
+    # ----------------------------------------------------------------------
+    # GQA D-reshape (D_lmk != D_q) correctness
+    # ----------------------------------------------------------------------
+    test_gqa_d_reshape_correctness()
+
+    # ----------------------------------------------------------------------
+    # Varlen (cu_seq_lens) consistency: packed run vs per-sub-sequence dense run.
+    # ----------------------------------------------------------------------
+    # Basic: per-KV-head lmks, no bias
+    test_varlen_correctness(
+        sub_q_lens=(256, 384, 192), h_kv=2, G=4, D=128,
+        topk=8, block_size=32, window_size=64,
+        use_bias=False, per_qhead_lmks=False,
     )
-    test_fused_softmax_topk_max_pooling_memory_and_speed(
-        name="gqa_perqhead_lmks", per_qhead_lmks=True, **gqa_cfg
+    # Per-KV-head + bias
+    test_varlen_correctness(
+        sub_q_lens=(256, 384, 192), h_kv=2, G=4, D=128,
+        topk=8, block_size=32, window_size=64,
+        use_bias=True, per_qhead_lmks=False,
     )
-    
-    # # 运行训练和推理正确性测试
-    # print("\n" + "=" * 70)
-    # print("Running Train/Inference Correctness Tests")
-    # print("=" * 70)
-    
-    # test_cases = [# test_name, B, q_len, kv_len, h_kv, G, D, topk, block_size, window_size, is_training, q_offset
-    #     # 训练场景
-    #             ("train_basic", 2, 1048, 1048, 2, 8, 128, 16, 64, 64, True, 0),
-    #             ("train_large_batch", 4, 2048, 2048, 2, 8, 128, 16, 64, 64, True, 0),
-    #             ("train_non_divisible", 2, 999, 999, 2, 8, 128, 16, 64, 64, True, 0),
-                
-    #             # 推理场景
-    #             ("prefill_chunk1", 1, 1024, 1024, 2, 8, 128, 16, 64, 64, False, 0),
-    #             ("prefill_chunk2", 1, 1024, 2048, 2, 8, 128, 16, 64, 64, False, 1024),
-    #             ("prefill_chunk3", 1, 1024, 3072, 2, 8, 128, 16, 64, 64, False, 2048),
-    #             ("prefill_non_divisible", 1, 512, 1536, 2, 8, 128, 16, 64, 64, False, 1024),
-    #             ("decode_step1", 1, 1, 1025, 2, 8, 128, 16, 64, 64, False, 1024),
-    #             ("decode_step2", 1, 1, 2049, 2, 8, 128, 16, 64, 64, False, 2048),
-    #             ("edge_small_topk", 1, 512, 1024, 2, 8, 128, 4, 64, 64, False, 512),
-    #             ("edge_large_window", 1, 1024, 2048, 2, 8, 128, 16, 64, 128, False, 1024),
-    # ]
-    
-    # for params in test_cases:
-    #     test_train_inference_correctness(*params)
-    
+    # Per-q-head lmks + bias (most general path)
+    test_varlen_correctness(
+        sub_q_lens=(256, 384, 192), h_kv=2, G=4, D=128,
+        topk=8, block_size=32, window_size=64,
+        use_bias=True, per_qhead_lmks=True,
+    )
+    # Larger packed batch
+    test_varlen_correctness(
+        sub_q_lens=(512, 256, 768, 128), h_kv=2, G=8, D=128,
+        topk=16, block_size=64, window_size=128,
+        use_bias=False, per_qhead_lmks=False,
+    )
 
-    # params_list = [
-    #     (2, 4096, 64, 2, 8, 128, 16, 64, 64),
-    #     (1, 2048, 64, 1, 8, 128, 16, 32, 40),
-    #     (3, 2048, 64, 1, 8, 128, 8, 32, 33),
-    #     (2, 4096, 64, 1, 8, 128, 32, 64, 100),
-    # ]
-    # for p in params_list:
-    #     test_topk_correctness_robust(*p)
-
-    # # 运行 DropMask 正确性测试
-    # test_drop_mask_correctness()
-    
-    # # 运行 GQA D-Reshape 正确性测试
-    # test_gqa_d_reshape_correctness()
+    print("\n" + "=" * 70)
+    print("All regression tests finished.")
+    print("=" * 70)
 
 
-# python ops/topk_head_softmax_perchunkbias.py
+# python ops/topk_head_softmax_culens.py

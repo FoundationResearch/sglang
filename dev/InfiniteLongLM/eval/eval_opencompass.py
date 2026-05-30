@@ -2,6 +2,7 @@ import json
 import os
 import sys
 from transformers import AutoConfig, AutoModelForCausalLM, Qwen3Config
+from transformers.models.auto.configuration_auto import CONFIG_MAPPING
 from models.FlashHSA.configuration_hsa import HSAConfig
 def _pop_cli_arg(name: str):
     if name not in sys.argv:
@@ -24,25 +25,29 @@ def _peek_cli_arg(name: str):
 
 
 def _resolve_model_type(config_path=None, checkpoint_path=None):
-    model_type = ""
-    path = config_path or (os.path.join(checkpoint_path, "config.json") if checkpoint_path else None)
-    if path and os.path.exists(path):
-        with open(path, "r", encoding="utf-8") as f:
-            model_type = json.load(f).get("model_type", "")
-    return model_type
+    # Prefer the checkpoint's own config.json because that's the file
+    # AutoConfig.from_pretrained() will actually read inside OpenCompass.
+    # The --hsa-config json (model template) may carry a different
+    # model_type and would cause registration to miss the real key.
+    candidates = []
+    if checkpoint_path:
+        candidates.append(os.path.join(checkpoint_path, "config.json"))
+    if config_path:
+        candidates.append(config_path)
+    for path in candidates:
+        if path and os.path.exists(path):
+            with open(path, "r", encoding="utf-8") as f:
+                model_type = json.load(f).get("model_type", "")
+            if model_type:
+                return model_type
+    return ""
 
 
 def resolve_hsa_class(config_path=None, checkpoint_path=None):
     model_type = _resolve_model_type(config_path, checkpoint_path)
     if "lhsa" in model_type or "hsa" in model_type:
-        if "olmo" in model_type:
-            from models.FlashHSA.modeling_olmo_lhsa import HSAForCausalLM
-            return HSAForCausalLM, model_type
-        if "qwen" in model_type:
-            from models.FlashHSA.modeling_qwen_lhsa import HSAForCausalLM
-            return HSAForCausalLM, model_type
-        # Generic HSA fallback (legacy): qwen-based HSAForCausalLM under the
-        # literal "flash_hsa" tag.
+        # All HSA variants (olmo_lhsa, qwen_lhsa, flash_hsa, etc.) use the
+        # unified qwen_lhsa modeling implementation.
         from models.FlashHSA.modeling_qwen_lhsa import HSAForCausalLM
         return HSAForCausalLM, model_type or "flash_hsa"
     # Non-HSA checkpoint (e.g. stock Olmo3 "olmo3", plain Qwen, etc.).
@@ -63,6 +68,9 @@ if _hsa_resolved[0] is not None:
 
 
     AutoConfig.register(model_type, OpenCompassHSAConfig, exist_ok=True)
+    # Also register into CONFIG_MAPPING so that AutoConfig.from_pretrained()
+    # can resolve the model_type before falling back to _model_mapping.
+    CONFIG_MAPPING._extra_content[model_type] = OpenCompassHSAConfig
     HSAForCausalLM.config_class = OpenCompassHSAConfig
     AutoModelForCausalLM.register(OpenCompassHSAConfig, HSAForCausalLM, exist_ok=True)
 

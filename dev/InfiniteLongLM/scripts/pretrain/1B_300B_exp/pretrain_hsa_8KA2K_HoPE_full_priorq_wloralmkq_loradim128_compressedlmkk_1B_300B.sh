@@ -16,11 +16,11 @@ export NCCL_DEBUG=INFO
 export NCCL_DEBUG_SUBSYS=INIT,NET
 
 
-export MODEL_CONFIG="configs/flash_hsa/config_hsa_8KA2K_HoPE_345M_lmk_bias_priorq_wloralmkq_loradim128_1B.json"
+export MODEL_CONFIG="configs/flash_hsa/config_hsa_8KA2K_HoPE_345M_lmk_bias_priorq_wloralmkq_loradim128_compressedlmkk_1B.json"
 export CORPUS_PATH="/apdcephfs_tj5/share_300719894/shared/data/dolma3_mix-6T-1025-500B/"
 export MAX_SEQ_LEN=8192
-export WANDB_NAME="hsa_8KA2K_HoPE-priorq-wloralmkq-loradim128-1B-300B"
-export OUTPUT_DIR="/apdcephfs_tj5/share_300719894/user/qqzxywei/wxy/checkpoints/hsa_8KA2K_HoPE_full_345M_dist-priorq-wloralmkq-loradim128-1B-300B"
+export WANDB_NAME="hsa_8KA2K_HoPE-priorq-wloralmkq-loradim128-compressedlmkk-1B-300B"
+export OUTPUT_DIR="/apdcephfs_tj5/share_300719894/user/qqzxywei/wxy/checkpoints/hsa_8KA2K_HoPE_full_345M_dist-priorq-wloralmkq-loradim128-compressedlmkk-1B-300B"
 export MAX_STEPS=143000
 export SAVE_STEPS=5000
 export TRAIN_SIZE=300000000000

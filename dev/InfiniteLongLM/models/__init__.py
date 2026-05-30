@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from . import FlashHSA, SWANGPT, DRT, SWANNSA, DEEPSEEK
+from . import FlashHSA, SWANGPT, DRT, SWANNSA, DEEPSEEK, DASHATTN, INFLLMV2
 
 __all__ = [
     "FlashHSA",
@@ -20,4 +20,6 @@ __all__ = [
     "SWANNSA",
     "DRT",
     "DEEPSEEK",
+    "DASHATTN",
+    "INFLLMV2",
 ]

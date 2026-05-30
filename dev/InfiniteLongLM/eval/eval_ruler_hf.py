@@ -40,18 +40,18 @@ from utils.landmark_utils import insert_special_tokens, create_position_ids_with
 
 def resolve_hsa_class(config_path=None, checkpoint_path=None):
     """根据 config 中的 model_type 动态选择 HSAForCausalLM 实现"""
-    model_type = ""
-    # 优先从 config_path 读取，其次从 checkpoint_path 下的 config.json 读取
-    path = config_path or (os.path.join(checkpoint_path, "config.json") if checkpoint_path else None)
-    if path and os.path.exists(path):
-        with open(path, 'r') as f:
-            model_type = json.load(f).get("model_type", "")
-    if "olmo" in model_type:
-        from models.FlashHSA.modeling_olmo_lhsa import HSAForCausalLM
-        print("Using OLMo LHSA implementation")
-    else:
-        from models.FlashHSA.modeling_qwen_lhsa import HSAForCausalLM
-        print("Using Qwen LHSA implementation")
+    # model_type = ""
+    # # 优先从 config_path 读取，其次从 checkpoint_path 下的 config.json 读取
+    # path = config_path or (os.path.join(checkpoint_path, "config.json") if checkpoint_path else None)
+    # if path and os.path.exists(path):
+    #     with open(path, 'r') as f:
+    #         model_type = json.load(f).get("model_type", "")
+    # if "olmo" in model_type:
+    #     from models.FlashHSA.modeling_olmo_lhsa import HSAForCausalLM
+    #     print("Using OLMo LHSA implementation")
+    # else:
+    from models.FlashHSA.modeling_qwen_lhsa_forbench import HSAForCausalLM
+    print("Using Qwen LHSA implementation")
     return HSAForCausalLM
 
 

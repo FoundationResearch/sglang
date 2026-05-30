@@ -535,7 +535,7 @@ class Qwen3RotaryEmbedding(nn.Module):
             cos = emb.cos() * self.attention_scaling
             sin = emb.sin() * self.attention_scaling
 
-        return cos, sin
+        return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
 
 
 QWEN3_START_DOCSTRING = r"""

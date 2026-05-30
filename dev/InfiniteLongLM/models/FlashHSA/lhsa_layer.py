@@ -95,7 +95,11 @@ def _chunk_attn_pool_impl(
             # caller passes K with its native h_kv head count).  This gives
             # one lmk_k per KV head -- output shape (B, N, h_kv, D).
             B, N, _, _, D = k_f32.shape
-            mu_g = mu_f32.view(B, N, h_kv, G, D).mean(dim=3)                # (B, N, h_kv, D)
+            # ``reshape`` (not ``view``) so callers passing a non-contiguous
+            # mu_q (e.g. via ``q_c.expand(...)`` in shared_q_c mode) still
+            # work; reshape contiguifies if needed -- a one-time copy of the
+            # small (B, N, h_q, D) tensor.
+            mu_g = mu_f32.reshape(B, N, h_kv, G, D).mean(dim=3)             # (B, N, h_kv, D)
             logits_kv = torch.einsum("bnhd,bnshd->bnsh", mu_g, k_f32) * sm_scale  # (B, N, S, h_kv)
             logits_kv = logits_kv.masked_fill(
                 last_mask.view(1, 1, S_chunk, 1), float('-inf')
@@ -373,7 +377,6 @@ class LandmarkHSA(nn.Module):
         self.q_proj = nn.Linear(self.d_model, self.d_model // self.hsa_denom, bias=False)
         self.k_proj = nn.Linear(self.d_model, self.h_kv * self.head_dim, bias=False)
         self.v_proj = nn.Linear(self.d_model, self.h_kv * self.head_dim, bias=False)
-
         self.o_proj = nn.Linear(self.d_model, self.d_model, bias=False)
 
         self.enable_lmk_q_proj = getattr(config, "enable_lmk_q_proj", False)
@@ -429,6 +432,7 @@ class LandmarkHSA(nn.Module):
         self.compact_lmk_k = getattr(config, "compact_lmk_k", False)
         self.compressed_lmk_k = getattr(config, "compressed_lmk_k", False)
         assert not (self.compact_lmk_k and self.compressed_lmk_k), 'compact_lmk_k and compressed_lmk_k cannot be True at the same time'
+        self.enable_chunk_pooling = getattr(config, "enable_chunk_pooling", False)
         
         self.is_causal = True
         
@@ -451,6 +455,15 @@ class LandmarkHSA(nn.Module):
         self.hsa_dropout_prob = getattr(config, "hsa_dropout_prob", 0.0)
         self.hsa_disturb_prob = getattr(config, "hsa_disturb_prob", 0.0)
         self.enable_gumbel_noise = getattr(config, "enable_gumbel_noise", False)
+        self.shared_q_c = getattr(config, "shared_q_c", False)
+        if self.shared_q_c:
+            assert self.enable_prior_query, (
+                "shared_q_c only makes sense when enable_prior_query=True"
+            )
+            
+            std = getattr(config, "initializer_range", 0.02)
+            self.q_c = nn.Parameter(torch.empty(self.h_q, self.head_dim))
+            nn.init.normal_(self.q_c, mean=0.0, std=std)
         
 
     def forward(self,
@@ -639,9 +652,13 @@ class LandmarkHSA(nn.Module):
                 k_chunked = lmk_k_source[:, : full_chunks * self.chunk_size]
                 k_chunked = rearrange(
                     k_chunked, "b (n s) h d -> b n s h d", s=self.chunk_size
-                )                                                              # (B, N, S, h_hsa_kv, d)
+                )
+                # (B, N, S, h_hsa_kv, d)
 
-                mu_q = lmk_q_norm[:, self.chunk_size - 1::self.chunk_size, :, :][:, :full_chunks]  # (B, N, h_q_lmk, d)
+                if not self.shared_q_c:
+                    mu_q = lmk_q_norm[:, self.chunk_size - 1::self.chunk_size, :, :][:, :full_chunks]  # (B, N, h_q_lmk, d)
+                else:
+                    mu_q = self.q_c.unsqueeze(0).unsqueeze(0).expand(B, full_chunks, -1, -1)  # (B, N, h_q, d)
                 h_q_lmk = mu_q.shape[2]
                 # K is passed at native h_kv head count; ``chunk_attn_pool``
                 # infers the GQA group size internally from
@@ -663,9 +680,27 @@ class LandmarkHSA(nn.Module):
                 #   else                -> lmk_k: (B, N, h_q, d)
                 # prior_b is always (B, N, h_q).
                 if self.compact_lmk_k:
-                    lmk_k = lmk_k_source[:, self.chunk_size - 1::self.chunk_size, : ,:]  # (B, L // S, hsa_kv, d)
+                    if self.enable_chunk_pooling:
+                        # chunk-inner mean pooling: (B, num_chunks, h_kv, d)
+                        lmk_k = rearrange(
+                            lmk_k_source, 'B (S C) H D -> B S C H D', C=self.chunk_size
+                        ).mean(dim=2)
+                    else:
+                        lmk_k = lmk_k_source[:, self.chunk_size - 1::self.chunk_size, : ,:]  # (B, L // S, hsa_kv, d)
+                elif self.enable_chunk_pooling:
+                    # Override pool surrogate K with chunk-inner mean K,
+                    # while keeping prior_b from chunk_attn_pool intact.
+                    lmk_k = rearrange(
+                        lmk_k_source, 'B (S C) H D -> B S C H D', C=self.chunk_size
+                    ).mean(dim=2)
             else:
-                lmk_k: Any = lmk_k_source[:, self.chunk_size - 1::self.chunk_size, : ,:]  # (B, L // S, hsa_kv, d)
+                if self.enable_chunk_pooling:
+                    # chunk-inner mean pooling: (B, num_chunks, h_kv, d)
+                    lmk_k = rearrange(
+                        lmk_k_source, 'B (S C) H D -> B S C H D', C=self.chunk_size
+                    ).mean(dim=2)
+                else:
+                    lmk_k: Any = lmk_k_source[:, self.chunk_size - 1::self.chunk_size, : ,:]  # (B, L // S, hsa_kv, d)
 
             hsa_visible_window = self.hsa_visible_window if self.training else -1
             B, S,  H, D = lmk_k.shape
@@ -696,7 +731,6 @@ class LandmarkHSA(nn.Module):
                 is_causal=True,
                 drop_mask=drop_mask,
                 q_offset=q_offset,
-                use_gumbel=self.enable_gumbel_noise and self.training,
                 G=lmk_k.shape[2] // self.h_kv,
                 bias=prior_b
             )

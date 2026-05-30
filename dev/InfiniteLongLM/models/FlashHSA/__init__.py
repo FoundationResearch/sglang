@@ -22,6 +22,18 @@ def register_flash_hsa_modeling(architecture: str):
         return HSAModel
     else:
         return HSAForCausalLM
+
+
+@MODELING_REGISTRY.register('qwen_lhsa_forbench')
+def register_flash_hsa_modeling(architecture: str):
+    from .modeling_qwen_lhsa_forbench import HSAForCausalLM, HSAModel
+
+    if "ForCausalLM" in architecture:
+        return HSAForCausalLM
+    elif "Model" in architecture:
+        return HSAModel
+    else:
+        return HSAForCausalLM
     
 @MODELING_REGISTRY.register('qwen_lhsa_pope')
 def register_flash_hsa_modeling(architecture: str):
@@ -87,6 +99,7 @@ def register_flash_hsa_modeling(architecture: str):
 @MODEL_CONFIG_REGISTRY.register('flash_hsa_innerx_ultra')
 @MODEL_CONFIG_REGISTRY.register('olmo_lhsa')
 @MODEL_CONFIG_REGISTRY.register('qwen_lhsa')
+@MODEL_CONFIG_REGISTRY.register('qwen_lhsa_forbench')
 @MODEL_CONFIG_REGISTRY.register('qwen_lhsa_pope')
 def register_swangpt_config():
     from .configuration_hsa import HSAConfig

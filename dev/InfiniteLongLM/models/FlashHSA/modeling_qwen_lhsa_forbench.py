@@ -1,11 +1,12 @@
 from typing import Any, Callable, Optional, Tuple, Union
 from dataclasses import dataclass, field
 
+from .HoPE import HoPERotaryEmbedding
 import torch
 import math
 from .hsa_forward import hsa_causal_lm_forward, hsa_model_forward
 from torch import nn
-from .lhsa_layer_forbench import LandmarkHSA
+from .lhsa_layer import LandmarkHSA
 from utils.flex_attn import flex_attn
 from transformers.activations import ACT2FN
 from transformers.cache_utils import Cache, DynamicCache, DynamicLayer
@@ -40,7 +41,9 @@ from veomni.utils.import_utils import (
 )
 from veomni.models.module_utils import GradientCheckpointingLayer
 from utils.landmark_utils import insert_special_tokens, create_position_ids_with_landmarks
+from .pope import PoPERotaryEmbWrapper
 from .hsa_forward import hsa_model_forward, hsa_causal_lm_forward
+from ops.flex_attn_tilelang import flex_attn_tl
 
 
 if is_torch_flex_attn_available():
@@ -63,8 +66,19 @@ except ImportError:
 
 logger = logging.get_logger(__name__)
 
-_CHECKPOINT_FOR_DOC = "Qwen/Qwen3-8B"
-_CONFIG_FOR_DOC = "Qwen3Config"
+
+@dataclass
+class GenerateState:
+    active: bool = False
+    decode_token_count: int = 0
+    next_pos: int = 0
+    lmk_positions_in_input: Optional[list] = None
+
+    def reset(self):
+        self.active = False
+        self.decode_token_count = 0
+        self.next_pos = 0
+        self.lmk_positions_in_input = None
 
 
 def rms_norm(hidden_states, weight, variance_epsilon):
@@ -108,7 +122,28 @@ class Qwen3RMSNorm(nn.Module):
 
     def extra_repr(self):
         return f"{tuple(self.weight.shape)}, eps={self.variance_epsilon}"
+    
+class FlashAttnRMSNorm(Qwen3RMSNorm):
+    def forward(self, hidden_states):
+        global rms_norm_fn
+        if rms_norm_fn is None:
+            try:
+                from flash_attn.ops.triton.layer_norm import rms_norm_fn as flash_attn_rms_norm_fn
+            except ImportError as exc:
+                raise ImportError(
+                    "flash_attn.ops.triton.layer_norm.rms_norm_fn is required for Olmo3FlashAttnRMSNorm."
+                ) from exc
+            rms_norm_fn = flash_attn_rms_norm_fn
 
+        hidden_shape = hidden_states.shape
+        hidden_states = hidden_states.reshape(-1, hidden_shape[-1])
+        hidden_states = rms_norm_fn(
+            hidden_states,
+            self.weight,
+            None,
+            eps=self.variance_epsilon,
+        )
+        return hidden_states.reshape(hidden_shape)
 
 class Qwen3FlashAttnRMSNorm(Qwen3RMSNorm):
     def forward(self, hidden_states):
@@ -180,7 +215,7 @@ def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
     sin = sin.unsqueeze(unsqueeze_dim)
     q_embed = (q * cos) + (rotate_half(q) * sin)
     k_embed = (k * cos) + (rotate_half(k) * sin)
-    return q_embed, k_embed
+    return q_embed.to(q_dtype), k_embed.to(k_dtype)
 
 
 def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
@@ -233,8 +268,8 @@ class Qwen3Attention(nn.Module):
         self.scaling = self.head_dim**-0.5
         self.attention_dropout = config.attention_dropout
         self.is_causal = True
-        self.align_chunk_boundary = getattr(config, "align_chunk_boundary", False)
-        if self.align_chunk_boundary:
+        self.mask_lmk_token = getattr(config, "mask_lmk_token", False)
+        if self.mask_lmk_token:
             self.chunk_size = config.chunk_size
 
         self.q_proj = nn.Linear(
@@ -267,8 +302,8 @@ class Qwen3Attention(nn.Module):
         input_shape = hidden_states.shape[:-1]
         hidden_shape = (*input_shape, -1, self.head_dim)
 
-        query_states = self.q_norm(self.q_proj(hidden_states).view(hidden_shape)).transpose(1, 2)
-        key_states = self.k_norm(self.k_proj(hidden_states).view(hidden_shape)).transpose(1, 2)
+        query_states = self.q_norm(self.q_proj(hidden_states).view(hidden_shape)).transpose(1, 2)  # (B, h, L, d)
+        key_states = self.k_norm(self.k_proj(hidden_states).view(hidden_shape)).transpose(1, 2)  # (B, h, L, d)
         value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
 
         cos, sin = position_embeddings
@@ -302,10 +337,9 @@ class Qwen3Attention(nn.Module):
             else:
                 attention_interface = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
 
-        if not self.align_chunk_boundary:
-            # for debug
-            # print(f'layer idx: {self.layer_idx}, apply rope: {self.apply_rope}, sliding window: {self.sliding_window}')
-            kwargs.pop("position_ids", None)
+        kwargs.pop("position_ids", None)
+        kwargs.pop("pope_pos_embeddings", None)
+        if not self.mask_lmk_token:
             attn_output, attn_weights = attention_interface(
                 self,
                 query_states, # (B, h, L, d)
@@ -317,20 +351,23 @@ class Qwen3Attention(nn.Module):
                 sliding_window=self.sliding_window,  # diff with Llama
                 **kwargs,
             )
-
-            attn_output = attn_output.reshape(*input_shape, -1).contiguous()
-            attn_output = self.o_proj(attn_output)
+            # attn_output: (B, L, h, d) — attention_interface already transposes
         else:
-            attn_output, attn_weights = flex_attn(
-                query_states, 
-                key_states, 
-                value_states, 
-                window_size=self.sliding_window,
-                chunk_size=self.chunk_size,
-                training=(past_key_values is None),
+            attn_weights = None
+            attn_output, _ = flex_attn_tl(
+                query_states,
+                key_states,
+                value_states,
+                window_size = self.sliding_window,
+                chunk_size = self.chunk_size,
+                training = self.training,
+                mask_lmk= True,
+                expand_to_chunk = False
             )
-            attn_output = attn_output.transpose(1, 2).reshape(*input_shape, -1).contiguous()
-            attn_output = self.o_proj(attn_output)
+            # flex_attn_tl returns (B, L, h, d) directly
+
+        attn_output = attn_output.reshape(*input_shape, -1).contiguous()
+        attn_output = self.o_proj(attn_output)
         return attn_output, attn_weights
 
 
@@ -402,11 +439,77 @@ class Qwen3RotaryEmbedding(nn.Module):
         self.config = config
         self.rope_init_fn = ROPE_INIT_FUNCTIONS[self.rope_type]
 
+        # ----------------------------------------------------------------
+        # Partial-RoPE: wavelength-based masking (opt-in).
+        #   ``enable_inrange_rope`` (bool): master switch.  When False
+        #       (default) this module behaves EXACTLY like the original
+        #       full-RoPE implementation -- no extra work, no masking.
+        #
+        #   When True, keep only freq-pairs whose period
+        #   ``lambda_j = 2*pi / inv_freq[j]`` fits inside the training
+        #   context window ``L`` -- so every kept freq completes at least
+        #   ``m`` full cycles within ``L`` tokens and the model never sees
+        #   rotary angles it was not trained on.  Cutoff:
+        #       ``inv_freq[j] >= 2*pi*m / L``
+        #   where
+        #       ``L = rope_context_length``   (default max_position_embeddings)
+        #       ``m = rope_period_multiplier`` (default 1.0; 2.0 = "at least
+        #                                       two full cycles in L").
+        #
+        # Because HF's rotary pairs dim ``j`` with dim ``j + head_dim/2`` and
+        # both share ``inv_freq[j]``, zeroing ``inv_freq[j]`` makes BOTH of
+        # those head-dim components position-invariant.
+        # ----------------------------------------------------------------
+        head_dim = getattr(config, "head_dim", None) or (
+            config.hidden_size // config.num_attention_heads
+        )
+        self._rope_head_dim_half = head_dim // 2
+        self.enable_inrange_rope = bool(getattr(config, "enable_inrange_rope", False))
+        self.rope_context_length = int(
+            getattr(config, "rope_context_length", config.max_position_embeddings)
+        )
+        self.rope_period_multiplier = float(
+            getattr(config, "rope_period_multiplier", 1.0)
+        )
+
         inv_freq, self.attention_scaling = self.rope_init_fn(self.config, device)
+        if self.enable_inrange_rope:
+            inv_freq = self._mask_long_period_(inv_freq)
         self.register_buffer("inv_freq", inv_freq, persistent=False)
         self.original_inv_freq = self.inv_freq
         # print(f'self.inv_freq: {self.inv_freq}, {self.inv_freq[None, :, None]}')
         self.reinit = False
+
+    def _mask_long_period_(self, inv_freq: torch.Tensor) -> torch.Tensor:
+        """Zero out freq-pairs whose period exceeds the training window.
+
+        Keeps ``inv_freq[j]`` iff ``2*pi / inv_freq[j] <= L / m``, i.e.
+        ``inv_freq[j] >= 2*pi*m / L`` where ``L = self.rope_context_length``
+        and ``m = self.rope_period_multiplier``.  At least one freq-pair
+        (the very highest) is always kept so the rotary path does not
+        silently degenerate to full NoPE.  Caller is responsible for gating
+        this on ``self.enable_inrange_rope``.
+        """
+        L = self.rope_context_length
+        m = self.rope_period_multiplier
+        # omega >= 2*pi*m / L  <=>  period <= L/m
+        threshold = (2.0 * math.pi * m) / max(L, 1)
+        keep = inv_freq >= threshold                                     # (head_dim//2,)
+        keep[0] = True  # guarantee at least the top freq survives
+        n_keep = int(keep.sum().item())
+        if not hasattr(self, "_inrange_rope_logged"):
+            self._inrange_rope_logged = True
+            longest_kept_period = (
+                2 * math.pi / inv_freq[keep][-1].item() if n_keep > 0 else 0.0
+            )
+            logger.warning_once(
+                f"[inrange-RoPE] head_dim_half={self._rope_head_dim_half}, "
+                f"L={L}, m={m}, threshold(inv_freq)={threshold:.4e} rad/token "
+                f"-> keep {n_keep} / {self._rope_head_dim_half} freq-pairs; "
+                f"longest kept period = {longest_kept_period:.1f} tokens."
+            )
+        inv_freq[~keep] = 0.0
+        return inv_freq
 
 
     @torch.no_grad()
@@ -415,7 +518,10 @@ class Qwen3RotaryEmbedding(nn.Module):
         if not self.reinit:
             self.reinit = True
             inv_freq, self.attention_scaling = self.rope_init_fn(self.config, x.device)
+            if self.enable_inrange_rope:
+                inv_freq = self._mask_long_period_(inv_freq)
             self.register_buffer("inv_freq", inv_freq, persistent=False)
+
         inv_freq_expanded = self.inv_freq[None, :, None].float().expand(position_ids.shape[0], -1, 1).to(x.device)
         position_ids_expanded = position_ids[:, None, :].float()
         # print(f'self.inv_freq: {self.inv_freq[None, :, None]}')
@@ -479,6 +585,13 @@ class Qwen3PreTrainedModel(PreTrainedModel):
                 module.weight.data[module.padding_idx].zero_()
         elif isinstance(module, Qwen3RMSNorm):
             module.weight.data.fill_(1.0)
+        elif isinstance(module, HSAModel):
+            # Standalone landmark embedding (when ``enable_external_lmk_embed``
+            # is on).  It plays the role of one extra row of ``embed_tokens``,
+            # so we initialize it with the same ``Normal(0, std)`` schedule
+            # as every other embedding row.
+            if getattr(module, "lmk_embed", None) is not None:
+                module.lmk_embed.data.normal_(mean=0.0, std=std)
 
 
 QWEN3_INPUTS_DOCSTRING = r"""
@@ -526,7 +639,7 @@ QWEN3_INPUTS_DOCSTRING = r"""
 
             It is a [`~cache_utils.Cache`] instance. For more details, see our [kv cache guide](https://huggingface.co/docs/transformers/en/kv_cache).
 
-            If `past_key_values` are used, the user can optionally input only the last `input_ids` (those that don't
+            If `past_key_valuess` are used, the user can optionally input only the last `input_ids` (those that don't
             have their past key value states given to this model) of shape `(batch_size, 1)` instead of all `input_ids`
             of shape `(batch_size, sequence_length)`.
         inputs_embeds (`torch.FloatTensor` of shape `(batch_size, sequence_length, hidden_size)`, *optional*):
@@ -534,8 +647,8 @@ QWEN3_INPUTS_DOCSTRING = r"""
             is useful if you want more control over how to convert `input_ids` indices into associated vectors than the
             model's internal embedding lookup matrix.
         use_cache (`bool`, *optional*):
-            If set to `True`, `past_key_values` key value states are returned and can be used to speed up decoding (see
-            `past_key_values`).
+            If set to `True`, `past_key_valuess` key value states are returned and can be used to speed up decoding (see
+            `past_key_valuess`).
         output_attentions (`bool`, *optional*):
             Whether or not to return the attentions tensors of all attention layers. See `attentions` under returned
             tensors for more detail.
@@ -573,20 +686,56 @@ class HSAModel(Qwen3PreTrainedModel):
         self.num_swa_layers = getattr(config, "num_swa_layers", 0)
         if self.num_swa_layers > 0 and self.num_swa_layers != config.num_hidden_layers // 2:
             logger.warning_once("Recomment num_swa_layers to be half of num_hidden_layers")
+
+        self.use_pope = getattr(config, "use_pope", False)
+        self.use_hsa_alibi = getattr(config, "use_hsa_alibi", False)
+        self.pope_impl = getattr(config, "pope_impl", "naive") if self.use_pope else None
+        self.enable_intra_chunk_pos = getattr(config, "enable_intra_chunk_pos", False)
+        # LandmarkHSA = LandmarkHSA_pope if self.use_pope else LandmarkHSA_base
+        lmk_cls = None
+        if self.use_pope:
+            assert not self.use_hsa_alibi
+            if self.pope_impl == "naive":
+                from .lhsa_layer_pope_naive import LandmarkHSA as LandmarkHSA_naive
+                lmk_cls = LandmarkHSA_naive
+            elif self.pope_impl == "fused":
+                lmk_cls = LandmarkHSA_pope
+            else:
+                raise ValueError(f"Invalid pope_impl {self.pope_impl}, expected 'naive' or 'fused'.")
+        elif self.use_hsa_alibi:
+            from .lhsa_layer_alibi import LandmarkHSA as LandmarkHSA_alibi
+            lmk_cls = LandmarkHSA_alibi
+        else:
+            from .lhsa_layer_forbench import LandmarkHSA as LandmarkHSA_base
+            lmk_cls = LandmarkHSA_base
+
         def layer_type(layer_idx: int):
             if layer_idx < self.num_swa_layers:
                 return Qwen3Attention
             if self.full_attn_interleave > 0 and ((layer_idx - self.num_swa_layers) % self.full_attn_interleave == self.full_attn_interleave - 1):
-                return partial(LandmarkHSA, norm_cls=Qwen3RMSNorm)
+                return partial(lmk_cls, norm_cls=Qwen3RMSNorm)
             else:
                 return Qwen3Attention
         self.layers = nn.ModuleList(
             [Qwen3DecoderLayer(config, layer_idx, attn_cls=layer_type(layer_idx)) for layer_idx in range(config.num_hidden_layers)]
         )
         self.norm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.rotary_emb = Qwen3RotaryEmbedding(config=config)
+        if not getattr(config, 'use_hope', False):
+            pos_cls = Qwen3RotaryEmbedding
+        else:
+            pos_cls = HoPERotaryEmbedding
+        self.rotary_emb = pos_cls(config=config)
+        
         self.gradient_checkpointing = False
         self.has_sliding_layers = "sliding_attention" in self.config.layer_types
+
+        insert_landmarks = getattr(config, "insert_landmarks", True)
+        enable_external_lmk_embed = getattr(config, "enable_external_lmk_embed", False)
+        self.lmk_id = config.vocab_size if insert_landmarks else None
+        if insert_landmarks and enable_external_lmk_embed:
+            self.lmk_embed = nn.Parameter(torch.zeros(config.hidden_size))
+        else:
+            self.lmk_embed = None
 
         # Initialize weights and apply final processing
         self.post_init()
@@ -597,20 +746,18 @@ class HSAModel(Qwen3PreTrainedModel):
     def set_input_embeddings(self, value):
         self.embed_tokens = value
 
-    @can_return_tuple
-    @add_start_docstrings_to_model_forward(QWEN3_INPUTS_DOCSTRING)
     def forward(
         self,
-        input_ids: Optional[torch.LongTensor] = None,
-        attention_mask: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
-        past_key_values: Optional[Cache] = None,
-        inputs_embeds: Optional[torch.FloatTensor] = None,
-        use_cache: Optional[bool] = None,
-        output_attentions: Optional[bool] = None,
-        output_hidden_states: Optional[bool] = None,
-        cache_position: Optional[torch.LongTensor] = None,
-        **flash_attn_kwargs: Unpack[FlashAttentionKwargs],
+        input_ids=None,
+        attention_mask=None,
+        position_ids=None,
+        past_key_values=None,
+        inputs_embeds=None,
+        use_cache=None,
+        output_attentions=None,
+        output_hidden_states=None,
+        cache_position=None,
+        **flash_attn_kwargs,
     ) -> BaseModelOutputWithPast:
         return hsa_model_forward(
             self,
@@ -626,9 +773,14 @@ class HSAModel(Qwen3PreTrainedModel):
             **flash_attn_kwargs,
         )
 
-
 class KwargsForCausalLM(FlashAttentionKwargs): ...
 
+
+def get_model_vocab_size(config) -> int:
+    enable_external_lmk_embed = getattr(config, "enable_external_lmk_embed", False)
+    if not enable_external_lmk_embed:
+        return next_of_y(config.vocab_size + 1, 32)
+    return config.vocab_size
 
 class HSAForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
     _tied_weights_keys = ["lm_head.weight"]
@@ -637,40 +789,20 @@ class HSAForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
 
     def __init__(self, config, **kwargs):
         auto_insert_lmk = kwargs.pop('auto_insert_lmk', None)
-        # bench 可调 kernel 参数
-        bench_block_M_fwd = kwargs.pop('bench_block_M_fwd', None)
-        bench_block_M_bwd = kwargs.pop('bench_block_M_bwd', None)
-        bench_num_threads_fwd = kwargs.pop('bench_num_threads_fwd', None)
-        bench_num_threads_bwd = kwargs.pop('bench_num_threads_bwd', None)
         super().__init__(config)
         self.model = HSAModel(config)
-        self.vocab_size = next_of_y(config.vocab_size + 1, 32)
+        self.vocab_size = get_model_vocab_size(config)
         self.chunk_size = config.chunk_size
         self.lmk_id = config.vocab_size
         self.lm_head = nn.Linear(config.hidden_size, self.vocab_size, bias=False)
+        self.insert_landmarks = getattr(config, 'insert_landmarks', True)
+        self.adjust_lmk_pos = getattr(config, "adjust_lmk_pos", self.insert_landmarks)
         self.auto_insert_lmk = auto_insert_lmk if auto_insert_lmk is not None else getattr(config, 'auto_insert_lmk', False)
 
         self._gen_state = GenerateState()
 
-        # 将 bench kernel 参数设置到所有 LandmarkHSA 层
-        self.set_hsa_kernel_params(bench_block_M_fwd, bench_block_M_bwd,
-                                   bench_num_threads_fwd, bench_num_threads_bwd)
-
         # Initialize weights and apply final processing
         self.post_init()
-
-    def set_hsa_kernel_params(self, block_M_fwd=None, block_M_bwd=None,
-                              num_threads_fwd=None, num_threads_bwd=None):
-        """将 bench kernel 参数设置到所有 LandmarkHSA 层"""
-        # print(f"[DEBUG set_hsa_kernel_params] block_M_fwd={block_M_fwd}, block_M_bwd={block_M_bwd}, "
-        #       f"num_threads_fwd={num_threads_fwd}, num_threads_bwd={num_threads_bwd}")
-        for layer in self.model.layers:
-            attn = layer.self_attn
-            if isinstance(attn, LandmarkHSA):
-                attn.bench_block_M_fwd = block_M_fwd
-                attn.bench_block_M_bwd = block_M_bwd
-                attn.bench_num_threads_fwd = num_threads_fwd
-                attn.bench_num_threads_bwd = num_threads_bwd
 
     def get_input_embeddings(self):
         return self.model.embed_tokens
@@ -762,55 +894,21 @@ class HSAForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
             "logits_to_keep": logits_to_keep,
         }
 
-    @can_return_tuple
-    @add_start_docstrings_to_model_forward(QWEN3_INPUTS_DOCSTRING)
-    @replace_return_docstrings(output_type=CausalLMOutputWithPast, config_class=_CONFIG_FOR_DOC)
     def forward(
         self,
-        input_ids: Optional[torch.LongTensor] = None,
-        attention_mask: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
-        past_key_values: Optional[Cache] = None,
-        inputs_embeds: Optional[torch.FloatTensor] = None,
-        labels: Optional[torch.LongTensor] = None,
-        use_cache: Optional[bool] = None,
-        output_attentions: Optional[bool] = None,
-        output_hidden_states: Optional[bool] = None,
-        cache_position: Optional[torch.LongTensor] = None,
+        input_ids=None,
+        attention_mask=None,
+        position_ids=None,
+        past_key_values=None,
+        inputs_embeds=None,
+        labels=None,
+        use_cache=None,
+        output_attentions=None,
+        output_hidden_states=None,
+        cache_position=None,
         logits_to_keep: Union[int, torch.Tensor] = 0,
-        **kwargs: Unpack[KwargsForCausalLM],
+        **kwargs,
     ) -> CausalLMOutputWithPast:
-        r"""
-            labels (`torch.LongTensor` of shape `(batch_size, sequence_length)`, *optional*):
-                Labels for computing the masked language modeling loss. Indices should either be in `[0, ...,
-                config.vocab_size]` or -100 (see `input_ids` docstring). Tokens with indices set to `-100` are ignored
-                (masked), the loss is only computed for the tokens with labels in `[0, ..., config.vocab_size]`.
-
-            logits_to_keep (`int` or `torch.Tensor`, *optional*):
-                If an `int`, compute logits for the last `logits_to_keep` tokens. If `0`, calculate logits for all
-                `input_ids` (special case). Only last token logits are needed for generation, and calculating them only for that
-                token can save memory, which becomes pretty significant for long sequences or large vocabulary size.
-                If a `torch.Tensor`, must be 1D corresponding to the indices to keep in the sequence length dimension.
-                This is useful when using packed tensor format (single dimension for batch and sequence length).
-
-        Returns:
-
-        Example:
-
-        ```python
-        >>> from transformers import AutoTokenizer, HSAForCausalLM
-
-        >>> model = HSAForCausalLM.from_pretrained("Qwen/Qwen3-8B")
-        >>> tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen3-8B")
-
-        >>> prompt = "Hey, are you conscious? Can you talk to me?"
-        >>> inputs = tokenizer(prompt, return_tensors="pt")
-
-        >>> # Generate
-        >>> generate_ids = model.generate(inputs.input_ids, max_length=30)
-        >>> tokenizer.batch_decode(generate_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)[0]
-        "Hey, are you conscious? Can you talk to me?\nI'm not conscious, but I can talk to you."
-        ```"""
         return hsa_causal_lm_forward(
             self,
             input_ids,
@@ -824,6 +922,7 @@ class HSAForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
             output_hidden_states,
             cache_position,
             logits_to_keep,
+            **kwargs,
         )
 
 

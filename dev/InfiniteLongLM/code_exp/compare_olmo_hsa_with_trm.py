@@ -275,9 +275,9 @@ def run_beam_decode(model, prompt_ids_cpu, device, dtype, max_new_tokens, num_be
 
 
 @torch.no_grad()
-def run_hsa_batch_consistency(
+def run_batch_generate_consistency(
     model, tokenizer, device, dtype, max_new_tokens=100,
-    short_len=10, long_len=300,
+    short_len=10, long_len=300, tag="",
 ):
     """Mimic OpenCompass HF gen-mode batched inference and compare against
     per-sample bsz=1 generate. Reproduces opencompass huggingface_above_v4_33.py:
@@ -291,7 +291,11 @@ def run_hsa_batch_consistency(
     batches internally via attention_mask.
 
     Two prompts: one short (~short_len tokens), one long (~long_len tokens).
+
+    Tag is a free-form label (e.g. "HSA" or "HF baseline") used in print
+    output so multiple invocations on different models can be distinguished.
     """
+    _t = f" / {tag}" if tag else ""
     # Build two prompts of distinct lengths from the existing default texts.
     base_text = " ".join([DEFAULT_DECODE_PROMPT, DEFAULT_TEXT])
     long_ids = tokenizer(base_text, add_special_tokens=True)["input_ids"]
@@ -303,7 +307,7 @@ def run_hsa_batch_consistency(
     short_text = tokenizer.decode(short_ids, skip_special_tokens=False)
     messages = [short_text, long_text]
     print(
-        f"\n[Batch consistency] prompts: short~{short_len} tok, long~{long_len} tok, "
+        f"\n[Batch consistency{_t}] prompts: short~{short_len} tok, long~{long_len} tok, "
         f"max_new_tokens={max_new_tokens}"
     )
 
@@ -345,7 +349,7 @@ def run_hsa_batch_consistency(
             new_tokens = out[0, tokens["input_ids"].shape[1]:].detach().cpu()
             per_sample_outs.append((tokens["input_ids"].shape[1], new_tokens))
             print(
-                f"[Batch consistency / bsz=1] sample {i}: prompt_len="
+                f"[Batch consistency{_t} / bsz=1] sample {i}: prompt_len="
                 f"{tokens['input_ids'].shape[1]}, gen_len={new_tokens.shape[0]}"
             )
 
@@ -364,7 +368,7 @@ def run_hsa_batch_consistency(
         prompt_len_padded = tokens["input_ids"].shape[1]
         batch_new = batch_out[:, prompt_len_padded:].detach().cpu()
         print(
-            f"[Batch consistency / bsz={len(messages)}] padded_prompt_len="
+            f"[Batch consistency{_t} / bsz={len(messages)}] padded_prompt_len="
             f"{prompt_len_padded}, gen_len={batch_new.shape[1]}"
         )
     finally:
@@ -372,7 +376,7 @@ def run_hsa_batch_consistency(
         tokenizer.truncation_side = saved_truncation_side
 
     # Compare per-sample.
-    print(f"[Batch consistency] bsz=1 vs bsz={len(messages)} comparison:")
+    print(f"[Batch consistency{_t}] bsz=1 vs bsz={len(messages)} comparison:")
     for i, (ref_prompt_len, ref_new) in enumerate(per_sample_outs):
         bsz_new = batch_new[i]
         n = min(ref_new.shape[0], bsz_new.shape[0])
@@ -845,6 +849,14 @@ def main():
         hf_tf_argmax, hf_tf_scores = run_teacher_forced_decode(
             hf_model, decode_prompt, full_ids, device, dtype, tag="HF"
         )
+    if args.run_batch_consistency:
+        run_batch_generate_consistency(
+            hf_model, tokenizer, device, dtype,
+            max_new_tokens=args.batch_max_new_tokens,
+            short_len=args.batch_short_len,
+            long_len=args.batch_long_len,
+            tag="HF baseline",
+        )
     release_model(hf_model)
 
     print("\nLoading custom HSA OLMo modeling...")
@@ -887,11 +899,12 @@ def main():
             hsa_model, decode_prompt, ref_ids, device, dtype, tag="HSA-decode"
         )
     if args.run_batch_consistency:
-        run_hsa_batch_consistency(
+        run_batch_generate_consistency(
             hsa_model, tokenizer, device, dtype,
             max_new_tokens=args.batch_max_new_tokens,
             short_len=args.batch_short_len,
             long_len=args.batch_long_len,
+            tag="HSA",
         )
     release_model(hsa_model)
 

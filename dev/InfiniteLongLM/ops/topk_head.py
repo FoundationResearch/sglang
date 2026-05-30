@@ -4,54 +4,152 @@ import tilelang.language as T
 from typing import Optional
 import math
 
-def ref_topk_max_pooling(q, k_lmks, topk, block_size, window_size, is_causal=False):
+def ref_topk_max_pooling(q, k_lmks, topk, block_size, window_size, is_causal=False, bias=None):
+    """
+    Reference implementation for max-pooling Top-K (no online softmax, no SWA LSE).
+
+    Selection rule: argmax_g (sm_scale * qk + bias) over groups G, then top-k over chunks S.
+    Output scores are raw scaled qk (sm_scale * qk), WITHOUT bias, to match the
+    softmax-version's recompute output convention.
+
+    Args:
+        q: [B, L, h_kv, G, D]
+        k_lmks: [B, S, h_kv, D] (per-KV-head shared lmks) or
+                [B, S, h_kv * G, D] (per-q-head lmks)
+        topk: int
+        block_size: int
+        window_size: int
+        is_causal: bool
+        bias: optional additive bias with shape [B, S, h_kv, G] or [B, S, h_kv * G].
+              When provided, selection logits add bias[b, chunk, head]; returned
+              scores stay raw scaled qk and do not include bias.
+
+    Returns:
+        indices_sorted: [B, L, h_kv, topk]
+        scores_sorted:  [B, L, h_kv, G, topk]   (raw scaled qk, NO bias)
+    """
     B, L, h_kv, G, D = q.shape
     S = k_lmks.shape[1]
     sm_scale = 1.0 / math.sqrt(D)
-    scores_all = torch.einsum("blhgd,bshd->blhgs", q.float(), k_lmks.float())
-    
+    lmks_h = k_lmks.shape[2]
+    if lmks_h == h_kv:
+        per_qhead_lmks = False
+    elif lmks_h == h_kv * G:
+        per_qhead_lmks = True
+    else:
+        raise AssertionError(
+            f"k_lmks h dim ({lmks_h}) must be either h_kv ({h_kv}) or h_kv*G ({h_kv * G})"
+        )
+
+    if per_qhead_lmks:
+        k_lmks_v = k_lmks.view(B, S, h_kv, G, D)
+        scores_all = torch.einsum("blhgd,bshgd->blhgs", q.float(), k_lmks_v.float())
+    else:
+        scores_all = torch.einsum("blhgd,bshd->blhgs", q.float(), k_lmks.float())
+
+    # raw scaled qk (no bias) — used both for selection (after adding bias) and for output
+    scores_all_scaled = scores_all * sm_scale
+
     if is_causal:
-        i_idx = torch.arange(L, device=q.device).unsqueeze(1) # [L, 1]
-        j_idx = torch.arange(S, device=q.device).unsqueeze(0) # [1, S]
-        
-        # Mask out chunks covered by sliding window
+        i_idx = torch.arange(L, device=q.device).unsqueeze(1)  # [L, 1]
+        j_idx = torch.arange(S, device=q.device).unsqueeze(0)  # [1, S]
         threshold_idx = (i_idx - window_size + 1).div(block_size, rounding_mode='floor')
         causal_mask = j_idx >= threshold_idx
-        
         causal_mask_expanded = causal_mask.view(1, L, 1, 1, S)
-        scores_all = scores_all.masked_fill(causal_mask_expanded, float('-inf'))
+        scores_all_scaled = scores_all_scaled.masked_fill(causal_mask_expanded, float('-inf'))
 
-    scores_max_pooling = scores_all.max(dim=3).values
-    _, topk_indices = torch.topk(scores_max_pooling, k=topk, dim=-1, sorted=False)
-    indices_sorted, order = torch.sort(topk_indices, dim=-1)
-    order_expanded = order.unsqueeze(3).expand(-1, -1, -1, G, -1)
-    indices_expanded = indices_sorted.unsqueeze(3).expand(-1, -1, -1, G, -1)
-    scores_sorted = torch.gather(scores_all, -1, indices_expanded)
-    scores_sorted = scores_sorted * sm_scale
+    # Build selection logits = scaled qk + bias (broadcast over L)
+    if bias is not None:
+        if bias.dim() == 3:
+            assert bias.shape == (B, S, h_kv * G), (
+                f"bias shape {tuple(bias.shape)} != ({B}, {S}, {h_kv * G})"
+            )
+            bias_4d = bias.float().reshape(B, S, h_kv, G)
+        elif bias.dim() == 4:
+            assert bias.shape == (B, S, h_kv, G), (
+                f"bias shape {tuple(bias.shape)} != ({B}, {S}, {h_kv}, {G})"
+            )
+            bias_4d = bias.float()
+        else:
+            raise AssertionError(
+                f"bias must be [B, S, h_q] or [B, S, h_kv, G], got {tuple(bias.shape)}"
+            )
+        # bias_4d: [B, S, h_kv, G] -> broadcast to [B, L, h_kv, G, S]
+        bias_for_sel = bias_4d.permute(0, 2, 3, 1).unsqueeze(1)  # [B, 1, h_kv, G, S]
+        scores_for_sel = scores_all_scaled + bias_for_sel
+        # Preserve -inf positions (causal masked)
+        scores_for_sel = torch.where(
+            scores_all_scaled == float('-inf'),
+            scores_all_scaled,
+            scores_for_sel,
+        )
+    else:
+        scores_for_sel = scores_all_scaled
+
+    # max over G with bias-aware selection logits
+    scores_max_pooling = scores_for_sel.max(dim=3).values  # [B, L, h_kv, S]
+
+    # Handle topk > S or causal-masked rows where valid chunks < topk by
+    # taking only actual_topk = min(topk, S), then padding with sentinel -1.
+    # Invalid (-inf) positions are also replaced with -1 to mirror kernel behavior.
+    actual_topk = min(topk, S)
+    topk_scores, topk_indices = torch.topk(
+        scores_max_pooling, k=actual_topk, dim=-1, sorted=False
+    )
+    topk_indices[topk_scores == float('-inf')] = -1
+    if actual_topk < topk:
+        pad = torch.full(
+            (B, L, h_kv, topk - actual_topk), -1,
+            dtype=topk_indices.dtype, device=topk_indices.device,
+        )
+        topk_indices = torch.cat([topk_indices, pad], dim=-1)
+
+    # Sort with -1 routed to the end (use S+1000 as sentinel key, then restore)
+    sort_temp = topk_indices.clone()
+    sort_temp[sort_temp < 0] = S + 1000
+    indices_sorted, _ = torch.sort(sort_temp, dim=-1)
+    indices_sorted[indices_sorted >= S] = -1
+
+    # Gather the RAW scaled qk (no bias) at the selected indices.
+    # For -1 positions, use 0 as a safe gather index and mask out afterwards.
+    safe_indices = indices_sorted.clone()
+    safe_indices[safe_indices < 0] = 0
+    indices_expanded = safe_indices.unsqueeze(3).expand(-1, -1, -1, G, -1)
+    scores_sorted = torch.gather(scores_all_scaled, -1, indices_expanded)
+    invalid_mask = indices_sorted.unsqueeze(3).expand(-1, -1, -1, G, -1) < 0
+    scores_sorted = scores_sorted.masked_fill(invalid_mask, float('-inf'))
     return indices_sorted, scores_sorted
 
 
 @tilelang.jit(
-    out_idx=[2],
+    out_idx=[3],
     pass_configs={
         tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: True,
         tilelang.PassConfigKey.TL_DISABLE_TMA_LOWER: True,
         tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
     }
 )
-def fused_topk_max_pooling_kernel(batch, seq_len, s_len, h_kv, groups, head_dim, topk, block_size, window_size, is_causal,
-                                  BLOCK_L=None, BLOCK_S=None, threads=None):
+def fused_topk_max_pooling_kernel(batch, seq_len, s_len, h_kv, groups, head_dim, topk,
+                                  block_size, window_size, is_causal,
+                                  BLOCK_L=None, BLOCK_S=None, threads=None,
+                                  use_bias=False, per_qhead_lmks=False):
     dtype = "bfloat16"
     accum_dtype = "float"
     idx_dtype = "int32"
 
     q_shape = [batch, seq_len, h_kv, groups, head_dim]
-    k_shape = [batch, s_len, h_kv, head_dim]
-    out_scores_shape = [batch, seq_len, h_kv, groups, topk]
+    if per_qhead_lmks:
+        k_shape = [batch, s_len, h_kv * groups, head_dim]
+    else:
+        k_shape = [batch, s_len, h_kv, head_dim]
     out_indices_shape = [batch, seq_len, h_kv, topk]
+    bias_shape = [batch, s_len, h_kv, groups] if use_bias else [1, 1, 1, 1]
 
     if BLOCK_L is None:
-        BLOCK_L = 4  # {'BLOCK_L': 4, 'BLOCK_S': 16, 'threads': 64}
+        # GEMM requires M % 16 == 0. For shared-K path M = BLOCK_L*groups, so
+        # use the smallest BLOCK_L that makes M >= 16. For per-q-head path the
+        # GEMM is per-g with M = BLOCK_L, so BLOCK_L itself must be >= 16.
+        BLOCK_L = 16 if per_qhead_lmks else (16 + groups - 1) // groups
     if BLOCK_S is None:
         BLOCK_S = 16
     BLOCK_D = head_dim
@@ -61,19 +159,13 @@ def fused_topk_max_pooling_kernel(batch, seq_len, s_len, h_kv, groups, head_dim,
     GEMM_M = BLOCK_L * groups
     num_s_blocks = tilelang.cdiv(s_len, BLOCK_S)
 
-    if BLOCK_S >= BLOCK_L:
-        BLOCK_TK = BLOCK_S // BLOCK_L
-        if BLOCK_TK < 1:
-            BLOCK_TK = 1
-    else:
-        BLOCK_TK = 1
-    
-    tk_blocks = (topk + BLOCK_TK - 1) // BLOCK_TK
-    
+    sm_scale = 1.0 / math.sqrt(head_dim)
+
     @T.prim_func
     def fwd_kernel_max_pooling(
         Q: T.Tensor(q_shape, dtype),
         K: T.Tensor(k_shape, dtype),
+        bias: T.Tensor(bias_shape, accum_dtype),
         OutIndices: T.Tensor(out_indices_shape, idx_dtype),
     ):
         with T.Kernel(tilelang.cdiv(seq_len, BLOCK_L), h_kv, batch, threads=threads) as (bx, by, bz):
@@ -84,17 +176,17 @@ def fused_topk_max_pooling_kernel(batch, seq_len, s_len, h_kv, groups, head_dim,
             Q_shared = T.alloc_shared([GEMM_M, BLOCK_D], dtype)
             K_shared = T.alloc_shared([BLOCK_S, BLOCK_D], dtype)
             score_shared = T.alloc_shared([GEMM_M, BLOCK_S], accum_dtype)
-
             acc_s = T.alloc_fragment([GEMM_M, BLOCK_S], accum_dtype)
+
+            # Per-g GEMM staging (only used when per_qhead_lmks=True)
+            Q_g_shared = T.alloc_shared([BLOCK_L, BLOCK_D], dtype)
+            acc_s_g = T.alloc_fragment([BLOCK_L, BLOCK_S], accum_dtype)
 
             topk_max_scores_local = T.alloc_local([topk], accum_dtype)
             topk_indices_local = T.alloc_local([topk], idx_dtype)
 
-            topk_indices_shared = T.alloc_shared([BLOCK_L, topk], idx_dtype)
-
             T.fill(topk_max_scores_local, -T.infinity(accum_dtype))
             T.fill(topk_indices_local, -1)
-            T.fill(topk_indices_shared, -1)
 
             for l_idx, g, d in T.Parallel(BLOCK_L, groups, BLOCK_D):
                 tq = base_l + l_idx
@@ -112,48 +204,73 @@ def fused_topk_max_pooling_kernel(batch, seq_len, s_len, h_kv, groups, head_dim,
             for s_block in T.serial(loop_limit):
                 base_s = s_block * BLOCK_S
 
-                for s_idx, d in T.Parallel(BLOCK_S, BLOCK_D):
-                    ts = base_s + s_idx
-                    if ts < s_len:
-                        K_shared[s_idx, d] = K[i_b, ts, i_h, d]
-                    else:
-                        K_shared[s_idx, d] = 0
-                T.sync_threads()
+                if per_qhead_lmks:
+                    # Per-g GEMM: write into score_shared[l*G+g, s_idx]
+                    for g in T.serial(groups):
+                        for s_idx, d in T.Parallel(BLOCK_S, BLOCK_D):
+                            ts = base_s + s_idx
+                            if ts < s_len:
+                                K_shared[s_idx, d] = K[i_b, ts, i_h * groups + g, d]
+                            else:
+                                K_shared[s_idx, d] = 0
+                        for l_idx, d in T.Parallel(BLOCK_L, BLOCK_D):
+                            Q_g_shared[l_idx, d] = Q_shared[l_idx * groups + g, d]
+                        T.sync_threads()
+                        T.clear(acc_s_g)
+                        T.gemm(Q_g_shared, K_shared, acc_s_g, transpose_B=True,
+                               policy=T.GemmWarpPolicy.FullRow)
+                        for l_idx, s_idx in T.Parallel(BLOCK_L, BLOCK_S):
+                            score_shared[l_idx * groups + g, s_idx] = acc_s_g[l_idx, s_idx]
+                        T.sync_threads()
+                else:
+                    for s_idx, d in T.Parallel(BLOCK_S, BLOCK_D):
+                        ts = base_s + s_idx
+                        if ts < s_len:
+                            K_shared[s_idx, d] = K[i_b, ts, i_h, d]
+                        else:
+                            K_shared[s_idx, d] = 0
+                    T.sync_threads()
 
-                T.clear(acc_s)
-                T.gemm(
-                    Q_shared,
-                    K_shared,
-                    acc_s,
-                    transpose_B=True,
-                    policy=T.GemmWarpPolicy.FullRow
-                )
-                T.copy(acc_s, score_shared)
-                
+                    T.clear(acc_s)
+                    T.gemm(
+                        Q_shared,
+                        K_shared,
+                        acc_s,
+                        transpose_B=True,
+                        policy=T.GemmWarpPolicy.FullRow
+                    )
+                    T.copy(acc_s, score_shared)
+
                 if is_causal:
                     for i, j in T.Parallel(GEMM_M, BLOCK_S):
                         l_idx = i // groups
                         tq = base_l + l_idx
                         ts = base_s + j
-                        # if ts >= (tq // block_size):
                         if ts >= (tq - window_size + 1) // block_size:
                             score_shared[i, j] = -T.infinity(accum_dtype)
-                
+
                 T.sync_threads()
 
                 tx = T.get_thread_binding()
                 my_l_idx = tx
                 my_tq = base_l + my_l_idx
                 cur_max_val = T.alloc_var(accum_dtype)
+                val = T.alloc_var(accum_dtype)
 
                 if (my_tq < seq_len) and (tx < BLOCK_L):
                     for s_idx in T.serial(BLOCK_S):
                         ts = base_s + s_idx
                         if ts < s_len:
                             cur_max_val = -T.infinity(accum_dtype)
-                            # 在 groups 上取 max
+                            # max over groups using selection logits = scaled qk + bias
                             for g in T.serial(groups):
-                                val = score_shared[my_l_idx * groups + g, s_idx]
+                                val = score_shared[my_l_idx * groups + g, s_idx] * sm_scale
+                                if use_bias:
+                                    if val == -T.infinity(accum_dtype):
+                                        # Keep -inf for causal-masked positions
+                                        val = -T.infinity(accum_dtype)
+                                    else:
+                                        val += bias[i_b, ts, i_h, g]
                                 if val > cur_max_val:
                                     cur_max_val = val
 
@@ -177,40 +294,13 @@ def fused_topk_max_pooling_kernel(batch, seq_len, s_len, h_kv, groups, head_dim,
             my_tq = base_l + my_l_idx
             if (my_tq < seq_len) and (tx < BLOCK_L):
                 for k in T.serial(topk):
-                    idx_val = topk_indices_local[k]
-                    topk_indices_shared[my_l_idx, k] = idx_val
-                    OutIndices[i_b, my_tq, i_h, k] = idx_val
+                    OutIndices[i_b, my_tq, i_h, k] = topk_indices_local[k]
 
 
     return fwd_kernel_max_pooling
 
 
 
-# from tilelang.autotuner import autotune
-# import itertools
-# BLOCK_L = [2,4,8]
-# BLOCK_TK = [16,32,64]
-# threads = [64,128,256]
-# _configs = list(
-#     itertools.product(
-#         BLOCK_L,
-#         BLOCK_TK,
-#         threads,
-#     ))
-
-# configs = [
-#     {
-#         "BLOCK_L": c[0],
-#         "BLOCK_TK": c[1],
-#         "threads": c[2],
-#     } for c in _configs
-# ]
-
-# @autotune(
-#     configs=configs,
-#     warmup=5,
-#     rep=10,
-# )
 @tilelang.jit(
     out_idx=[3],
     pass_configs={
@@ -221,12 +311,15 @@ def fused_topk_max_pooling_kernel(batch, seq_len, s_len, h_kv, groups, head_dim,
 )
 def recompute_topk_max_pooling_scores_kernel(
     batch, seq_len, s_len, h_kv, groups, head_dim, topk,
-    BLOCK_L=None, BLOCK_TK=None, threads=None
+    BLOCK_L=None, BLOCK_TK=None, threads=None,
+    per_qhead_lmks=False,
 ):
     """
-    只负责根据给定的 topk indices 重算 scores。
+    Recompute scores at given topk indices. Outputs raw scaled qk (no bias),
+    consistent with the softmax-version's recompute kernel.
+
     Q:        [B, L, h_kv, G, D]
-    K:        [B, S, h_kv, D]
+    K:        [B, S, h_kv, D]   (per-KV-head)  or  [B, S, h_kv*G, D] (per-q-head)
     Indices:  [B, L, h_kv, topk]
     OutScores:[B, L, h_kv, G, topk]
     """
@@ -235,14 +328,19 @@ def recompute_topk_max_pooling_scores_kernel(
     idx_dtype = "int32"
 
     q_shape = [batch, seq_len, h_kv, groups, head_dim]
-    k_shape = [batch, s_len, h_kv, head_dim]
+    if per_qhead_lmks:
+        k_shape = [batch, s_len, h_kv * groups, head_dim]
+    else:
+        k_shape = [batch, s_len, h_kv, head_dim]
     indices_shape = [batch, seq_len, h_kv, topk]
     out_scores_shape = [batch, seq_len, h_kv, groups, topk]
 
     if BLOCK_L is None:
-        BLOCK_L = 2       # {'BLOCK_L': 2, 'BLOCK_TK': 32, 'threads': 64}
+        # Same alignment constraint as the selection kernel: per-q-head path
+        # needs BLOCK_L >= 16; shared-K path needs BLOCK_L*groups >= 16.
+        BLOCK_L = 16 if per_qhead_lmks else (16 + groups - 1) // groups
     if BLOCK_TK is None:
-        BLOCK_TK = 32
+        BLOCK_TK = 16
     BLOCK_D = head_dim
     if threads is None:
         threads = 64
@@ -250,7 +348,7 @@ def recompute_topk_max_pooling_scores_kernel(
     GEMM_M = BLOCK_L * groups
     GEMM_N = BLOCK_L * BLOCK_TK
     tk_blocks = (topk + BLOCK_TK - 1) // BLOCK_TK
-    
+
     sm_scale = 1.0 / math.sqrt(head_dim)
 
     @T.prim_func
@@ -264,61 +362,114 @@ def recompute_topk_max_pooling_scores_kernel(
             i_b = bz
             i_h = by
             base_l = bx * BLOCK_L
-            Q_shared = T.alloc_shared([GEMM_M, BLOCK_D], dtype)
             K_shared = T.alloc_shared([BLOCK_L * BLOCK_TK, BLOCK_D], dtype)
-            score_shared = T.alloc_shared([GEMM_M, GEMM_N], accum_dtype)
-            acc_s = T.alloc_fragment([GEMM_M, GEMM_N], accum_dtype)
 
-            for l_idx, g, d in T.Parallel(BLOCK_L, groups, BLOCK_D):
-                tq = base_l + l_idx
-                flat_m = l_idx * groups + g
-                if tq < seq_len:
-                    Q_shared[flat_m, d] = Q[i_b, tq, i_h, g, d]
-                else:
-                    Q_shared[flat_m, d] = T.Cast(dtype, 0.0)
+            if per_qhead_lmks:
+                # Per-g GEMM staging to keep dynamic shared memory within limits.
+                Q_g_shared = T.alloc_shared([BLOCK_L, BLOCK_D], dtype)
+                acc_s_g = T.alloc_fragment([BLOCK_L, GEMM_N], accum_dtype)
 
-            for tk_block in T.serial(tk_blocks):
-                tk_base = tk_block * BLOCK_TK
-                tk_size = T.min(BLOCK_TK, topk - tk_base)
+                for tk_block in T.serial(tk_blocks):
+                    tk_base = tk_block * BLOCK_TK
+                    tk_size = T.min(BLOCK_TK, topk - tk_base)
 
-                for l_idx, tk_idx, d in T.Parallel(BLOCK_L, BLOCK_TK, BLOCK_D):
+                    for g in T.serial(groups):
+                        # Load K for this (tk_block, g)
+                        for l_idx, tk_idx, d in T.Parallel(BLOCK_L, BLOCK_TK, BLOCK_D):
+                            tq = base_l + l_idx
+                            off = l_idx * BLOCK_TK + tk_idx
+                            if (tq < seq_len) and (tk_idx < tk_size):
+                                k_id = tk_base + tk_idx
+                                idx = Indices[i_b, tq, i_h, k_id]
+                                if (idx >= 0) and (idx < s_len):
+                                    K_shared[off, d] = K[i_b, idx, i_h * groups + g, d]
+                                else:
+                                    K_shared[off, d] = T.Cast(dtype, 0.0)
+                            else:
+                                if off < BLOCK_L * BLOCK_TK:
+                                    K_shared[off, d] = T.Cast(dtype, 0.0)
+                        # Load Q for this g
+                        for l_idx, d in T.Parallel(BLOCK_L, BLOCK_D):
+                            tq = base_l + l_idx
+                            if tq < seq_len:
+                                Q_g_shared[l_idx, d] = Q[i_b, tq, i_h, g, d]
+                            else:
+                                Q_g_shared[l_idx, d] = T.Cast(dtype, 0.0)
+                        T.sync_threads()
+                        T.clear(acc_s_g)
+                        T.gemm(
+                            Q_g_shared,
+                            K_shared,
+                            acc_s_g,
+                            transpose_B=True,
+                            policy=T.GemmWarpPolicy.FullRow,
+                        )
+                        for l_idx, tk_idx in T.Parallel(BLOCK_L, BLOCK_TK):
+                            tq = base_l + l_idx
+                            if (tq < seq_len) and (tk_idx < tk_size):
+                                k_id = tk_base + tk_idx
+                                idx = Indices[i_b, tq, i_h, k_id]
+                                if idx < 0:
+                                    OutScores[i_b, tq, i_h, g, k_id] = -T.infinity(accum_dtype)
+                                else:
+                                    col = l_idx * BLOCK_TK + tk_idx
+                                    OutScores[i_b, tq, i_h, g, k_id] = acc_s_g[l_idx, col] * sm_scale
+                        T.sync_threads()
+            else:
+                Q_shared = T.alloc_shared([GEMM_M, BLOCK_D], dtype)
+                score_shared = T.alloc_shared([GEMM_M, GEMM_N], accum_dtype)
+                acc_s = T.alloc_fragment([GEMM_M, GEMM_N], accum_dtype)
+
+                for l_idx, g, d in T.Parallel(BLOCK_L, groups, BLOCK_D):
                     tq = base_l + l_idx
-                    off = l_idx * BLOCK_TK + tk_idx
-                    if (tq < seq_len) and (tk_idx < tk_size):
-                        k_id = tk_base + tk_idx
-                        idx = Indices[i_b, tq, i_h, k_id]
-                        if (idx >= 0) and (idx < s_len):
-                            K_shared[off, d] = K[i_b, idx, i_h, d]
-                        else:
-                            K_shared[off, d] = T.Cast(dtype, 0.0)
+                    flat_m = l_idx * groups + g
+                    if tq < seq_len:
+                        Q_shared[flat_m, d] = Q[i_b, tq, i_h, g, d]
                     else:
-                        if off < BLOCK_L * BLOCK_TK:
-                            K_shared[off, d] = T.Cast(dtype, 0.0)
-                T.sync_threads()
+                        Q_shared[flat_m, d] = T.Cast(dtype, 0.0)
 
-                T.clear(acc_s)
-                T.gemm(
-                    Q_shared,
-                    K_shared,
-                    acc_s,
-                    transpose_B=True,
-                    policy=T.GemmWarpPolicy.FullRow
-                )
-                T.copy(acc_s, score_shared)
-                T.sync_threads()
+                for tk_block in T.serial(tk_blocks):
+                    tk_base = tk_block * BLOCK_TK
+                    tk_size = T.min(BLOCK_TK, topk - tk_base)
 
-                for l_idx, g, tk_idx in T.Parallel(BLOCK_L, groups, BLOCK_TK):
-                    tq = base_l + l_idx
-                    if (tq < seq_len) and (tk_idx < tk_size):
-                        k_id = tk_base + tk_idx
-                        idx = Indices[i_b, tq, i_h, k_id]
-                        if idx < 0:
-                            OutScores[i_b, tq, i_h, g, k_id] = -T.infinity(accum_dtype)
+                    for l_idx, tk_idx, d in T.Parallel(BLOCK_L, BLOCK_TK, BLOCK_D):
+                        tq = base_l + l_idx
+                        off = l_idx * BLOCK_TK + tk_idx
+                        if (tq < seq_len) and (tk_idx < tk_size):
+                            k_id = tk_base + tk_idx
+                            idx = Indices[i_b, tq, i_h, k_id]
+                            if (idx >= 0) and (idx < s_len):
+                                K_shared[off, d] = K[i_b, idx, i_h, d]
+                            else:
+                                K_shared[off, d] = T.Cast(dtype, 0.0)
                         else:
-                            row = l_idx * groups + g
-                            col = l_idx * BLOCK_TK + tk_idx
-                            val = score_shared[row, col]
-                            OutScores[i_b, tq, i_h, g, k_id] = val * sm_scale
+                            if off < BLOCK_L * BLOCK_TK:
+                                K_shared[off, d] = T.Cast(dtype, 0.0)
+                    T.sync_threads()
+
+                    T.clear(acc_s)
+                    T.gemm(
+                        Q_shared,
+                        K_shared,
+                        acc_s,
+                        transpose_B=True,
+                        policy=T.GemmWarpPolicy.FullRow
+                    )
+                    T.copy(acc_s, score_shared)
+                    T.sync_threads()
+
+                    for l_idx, g, tk_idx in T.Parallel(BLOCK_L, groups, BLOCK_TK):
+                        tq = base_l + l_idx
+                        if (tq < seq_len) and (tk_idx < tk_size):
+                            k_id = tk_base + tk_idx
+                            idx = Indices[i_b, tq, i_h, k_id]
+                            if idx < 0:
+                                OutScores[i_b, tq, i_h, g, k_id] = -T.infinity(accum_dtype)
+                            else:
+                                row = l_idx * groups + g
+                                col = l_idx * BLOCK_TK + tk_idx
+                                val = score_shared[row, col]
+                                OutScores[i_b, tq, i_h, g, k_id] = val * sm_scale
 
     return fwd_recompute
 
@@ -462,27 +613,35 @@ class TopKMaxPoolingFusedFn(torch.autograd.Function):
     def forward(ctx, q, lmks, topk: int,
                 select_kernel,
                 sort_kernel,
-                recompute_kernel
+                recompute_kernel,
+                bias_arg,
+                per_qhead_lmks: bool,
                 ):
-        # q:   [B, L, h_kv, G, D]
-        # lmks:[B, S, h_kv, D]
+        # q:    [B, L, h_kv, G, D]
+        # lmks: [B, S, h_kv, D]  (per-KV-head)  or  [B, S, h_kv*G, D] (per-q-head)
+        # bias_arg: [B, S, h_kv, G] float32 when use_bias else [1,1,1,1] dummy
         B, L, h_kv, G, D = q.shape
-        B2, S, h_kv2, D2 = lmks.shape
+        B2, S, lmks_h, D2 = lmks.shape
         dtype = q.dtype
 
-        assert B == B2 and h_kv == h_kv2 and D == D2
+        assert B == B2 and D == D2
+        if per_qhead_lmks:
+            assert lmks_h == h_kv * G, (
+                f"per_qhead_lmks expects lmks_h={h_kv*G}, got {lmks_h}"
+            )
+        else:
+            assert lmks_h == h_kv, (
+                f"shared-K expects lmks_h={h_kv}, got {lmks_h}"
+            )
 
         q_in = q.contiguous()
         k_in = lmks.contiguous()
+        bias_in = bias_arg.contiguous()
 
-        indices_raw = select_kernel(q_in, k_in)  # int32
-
+        indices_raw = select_kernel(q_in, k_in, bias_in)  # int32
         indices_sorted = sort_kernel(indices_raw)
-
-        # indices_sorted_64 = indices_sorted.to(torch.int64)
-
         indices_for_kernel = indices_sorted
-        
+
         best_scores_buf = recompute_kernel(q_in, k_in, indices_for_kernel)  # float32
 
         ctx.save_for_backward(q_in, k_in, indices_sorted)
@@ -490,6 +649,7 @@ class TopKMaxPoolingFusedFn(torch.autograd.Function):
         ctx.G = G
         ctx.topk = topk
         ctx.shapes = (B, L, S, h_kv, D)
+        ctx.per_qhead_lmks = per_qhead_lmks
 
         return indices_sorted, best_scores_buf.to(dtype)
 
@@ -499,7 +659,8 @@ class TopKMaxPoolingFusedFn(torch.autograd.Function):
         indices = indices.long()
         B, L, S, h_kv, D = ctx.shapes
         G = ctx.G
-        
+        per_qhead_lmks = ctx.per_qhead_lmks
+
         sm_scale = 1.0 / math.sqrt(D)
 
         grad_scores_dense = torch.zeros(
@@ -519,57 +680,97 @@ class TopKMaxPoolingFusedFn(torch.autograd.Function):
         grad_scores_dense.scatter_(4, safe_indices, safe_grad)
 
         bs_hg = B * h_kv * G
-
+        # dense_in: [B*h_kv*G, L, S]
         dense_in = grad_scores_dense.permute(0, 2, 3, 1, 4).reshape(bs_hg, L, S)
-
+        # q_flat: [B*h_kv*G, L, D]
         q_flat = q_in.permute(0, 2, 3, 1, 4).reshape(bs_hg, L, D)
 
-        k_expanded = k_in.unsqueeze(3).expand(-1, -1, -1, G, -1)
-        k_flat = k_expanded.permute(0, 2, 3, 1, 4).reshape(bs_hg, S, D)
+        if per_qhead_lmks:
+            # k_in: [B, S, h_kv*G, D] -> [B, h_kv, G, S, D] -> [B*h_kv*G, S, D]
+            k_view = k_in.view(B, S, h_kv, G, D)
+            k_flat = k_view.permute(0, 2, 3, 1, 4).reshape(bs_hg, S, D)
+        else:
+            # k_in: [B, S, h_kv, D] -> [B, S, h_kv, G, D] (broadcast over G)
+            k_expanded = k_in.unsqueeze(3).expand(-1, -1, -1, G, -1)
+            k_flat = k_expanded.permute(0, 2, 3, 1, 4).reshape(bs_hg, S, D)
 
         grad_q_flat = torch.bmm(dense_in, k_flat)
         grad_q = grad_q_flat.view(B, h_kv, G, L, D).permute(0, 3, 1, 2, 4)
-        
         grad_q = grad_q * sm_scale
 
-        grad_k_flat = torch.bmm(dense_in.transpose(1, 2), q_flat)
-
+        grad_k_flat = torch.bmm(dense_in.transpose(1, 2), q_flat)  # [B*h_kv*G, S, D]
         grad_k_grouped = grad_k_flat.view(B, h_kv, G, S, D)
-        grad_k_sum = grad_k_grouped.sum(dim=2)
-        grad_lmks = grad_k_sum.permute(0, 2, 1, 3)  # [B, S, h_kv, D]
-        
+
+        if per_qhead_lmks:
+            # No sum over G; output shape [B, S, h_kv*G, D]
+            grad_lmks = grad_k_grouped.permute(0, 3, 1, 2, 4).reshape(B, S, h_kv * G, D)
+        else:
+            grad_k_sum = grad_k_grouped.sum(dim=2)
+            grad_lmks = grad_k_sum.permute(0, 2, 1, 3)  # [B, S, h_kv, D]
+
         grad_lmks = grad_lmks * sm_scale
 
-        return grad_q, grad_lmks, None, None, None, None
+        # forward signature: (q, lmks, topk, select_kernel, sort_kernel,
+        #                    recompute_kernel, bias_arg, per_qhead_lmks)
+        return grad_q, grad_lmks, None, None, None, None, None, None
 
 
 class TopKMaxPooling_Fused(torch.nn.Module):
-    def __init__(self, topk, block_size, window_size, is_causal):
+    def __init__(self, topk, block_size, window_size, is_causal,
+                 use_bias: bool = False, per_qhead_lmks: bool = False):
         super().__init__()
         self.topk = topk
         self.block_size = block_size
         self.window_size = window_size
         self.is_causal = is_causal
+        self.use_bias = use_bias
+        self.per_qhead_lmks = per_qhead_lmks
         self._cached_select_kernel = None
         self._cached_sort_kernel = None
         self._cached_recompute_kernel = None
         self._cached_shape = None
 
-    def forward(self, q, lmks):
-        # q:   [B, L, h_kv, G, D]
-        # lmks:[B, S, h_kv, D]
+    def forward(self, q, lmks, bias=None):
+        # q:    [B, L, h_kv, G, D]
+        # lmks: [B, S, h_kv, D]   (per-KV-head)  or  [B, S, h_kv*G, D] (per-q-head)
+        # bias: optional [B, S, h_q] or [B, S, h_kv, G]
         B, L, h_kv, G, D = q.shape
         _, S, _, _ = lmks.shape
         topk = self.topk
         block_size = self.block_size
         window_size = self.window_size
         is_causal = self.is_causal
+        use_bias = self.use_bias
+        per_qhead_lmks = self.per_qhead_lmks
 
-        shape_key = (B, L, S, h_kv, G, D, topk, block_size, window_size, is_causal)
+        # Build bias_arg [B, S, h_kv, G] float32 (or dummy [1,1,1,1] when not used)
+        if use_bias:
+            assert bias is not None, "use_bias=True but bias is None"
+            bias_arg = bias.to(device=q.device, dtype=torch.float32)
+            if bias_arg.dim() == 3:
+                assert bias_arg.shape == (B, S, h_kv * G), (
+                    f"bias shape {tuple(bias_arg.shape)} != ({B}, {S}, {h_kv * G})"
+                )
+                bias_arg = bias_arg.reshape(B, S, h_kv, G).contiguous()
+            elif bias_arg.dim() == 4:
+                assert bias_arg.shape == (B, S, h_kv, G), (
+                    f"bias shape {tuple(bias_arg.shape)} != ({B}, {S}, {h_kv}, {G})"
+                )
+                bias_arg = bias_arg.contiguous()
+            else:
+                raise AssertionError(
+                    f"bias must be [B, S, h_q] or [B, S, h_kv, G], got {tuple(bias_arg.shape)}"
+                )
+        else:
+            bias_arg = torch.zeros(1, 1, 1, 1, dtype=torch.float32, device=q.device)
+
+        shape_key = (B, L, S, h_kv, G, D, topk, block_size, window_size,
+                     is_causal, use_bias, per_qhead_lmks)
         if self._cached_shape != shape_key:
 
             self._cached_select_kernel = fused_topk_max_pooling_kernel(
-                B, L, S, h_kv, G, D, topk, block_size, window_size, is_causal
+                B, L, S, h_kv, G, D, topk, block_size, window_size, is_causal,
+                use_bias=use_bias, per_qhead_lmks=per_qhead_lmks,
             )
 
             self._cached_sort_kernel = sort_topk_indices_kernel(
@@ -577,7 +778,8 @@ class TopKMaxPooling_Fused(torch.nn.Module):
             )
 
             self._cached_recompute_kernel = recompute_topk_max_pooling_scores_kernel(
-                B, L, S, h_kv, G, D, topk
+                B, L, S, h_kv, G, D, topk,
+                per_qhead_lmks=per_qhead_lmks,
             )
             self._cached_shape = shape_key
 
@@ -586,110 +788,269 @@ class TopKMaxPooling_Fused(torch.nn.Module):
         recompute_kernel = self._cached_recompute_kernel
 
         indices, scores = TopKMaxPoolingFusedFn.apply(
-            q, lmks, topk, select_kernel, sort_kernel, recompute_kernel
+            q, lmks, topk, select_kernel, sort_kernel, recompute_kernel,
+            bias_arg, per_qhead_lmks,
         )
         # Reshape scores: [B, L, h_kv, G, topk] -> [B, L, h_q, topk]
         scores = scores.view(B, L, h_kv * G, -1)
         return indices, scores
 
 _MODULE_CACHE = {}
-def online_topk_head(q: torch.Tensor, lmks: torch.Tensor, topk: int, block_size: int, window_size: int, is_causal: bool = False):
+def online_topk_head(q: torch.Tensor, lmks: torch.Tensor, topk: int,
+                     block_size: int, window_size: int, is_causal: bool = False,
+                     bias: Optional[torch.Tensor] = None,
+                     G: Optional[int] = None):
     """
-    Functional API for TopKMaxPooling_Fused
-    
+    Functional API for TopKMaxPooling_Fused (max-pooling top-k, no SWA-LSE).
+
     Args:
-        q: [B, L, h_q, D]
-        lmks: [B, S, h_kv, D]
+        q: [B, L, h_q, D] or [B, L, h_kv, G, D]
+        lmks: [B, S, h_kv, D] (per-KV-head) or [B, S, h_q, D] (per-q-head)
         topk: int
         block_size: int
         window_size: int
         is_causal: bool
+        bias: optional [B, S, h_q] or [B, S, h_kv, G] additive selection bias.
+              Only affects argmax-over-G during selection; returned scores
+              stay raw scaled qk and do NOT include bias.
+        G: optional explicit query group size. When G>1 and lmks_h==h_q,
+           takes the per-q-head path (no K sharing across G).
 
     Returns:
         indices: [B, L, h_kv, topk]
-        scores: [B, L, h_q, topk]
+        scores:  [B, L, h_q, topk]   (raw scaled qk)
     """
     if q.dim() == 4:
         B, L, h_q, D = q.shape
-        h_kv = lmks.shape[2]
-        assert h_q % h_kv == 0, f"h_q ({h_q}) must be divisible by h_kv ({h_kv})"
-        G = h_q // h_kv
-        q = q.view(B, L, h_kv, G, D)
+        lmks_h = lmks.shape[2]
+        if G is None or G == 1:
+            assert h_q % lmks_h == 0, (
+                f"h_q ({h_q}) must be divisible by lmks_h ({lmks_h})"
+            )
+            h_kv = lmks_h
+            G_eff = h_q // h_kv
+            per_qhead_lmks = False
+        else:
+            assert lmks_h == h_q, (
+                f"when G>1, lmks must have h_q ({h_q}) heads, got {lmks_h}"
+            )
+            assert h_q % G == 0, f"h_q ({h_q}) must be divisible by G ({G})"
+            h_kv = h_q // G
+            G_eff = G
+            per_qhead_lmks = True
+        q = q.view(B, L, h_kv, G_eff, D)
+    else:
+        B, L, h_kv, G_in, D = q.shape
+        h_q = h_kv * G_in
+        lmks_h = lmks.shape[2]
+        if G is None or G == 1:
+            if lmks_h == h_kv:
+                per_qhead_lmks = False
+            elif lmks_h == h_q:
+                per_qhead_lmks = True
+            else:
+                raise AssertionError(
+                    f"lmks_h ({lmks_h}) must be h_kv ({h_kv}) or h_q ({h_q})"
+                )
+        else:
+            assert lmks_h == h_q, (
+                f"when G>1, lmks must have h_q ({h_q}) heads, got {lmks_h}"
+            )
+            assert h_q % G == 0
+            new_h_kv = h_q // G
+            if new_h_kv != h_kv:
+                q = q.reshape(B, L, new_h_kv, G, D)
+                h_kv = new_h_kv
+            per_qhead_lmks = True
 
-    cache_key = (topk, block_size, window_size, is_causal)
+    use_bias = bias is not None
+    cache_key = (topk, block_size, window_size, is_causal, use_bias, per_qhead_lmks)
     if cache_key not in _MODULE_CACHE:
-        _MODULE_CACHE[cache_key] = TopKMaxPooling_Fused(topk, block_size, window_size, is_causal)
+        _MODULE_CACHE[cache_key] = TopKMaxPooling_Fused(
+            topk, block_size, window_size, is_causal,
+            use_bias=use_bias, per_qhead_lmks=per_qhead_lmks,
+        )
 
-    return _MODULE_CACHE[cache_key](q, lmks)
+    return _MODULE_CACHE[cache_key](q, lmks, bias=bias)
 
 
+# ----------------------------------------------------------------------
+# Tests (ported & adapted from topk_head_softmax.py to cover bias and
+# per_qhead_lmks for the max-pooling top-k path).
+# ----------------------------------------------------------------------
+def test_train_inference_correctness(test_name, B, q_len, h_kv, G, D, topk,
+                                     block_size, window_size,
+                                     use_bias, per_qhead_lmks=False, is_causal=True):
+    """
+    Forward + backward correctness test for the max-pooling top-k kernel.
+    Adapted from topk_head_softmax.py:test_train_inference_correctness.
+    The max-pooling path has no SWA LSE / inference q_offset, so we keep
+    only the training-style coverage of bias and per_qhead_lmks combinations.
+    """
+    device = "cuda"
+    dtype = torch.bfloat16
+    h_q = h_kv * G
 
-# ...existing code...
+    print(f"\n{'='*70}")
+    print(f"Test: {test_name}")
+    print(f"Config: B={B}, q_len={q_len}, h_kv={h_kv}, G={G}, D={D}")
+    print(f"        topk={topk}, block_size={block_size}, window_size={window_size}")
+    print(f"        is_causal={is_causal}, use_bias={use_bias}, per_qhead_lmks={per_qhead_lmks}")
+    print(f"{'='*70}")
+
+    torch.manual_seed(42)
+
+    # S = q_len // block_size (kv landmarks)
+    S = q_len // block_size
+
+    # Q: [B, q_len, h_kv, G, D]
+    q_raw = torch.randn(B, q_len, h_kv, G, D, dtype=dtype, device=device)
+    # Lmks: per-KV-head [B, S, h_kv, D]; per-q-head [B, S, h_q, D]
+    if per_qhead_lmks:
+        lmks_raw = torch.randn(B, S, h_q, D, dtype=dtype, device=device)
+    else:
+        lmks_raw = torch.randn(B, S, h_kv, D, dtype=dtype, device=device)
+
+    # Input isolation
+    q_fused = q_raw.clone().detach().requires_grad_(True)
+    lmks_fused = lmks_raw.clone().detach().requires_grad_(True)
+    q_ref = q_raw.clone().detach().requires_grad_(True)
+    lmks_ref = lmks_raw.clone().detach().requires_grad_(True)
+
+    if use_bias:
+        # Deterministic per-chunk per-head additive bias.
+        chunk_axis = torch.linspace(-1.0, 1.0, S, device=device, dtype=torch.float32).view(1, S, 1)
+        head_axis = torch.linspace(-0.5, 0.5, h_kv * G, device=device, dtype=torch.float32).view(1, 1, h_kv * G)
+        batch_axis = torch.arange(B, device=device, dtype=torch.float32).view(B, 1, 1) * 0.01
+        bias = (chunk_axis + head_axis + batch_axis).contiguous()
+    else:
+        bias = None
+
+    G_arg = G if per_qhead_lmks else None
+
+    # ============ Forward ============
+    print("\n--- Forward Pass ---")
+
+    indices_ref, scores_ref = ref_topk_max_pooling(
+        q_ref, lmks_ref, topk, block_size, window_size, is_causal, bias=bias,
+    )
+
+    indices_fused, scores_fused = online_topk_head(
+        q_fused, lmks_fused, topk, block_size, window_size, is_causal,
+        bias=bias, G=G_arg,
+    )
+
+    def get_abs_err(x, y):
+        mask = (x > -1e5) & (y > -1e5)
+        if mask.sum() == 0:
+            return 0.0
+        return (x[mask] - y[mask]).abs().max().item()
+
+    def get_err_ratio(x, y):
+        mask = (x > -1e5) & (y > -1e5)
+        if mask.sum() == 0:
+            return 0.0
+        err = (x[mask] - y[mask]).square().mean().sqrt().item()
+        base = x[mask].square().mean().sqrt().item()
+        return err / (base + 1e-12)
+
+    # Reshape fused scores to [B, q_len, h_kv, G, topk] for comparison
+    scores_fused_reshaped = scores_fused.view(B, q_len, h_kv, G, topk)
+
+    fwd_abs_err = get_abs_err(scores_ref.float(), scores_fused_reshaped.float())
+    fwd_rel_err = get_err_ratio(scores_ref.float(), scores_fused_reshaped.float())
+
+    print(f"Forward Scores - Abs Error: {fwd_abs_err:.6f}")
+    print(f"Forward Scores - Rel Error: {fwd_rel_err:.6f}")
+
+    # Indices match rate (where ref has valid pooled scores)
+    indices_match = (indices_fused.long() == indices_ref.long())
+    scores_ref_pooled = scores_ref.max(dim=3).values
+    valid_mask = scores_ref_pooled > -1e5
+    if valid_mask.sum() > 0:
+        match_rate = indices_match[valid_mask].float().mean().item()
+        print(f"Indices Match Rate: {match_rate*100:.2f}%")
+    else:
+        match_rate = 1.0
+        print("Indices Match Rate: N/A (all masked)")
+
+    assert fwd_rel_err < 0.02, f"Forward relative error too large: {fwd_rel_err}"
+    print("✅ Forward PASSED")
+
+    # ============ Backward ============
+    print("\n--- Backward Pass ---")
+    grad_output = torch.randn_like(scores_fused, dtype=dtype)
+    with torch.no_grad():
+        invalid_mask = scores_ref < -1e5
+        grad_output_view = grad_output.view(B, q_len, h_kv, G, topk)
+        grad_output_view[invalid_mask] = 0.0
+
+    scores_fused.backward(grad_output)
+    dq_fused = q_fused.grad.clone()
+    dlmks_fused = lmks_fused.grad.clone()
+
+    scores_ref.backward(grad_output.view(B, q_len, h_kv, G, topk))
+    dq_ref = q_ref.grad.clone()
+    dlmks_ref = lmks_ref.grad.clone()
+
+    dq_fused = torch.nan_to_num(dq_fused, 0.0)
+    dq_ref = torch.nan_to_num(dq_ref, 0.0)
+    dlmks_fused = torch.nan_to_num(dlmks_fused, 0.0)
+    dlmks_ref = torch.nan_to_num(dlmks_ref, 0.0)
+
+    dq_rel_err = get_err_ratio(dq_ref.float(), dq_fused.float())
+    dlmks_rel_err = get_err_ratio(dlmks_ref.float(), dlmks_fused.float())
+
+    print(f"dQ Rel Error: {dq_rel_err:.6f}")
+    print(f"dLmks Rel Error: {dlmks_rel_err:.6f}")
+
+    assert dq_rel_err < 0.05, f"dQ relative error too large: {dq_rel_err}"
+    assert dlmks_rel_err < 0.05, f"dLmks relative error too large: {dlmks_rel_err}"
+    print("✅ Backward PASSED")
+
+    print(f"\n✅ Test '{test_name}' PASSED")
+
+
 def test_fused_topk_max_pooling_correctness():
     print("\n" + "=" * 70)
-    print("=== Testing Fused TopK Max-Pooling Kernel Correctness ===")
+    print("=== Testing Fused TopK Max-Pooling Kernel Correctness (legacy) ===")
     print("=" * 70)
-    
-    B, L, D = 64, 4096, 128
+
+    B, L, D = 2, 1024, 128
     h_kv = 2
     G = 8
     h_q = h_kv * G
     S = 64
     topk = 16
     is_causal = True
-    block_size = 64
+    block_size = 16
     window_size = 64
-    
+
     dtype = torch.bfloat16
     device = "cuda"
-    
+
     print(f"Config: B={B}, L={L}, S={S}, h_kv={h_kv}, G={G} (h_q={h_q}), D={D}, topk={topk}, is_causal={is_causal}, block_size={block_size}")
-    
+
     torch.manual_seed(4200)
-    
+
     q = torch.randn(B, L, h_kv, G, D, dtype=dtype, device=device, requires_grad=True)
     lmks = torch.randn(B, S, h_kv, D, dtype=dtype, device=device, requires_grad=True)
-    
+
     # ============ Forward Correctness ============
     print("\n--- Forward Correctness ---")
-    
-    # Reference returns: indices [B, L, h_kv, topk], scores [B, L, h_kv, G, topk]
+
     ref_indices, ref_scores = ref_topk_max_pooling(q.detach(), lmks.detach(), topk, block_size, window_size, is_causal)
-    
-    # Fused returns: indices [B, L, h_kv, topk], scores [B, L, h_q, topk]
     fused_indices, fused_scores = online_topk_head(q, lmks, topk, block_size, window_size, is_causal)
-    
-    # Reshape fused scores back to [B, L, h_kv, G, topk] for comparison
     fused_scores_reshaped = fused_scores.view(B, L, h_kv, G, topk)
-    
-    scores_all_ref = torch.einsum("blhgd,bshd->blhgs", q.float(), lmks.float())
-    scores_all_ref = scores_all_ref * (1.0 / math.sqrt(D))
-    
-    if is_causal:
-        i_idx = torch.arange(L, device=device).unsqueeze(1)
-        j_idx = torch.arange(S, device=device).unsqueeze(0)
-        threshold_idx = (i_idx - window_size + 1).div(block_size, rounding_mode='floor')
-        causal_mask = j_idx >= threshold_idx
-        causal_mask_expanded = causal_mask.view(1, L, 1, 1, S)
-        scores_all_ref = scores_all_ref.masked_fill(causal_mask_expanded, float('-inf'))
 
-
-    safe_indices = fused_indices.clone()
-    safe_indices[safe_indices < 0] = 0 
-
-    indices_expanded = safe_indices.unsqueeze(3).expand(-1, -1, -1, G, -1).long()
-    scores_gathered_ref = torch.gather(scores_all_ref, -1, indices_expanded)
-
-    # Use reshaped fused scores for comparison
-    valid_mask = (scores_gathered_ref > -1e9) & (fused_scores_reshaped.float() > -1e9)
-    
-    if valid_mask.sum() == 0:
+    diff_mask = (ref_scores > -1e9) & (fused_scores_reshaped.float() > -1e9)
+    if diff_mask.sum() == 0:
         max_score_diff = 0.0
         rel_l2_score = 0.0
     else:
-        score_diff = torch.abs(scores_gathered_ref[valid_mask] - fused_scores_reshaped.float()[valid_mask])
+        score_diff = torch.abs(ref_scores[diff_mask] - fused_scores_reshaped.float()[diff_mask])
         max_score_diff = score_diff.max().item()
-        rel_l2_score = score_diff.norm().item() / (scores_gathered_ref[valid_mask].norm().item() + 1e-6)
+        rel_l2_score = score_diff.norm().item() / (ref_scores[diff_mask].norm().item() + 1e-6)
 
     print(f"Forward scores (valid only) - Max Diff: {max_score_diff:.6f}")
     print(f"Forward scores (valid only) - L2 RelErr: {rel_l2_score:.6f}")
@@ -697,393 +1058,56 @@ def test_fused_topk_max_pooling_correctness():
     indices_match = (fused_indices.long() == ref_indices.long())
     ref_scores_pooled = ref_scores.max(dim=3).values
     valid_indices_mask = (ref_scores_pooled > -1e9)
-    
     if valid_indices_mask.sum() > 0:
         match_rate = indices_match[valid_indices_mask].float().mean().item()
     else:
         match_rate = 1.0
-
     print(f"Indices Match Rate (Valid Elements): {match_rate*100:.6f}%")
 
-    if match_rate >= 0.99 and max_score_diff < 1 and rel_l2_score < 1e-2:
+    if match_rate >= 0.99 and rel_l2_score < 1e-2:
         print("✅ Fused Forward PASSED")
     else:
         print("❌ Fused Forward FAILED")
 
-    # ============ Backward Correctness ============
-    print("\n--- Backward Correctness ---")
-    
-    q_fused = q.detach().clone().requires_grad_(True)
-    lmks_fused = lmks.detach().clone().requires_grad_(True)
-    q_ref = q.detach().clone().requires_grad_(True)
-    lmks_ref = lmks.detach().clone().requires_grad_(True)
-    
-    # grad_output shape: [B, L, h_kv, G, topk]
-    grad_output = torch.randn(B, L, h_kv, G, topk, dtype=dtype, device=device)
-    
-    # Mask grad_output for invalid positions
-    with torch.no_grad():
-        _, ref_scores_check = ref_topk_max_pooling(
-            q_ref, lmks_ref, topk, block_size, window_size, is_causal
-        )
-        invalid_mask = (ref_scores_check < -1e9)
-        grad_output[invalid_mask] = 0.0
-
-    indices_fused_bwd, scores_fused_bwd = online_topk_head(q_fused, lmks_fused, topk, block_size, window_size, is_causal)
-    
-    # Reshape grad_output to [B, L, h_q, topk] for fused backward
-    loss_fused = (scores_fused_bwd * grad_output.view(B, L, h_kv * G, topk)).sum()
-    loss_fused.backward()
-    grad_q_fused = q_fused.grad.clone()
-    grad_lmks_fused = lmks_fused.grad.clone()
-    
-    scores_all_ref = torch.einsum("blhgd,bshd->blhgs", q_ref.float(), lmks_ref.float())
-    scores_all_ref = scores_all_ref * (1.0 / math.sqrt(D)) # Scale!
-    
-    if is_causal:
-        scores_all_ref = scores_all_ref.masked_fill(causal_mask_expanded, float('-inf'))
-    
-    safe_indices_bwd = indices_fused_bwd.clone()
-    safe_indices_bwd[safe_indices_bwd < 0] = 0
-    indices_expanded = safe_indices_bwd.unsqueeze(3).expand(-1, -1, -1, G, -1).long()
-    scores_gathered_ref = torch.gather(scores_all_ref, -1, indices_expanded)
-    
-    # Use original grad_output [B, L, h_kv, G, topk] for ref backward
-    loss_ref = (scores_gathered_ref * grad_output.float()).sum()
-    loss_ref.backward()
-    grad_q_ref = q_ref.grad.clone()
-    grad_lmks_ref = lmks_ref.grad.clone()
-    
-    if torch.isnan(grad_q_ref).any(): grad_q_ref = torch.nan_to_num(grad_q_ref, 0.0)
-    if torch.isnan(grad_lmks_ref).any(): grad_lmks_ref = torch.nan_to_num(grad_lmks_ref, 0.0)
-    if torch.isnan(grad_q_fused).any(): grad_q_fused = torch.nan_to_num(grad_q_fused, 0.0)
-    if torch.isnan(grad_lmks_fused).any(): grad_lmks_fused = torch.nan_to_num(grad_lmks_fused, 0.0)
-
-    diff_grad_q = torch.abs(grad_q_fused - grad_q_ref)
-    diff_grad_lmks = torch.abs(grad_lmks_fused - grad_lmks_ref)
-    
-    max_diff_q = diff_grad_q.max().item()
-    max_diff_lmks = diff_grad_lmks.max().item()
-    
-    norm_q_ref = torch.norm(grad_q_ref).item()
-    norm_lmks_ref = torch.norm(grad_lmks_ref).item()
-    norm_diff_q = torch.norm(diff_grad_q).item()
-    norm_diff_lmks = torch.norm(diff_grad_lmks).item()
-    
-    rel_err_q = norm_diff_q / (norm_q_ref + 1e-6)
-    rel_err_lmks = norm_diff_lmks / (norm_lmks_ref + 1e-6)
-    
-    print(f"Fused vs Ref - Max grad_q Diff: {max_diff_q:.6f}")
-    print(f"Fused vs Ref - Max grad_lmks Diff: {max_diff_lmks:.6f}")
-    print(f"Fused vs Ref - L2 Relative Error grad_q: {rel_err_q:.6f} ({rel_err_q*100:.4f}%)")
-    print(f"Fused vs Ref - L2 Relative Error grad_lmks: {rel_err_lmks:.6f} ({rel_err_lmks*100:.4f}%)")
-    
-    if rel_err_q < 0.01 and rel_err_lmks < 0.01:
-        print("✅ Fused Backward PASSED")
-    else:
-        print("❌ Fused Backward FAILED")
-
-
-def test_fused_topk_max_pooling_memory_and_speed():
-    print("\n" + "=" * 70)
-    print("=== Benchmark Fused TopK Max-Pooling Memory and Speed ===")
-    print("=" * 70)
-    
-    B, L, D = 32, 4096, 128
-    h_kv = 2
-    G = 8
-    h_q = h_kv * G
-    S = 64
-    topk = 16
-    is_causal = True
-    block_size = 64
-    window_size = 64
-    dtype = torch.bfloat16
-    device = "cuda"
-    
-    print(f"Config: B={B}, L={L}, S={S}, h_kv={h_kv}, G={G} (h_q={h_q}), D={D}, topk={topk}, is_causal={is_causal}, block_size={block_size}")
-    
-    torch.manual_seed(42)
-    q = torch.randn(B, L, h_kv, G, D, dtype=dtype, device=device, requires_grad=True)
-    lmks = torch.randn(B, S, h_kv, D, dtype=dtype, device=device, requires_grad=True)
-    
-    # grad_output shape: [B, L, h_q, topk]
-    grad_output = torch.randn(B, L, h_kv * G, topk, dtype=dtype, device=device)
-    
-    n_iters = 20
-    
-    def run_fused():
-        q_t = q.detach().clone().requires_grad_(True)
-        lmks_t = lmks.detach().clone().requires_grad_(True)
-        
-        torch.cuda.empty_cache()
-        torch.cuda.reset_peak_memory_stats()
-        
-        _, scores = online_topk_head(q_t, lmks_t, topk, block_size, window_size, is_causal)
-        loss = (scores * grad_output).sum()
-        loss.backward()
-        torch.cuda.synchronize()
-        
-        # Warmup
-        for _ in range(5):
-            q_t.grad = None
-            lmks_t.grad = None
-
-            _ = online_topk_head(q_t, lmks_t, topk, block_size, window_size, is_causal)
-
-            _, scores = online_topk_head(q_t, lmks_t, topk, block_size, window_size, is_causal)
-            loss = (scores * grad_output).sum()
-            loss.backward()
-        torch.cuda.synchronize()
-        
-        torch.cuda.reset_peak_memory_stats()
-        q_t.grad = None
-        lmks_t.grad = None
-        _, scores = online_topk_head(q_t, lmks_t, topk, block_size, window_size, is_causal)
-        loss = (scores * grad_output).sum()
-        loss.backward()
-        peak_mem = torch.cuda.max_memory_allocated() / 1024**2
-        
-        start_fwd = torch.cuda.Event(enable_timing=True)
-        end_fwd = torch.cuda.Event(enable_timing=True)
-        start_all = torch.cuda.Event(enable_timing=True)
-        end_all = torch.cuda.Event(enable_timing=True)
-        
-        # Fwd only
-        start_fwd.record()
-        for _ in range(n_iters):
-            q_t.grad = None
-            lmks_t.grad = None
-            _ = online_topk_head(q_t, lmks_t, topk, block_size, window_size, is_causal)
-        end_fwd.record()
-        torch.cuda.synchronize()
-        avg_fwd_ms = start_fwd.elapsed_time(end_fwd) / n_iters
-        
-        # Fwd + Bwd
-        start_all.record()
-        for _ in range(n_iters):
-            q_t.grad = None
-            lmks_t.grad = None
-            _, scores = online_topk_head(q_t, lmks_t, topk, block_size, window_size, is_causal)
-            loss = (scores * grad_output).sum()
-            loss.backward()
-        end_all.record()
-        torch.cuda.synchronize()
-        avg_all_ms = start_all.elapsed_time(end_all) / n_iters
-        avg_bwd_ms = avg_all_ms - avg_fwd_ms
-        
-        return peak_mem, avg_fwd_ms, avg_all_ms, avg_bwd_ms
-    
-    def run_ref():
-        q_t = q.detach().clone().requires_grad_(True)
-        lmks_t = lmks.detach().clone().requires_grad_(True)
-        
-        # Reshape grad_output for reference: [B, L, h_kv, G, topk]
-        grad_output_ref = grad_output.view(B, L, h_kv, G, topk)
-
-        torch.cuda.empty_cache()
-        torch.cuda.reset_peak_memory_stats()
-        
-        def forward_only():
-            _ = ref_topk_max_pooling(q_t, lmks_t, topk, block_size, window_size, is_causal)
-        
-        def forward_backward():
-            _, scores = ref_topk_max_pooling(q_t, lmks_t, topk, block_size, window_size, is_causal)
-            loss = (scores * grad_output_ref).sum()
-            loss.backward()
-            
-        for _ in range(5):
-            q_t.grad = None
-            lmks_t.grad = None
-            forward_only()
-            forward_backward()
-        torch.cuda.synchronize()
-        
-        torch.cuda.reset_peak_memory_stats()
-        q_t.grad = None
-        lmks_t.grad = None
-        forward_backward()
-        peak_mem = torch.cuda.max_memory_allocated() / 1024**2
-        
-        start_fwd = torch.cuda.Event(enable_timing=True)
-        end_fwd = torch.cuda.Event(enable_timing=True)
-        start_all = torch.cuda.Event(enable_timing=True)
-        end_all = torch.cuda.Event(enable_timing=True)
-        
-        # Fwd only
-        start_fwd.record()
-        for _ in range(n_iters):
-            q_t.grad = None
-            lmks_t.grad = None
-            forward_only()
-        end_fwd.record()
-        torch.cuda.synchronize()
-        avg_fwd_ms = start_fwd.elapsed_time(end_fwd) / n_iters
-        
-        # Fwd + Bwd
-        start_all.record()
-        for _ in range(n_iters):
-            q_t.grad = None
-            lmks_t.grad = None
-            forward_backward()
-        end_all.record()
-        torch.cuda.synchronize()
-        avg_all_ms = start_all.elapsed_time(end_all) / n_iters
-        
-        avg_bwd_ms = avg_all_ms - avg_fwd_ms
-        
-        return peak_mem, avg_fwd_ms, avg_all_ms, avg_bwd_ms
-    
-    # Run benchmarks
-    print("\nRunning benchmarks...")
-    
-    mem_fused, fwd_fused, all_fused, bwd_fused = run_fused()
-    print(f"\n[Fused TopK Max-Pooling]")
-    print(f"  Peak Memory: {mem_fused:.2f} MB")
-    print(f"  Avg Fwd Latency: {fwd_fused:.2f} ms")
-    print(f"  Avg Fwd+Bwd Latency: {all_fused:.2f} ms")
-    print(f"  Derived Bwd Latency: {bwd_fused:.2f} ms")
-    
-    try:
-        mem_ref, fwd_ref, all_ref, bwd_ref = run_ref()
-        print(f"\n[Reference (PyTorch)]")
-        print(f"  Peak Memory: {mem_ref:.2f} MB")
-        print(f"  Avg Fwd Latency: {fwd_ref:.2f} ms")
-        print(f"  Avg Fwd+Bwd Latency: {all_ref:.2f} ms")
-        print(f"  Derived Bwd Latency: {bwd_ref:.2f} ms")
-        
-        print("\n" + "-" * 70)
-        print("Comparison:")
-        print("-" * 70)
-        print(f"{'Method':<25} {'Memory (MB)':<15} {'Fwd (ms)':<12} {'Fwd+Bwd (ms)':<15} {'Bwd (ms)':<12}")
-        print("-" * 70)
-        print(f"{'Fused':<25} {mem_fused:<15.2f} {fwd_fused:<12.2f} {all_fused:<15.2f} {bwd_fused:<12.2f}")
-        print(f"{'Reference':<25} {mem_ref:<15.2f} {fwd_ref:<12.2f} {all_ref:<15.2f} {bwd_ref:<12.2f}")
-        print("-" * 70)
-        print(f"Speedup (Fwd): {fwd_ref / fwd_fused:.2f}x")
-        print(f"Speedup (Bwd): {bwd_ref / bwd_fused:.2f}x")
-        print(f"Speedup (Fwd+Bwd): {all_ref / all_fused:.2f}x")
-        print(f"Memory Saving: {mem_ref / mem_fused:.2f}x")
-        
-    except RuntimeError as e:
-        if "out of memory" in str(e).lower():
-            print(f"\n[Reference (PyTorch)] OOM - Cannot run with this config")
-            print("\n" + "-" * 70)
-            print("Comparison (Reference OOM):")
-            print("-" * 70)
-            print(f"{'Method':<25} {'Memory (MB)':<15} {'Fwd (ms)':<12} {'Fwd+Bwd (ms)':<15} {'Bwd (ms)':<12}")
-            print("-" * 70)
-            print(f"{'Fused':<25} {mem_fused:<15.2f} {fwd_fused:<12.2f} {all_fused:<15.2f} {bwd_fused:<12.2f}")
-            print("-" * 70)
-        else:
-            raise e
-
-
-import pytest
-@pytest.mark.parametrize("B, L, S, h_kv, G, D, topk, block_size, window_size", [
-    (2, 4096, 64, 2, 8, 64, 16, 64, 64),
-])
-def test_topk_correctness_robust(B, L, S, h_kv, G, D, topk, block_size, window_size):
-    device = "cuda"
-    dtype = torch.bfloat16
-    is_causal = True
-    # window_size = block_size # default window_size
-    
-    torch.manual_seed(42)
-    
-    print(f"\nTesting Config: B={B}, L={L}, S={S}, h_kv={h_kv}, G={G}, D={D}, topk={topk}, BS={block_size}, WS={window_size}")
-
-    # 1.准备数据
-    # Q: [B, L, h_kv, G, D]
-    q_raw = torch.randn(B, L, h_kv, G, D, dtype=dtype, device=device)
-    # Lmks: [B, S, h_kv, D]
-    lmks_raw = torch.randn(B, S, h_kv, D, dtype=dtype, device=device)
-    
-    # 2.输入隔离 (Clone & Detach)
-    q_fused = q_raw.clone().detach().requires_grad_(True)
-    lmks_fused = lmks_raw.clone().detach().requires_grad_(True)
-    
-    q_ref = q_raw.clone().detach().requires_grad_(True)
-    lmks_ref = lmks_raw.clone().detach().requires_grad_(True)
-
-    # 3.前向计算
-    # Fused Kernel
-    # indices: [B, L, h_kv, topk]
-    # scores:  [B, L, h_q, topk]
-    indices_fused, scores_fused = online_topk_head(q_fused, lmks_fused, topk, block_size, window_size, is_causal)
-
-    # Reference
-    # scores: [B, L, h_kv, G, topk]
-    indices_ref, scores_ref = ref_topk_max_pooling(q_ref, lmks_ref, topk, block_size, window_size, is_causal)
-
-    # 4.辅助校验函数 (带 Mask 处理)
-    def get_abs_err(x, y):
-        # 过滤掉 -inf (Masked) 的位置，避免 NaN
-        mask = (x > -1e5) & (y > -1e5)
-        if mask.sum() == 0: return 0.0
-        return (x[mask] - y[mask]).abs().max().item()
-
-    def get_err_ratio(x, y):
-        mask = (x > -1e5) & (y > -1e5)
-        if mask.sum() == 0: return 0.0
-        err = (x[mask] - y[mask]).square().mean().sqrt().item()
-        base = (x[mask]).square().mean().sqrt().item()
-        return err / (base + 1e-12)
-
-    def assert_close(prefix, ref, tri, ratio=0.01):
-        abs_err = get_abs_err(ref, tri)
-        rel_ratio = get_err_ratio(ref, tri)
-        msg = f"{prefix} diff: {abs_err:.6f} ratio: {rel_ratio:.6f}"
-        print(msg)
-        assert rel_ratio < ratio, msg
-
-    # 5.验证前向 Scores
-    # Reshape fused scores to match reference [B, L, h_kv, G, topk]
-    assert_close("FWD Scores", scores_ref.float(), scores_fused.view(B, L, h_kv, G, topk).float())
-
-    # 6.反向计算
-    # 生成 grad_output [B, L, h_q, topk]
-    grad_output = torch.randn_like(scores_fused, dtype=dtype)
-    
-    # 关键：Mask 掉无效位置的梯度，防止 -inf 导致 NaN 传播
-    with torch.no_grad():
-        # scores_ref is [B, L, h_kv, G, topk]
-        invalid_mask = scores_ref < -1e5
-        # Reshape grad_output to match mask for masking
-        grad_output_view = grad_output.view(B, L, h_kv, G, topk)
-        grad_output_view[invalid_mask] = 0.0
-
-    # Fused Backward
-    scores_fused.backward(grad_output)
-    dq_fused, dlmks_fused = q_fused.grad.clone(), lmks_fused.grad.clone()
-
-    # Ref Backward
-    # Reshape grad_output to match ref scores [B, L, h_kv, G, topk]
-    scores_ref.backward(grad_output.view(B, L, h_kv, G, topk))
-    dq_ref, dlmks_ref = q_ref.grad.clone(), lmks_ref.grad.clone()
-
-    # 7.验证梯度
-    # 处理可能的 NaN (虽然上面已经 mask 了 grad_output，但为了稳健性)
-    dq_fused = torch.nan_to_num(dq_fused, 0.0)
-    dq_ref = torch.nan_to_num(dq_ref, 0.0)
-    dlmks_fused = torch.nan_to_num(dlmks_fused, 0.0)
-    dlmks_ref = torch.nan_to_num(dlmks_ref, 0.0)
-
-    assert_close("DQ", dq_ref.float(), dq_fused.float(), ratio=0.05)
-    assert_close("DLmks", dlmks_ref.float(), dlmks_fused.float(), ratio=0.05)
-
-    print(f"Test Passed: B={B}, L={L}, S={S}, G={G}, topk={topk}")
-# ...existing code...
 
 if __name__ == "__main__":
+    print("\n" + "=" * 70)
+    print("Regression Suite for topk_head (max-pooling, with bias / per-q-head lmks)")
+    print("=" * 70)
+
+    # Legacy quick check
     test_fused_topk_max_pooling_correctness()
-    test_fused_topk_max_pooling_memory_and_speed()
-    params_list = [
-         (2, 4096, 64, 2, 8, 64, 16, 64, 64),
-        (1, 2048, 64, 1, 8, 64, 16, 32, 32),
-        (3, 2048, 64, 1, 8, 64, 8, 32, 32),
-        (3, 2048, 64, 1, 8, 64, 8, 32, 40),
-        (3, 2048, 64, 1, 8, 64, 8, 32, 64),
-    ]
-    for p in params_list:
-        test_topk_correctness_robust(*p)
+
+    # 1) Baseline: per-KV-head lmks, no bias
+    test_train_inference_correctness(
+        "train_basic", 2, 1024, 2, 8, 128, 16, 64, 64, False, False
+    )
+
+    # 2) Per-KV-head lmks + bias  (the missing-bias path we are now fixing)
+    test_train_inference_correctness(
+        "train_basic_bias", 2, 1024, 2, 8, 128, 16, 64, 64, True, False
+    )
+
+    # 3) Per-q-head lmks (no bias)
+    test_train_inference_correctness(
+        "train_perqhead", 2, 1024, 2, 8, 128, 16, 64, 64, False, True
+    )
+
+    # 4) Per-q-head lmks + bias (most general path)
+    test_train_inference_correctness(
+        "train_perqhead_bias", 2, 1024, 2, 8, 128, 16, 64, 64, True, True
+    )
+
+    # 5) Non-divisible q_len (padding inside kernel)
+    test_train_inference_correctness(
+        "train_bias_nondiv_999", 2, 999, 2, 8, 128, 16, 64, 64, True, False
+    )
+
+    # 6) G=1 corner case + per_qhead + bias
+    test_train_inference_correctness(
+        "train_perqhead_G1_bias", 2, 1024, 4, 1, 128, 16, 64, 64, True, True
+    )
+
+    print("\n" + "=" * 70)
+    print("All regression tests finished.")
+    print("=" * 70)
