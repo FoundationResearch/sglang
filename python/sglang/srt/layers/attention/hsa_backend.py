@@ -581,15 +581,17 @@ class HSAAttnBackend(AttentionBackend):
 
         # Non-HSA layers: delegate to dense backend.
         if not self._is_hsa_layer(layer.layer_id):
+            kwargs_clean = {kk: vv for kk, vv in kwargs.items() if not kk.startswith("hsa_")}
             return self._dense_backend.forward_decode(
-                q, k, v, layer, forward_batch, save_kv_cache=save_kv_cache, **kwargs
+                q, k, v, layer, forward_batch, save_kv_cache=save_kv_cache, **kwargs_clean
             )
 
         md = self.forward_metadata
         pool = getattr(forward_batch, "token_to_kv_pool", None)
         if md is None or pool is None:
+            kwargs_clean = {kk: vv for kk, vv in kwargs.items() if not kk.startswith("hsa_")}
             return self._dense_backend.forward_decode(
-                q, k, v, layer, forward_batch, save_kv_cache=save_kv_cache, **kwargs
+                q, k, v, layer, forward_batch, save_kv_cache=save_kv_cache, **kwargs_clean
             )
 
         # Save current KV into the paged KV cache (same as TritonAttnBackend).
