@@ -1,0 +1,31 @@
+{
+  "config_path": "dev/align/config_345m.json",
+  "config_sha256": "17f2d8a8241b8a6c024c6334a8c36cd0696dc4c8b33f094de1d5bbec42dcd47e",
+  "weights_path": "dev/align/weights_345m/model.safetensors",
+  "weights_sha256": "7fad83c90c2dd3a6f7191eff4c8e0efc21d72d769fbc3518793cc8bfd6f6aa81",
+  "weights_size_bytes": 893163200,
+  "weights_dtype": "float16",
+  "training": {
+    "seed": 42,
+    "steps": 10000,
+    "batch_size": 32,
+    "seq_len": 8192,
+    "lr": 0.0003,
+    "optimizer": "AdamW(0.9,0.95,wd=0.01,clip=1.0)",
+    "dtype": "bfloat16",
+    "final_loss": 6.27,
+    "best_loss": 6.27,
+    "loss_first": 11.7,
+    "loss_curve_p50_p90_p99": [
+      6.27,
+      6.3,
+      11.7
+    ]
+  },
+  "env": {
+    "git_commit": "eab346ca3",
+    "git_dirty": true
+  },
+  "trained_at_utc": "2026-05-31T19:37:48.592424+00:00",
+  "_note": "345M qwen_lhsa (hsa_heads=16,qk_ratio=8,kv=2) trained on wikitext-103 for retrieval-head emergence test"
+}
