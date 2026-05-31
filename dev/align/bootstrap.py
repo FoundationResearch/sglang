@@ -372,6 +372,25 @@ def transfer_official_to_sglang(src, dst):
                     skipped.append(name)
             else:
                 skipped.append(name)
+        elif name.endswith('.lmk_q_proj.weight'):
+            # Official may use a LoRA Sequential(Linear down, Linear up); sglang
+            # has a single Linear. Compose W_sgl = up.weight @ down.weight (shape
+            # [out, in]) which gives an identical forward y = x @ W_sgl.T to
+            # y = up(down(x)).
+            base = name[: -len('.weight')]
+            down_k = base + '.0.weight'
+            up_k = base + '.1.weight'
+            if down_k in ssd and up_k in ssd:
+                w_down = ssd[down_k]                                # (lora, in)
+                w_up = ssd[up_k]                                    # (out, lora)
+                w_composed = (w_up @ w_down).to(param.dtype)        # (out, in)
+                if w_composed.shape == param.shape:
+                    param.data.copy_(w_composed)
+                    loaded += 1
+                else:
+                    skipped.append(name)
+            else:
+                skipped.append(name)
         else:
             skipped.append(name)
     return loaded, total, skipped

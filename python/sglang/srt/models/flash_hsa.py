@@ -740,14 +740,25 @@ class FlashHSAInnerXDecoderLayer(nn.Module):
 
         rms_norm_eps = float(getattr(config, "rms_norm_eps", 1e-6))
 
-        # OLMo3 post-norm: norm AFTER attention/MLP output
         self.mlp = Olmo2MLP(
             config=config,
             quant_config=quant_config,
             prefix=add_prefix("mlp", prefix),
         )
+
+        # Decoder norm topology — set by FlashHSAConfig from model_type. "olmo"
+        # is OLMo3 post-norm (residual + post_norm(attn|mlp(x))), "qwen" is
+        # Qwen3 pre-norm (residual + attn|mlp(pre_norm(x))). The two share the
+        # name `post_attention_layernorm` for the param that lives in the same
+        # *position* in the state_dict; in olmo it's the post-attn output norm,
+        # in qwen it's the pre-MLP input norm.  The extra slot is named
+        # `post_feedforward_layernorm` for olmo and `input_layernorm` for qwen.
+        self.decoder_variant = str(getattr(config, "decoder_variant", "olmo"))
         self.post_attention_layernorm = RMSNorm(self.hidden_size, eps=rms_norm_eps)
-        self.post_feedforward_layernorm = RMSNorm(self.hidden_size, eps=rms_norm_eps)
+        if self.decoder_variant == "olmo":
+            self.post_feedforward_layernorm = RMSNorm(self.hidden_size, eps=rms_norm_eps)
+        else:  # qwen
+            self.input_layernorm = RMSNorm(self.hidden_size, eps=rms_norm_eps)
 
     def forward(
         self,
@@ -755,20 +766,36 @@ class FlashHSAInnerXDecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
-        # OLMo3 post-norm
-        residual = hidden_states
-        hidden_states = self.self_attn(
-            positions=positions,
-            hidden_states=hidden_states,
-            forward_batch=forward_batch,
-        )
-        hidden_states = self.post_attention_layernorm(hidden_states)
-        hidden_states = hidden_states + residual
+        if self.decoder_variant == "olmo":
+            # OLMo3 post-norm
+            residual = hidden_states
+            hidden_states = self.self_attn(
+                positions=positions,
+                hidden_states=hidden_states,
+                forward_batch=forward_batch,
+            )
+            hidden_states = self.post_attention_layernorm(hidden_states)
+            hidden_states = hidden_states + residual
 
-        residual = hidden_states
-        hidden_states = self.mlp(hidden_states)
-        hidden_states = self.post_feedforward_layernorm(hidden_states)
-        hidden_states = residual + hidden_states
+            residual = hidden_states
+            hidden_states = self.mlp(hidden_states)
+            hidden_states = self.post_feedforward_layernorm(hidden_states)
+            hidden_states = residual + hidden_states
+        else:
+            # Qwen3 pre-norm
+            residual = hidden_states
+            hidden_states = self.input_layernorm(hidden_states)
+            hidden_states = self.self_attn(
+                positions=positions,
+                hidden_states=hidden_states,
+                forward_batch=forward_batch,
+            )
+            hidden_states = residual + hidden_states
+
+            residual = hidden_states
+            hidden_states = self.post_attention_layernorm(hidden_states)
+            hidden_states = self.mlp(hidden_states)
+            hidden_states = residual + hidden_states
         return hidden_states
 
 

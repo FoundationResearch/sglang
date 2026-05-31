@@ -71,6 +71,15 @@ class FlashHSAConfig(PretrainedConfig):
         hsa_heads: Optional[int] = None,
         hsa_qk_ratio: Optional[int] = None,
         enable_gate: bool = False,
+        # ---- Decoder topology variant ----
+        # "olmo" (default): OLMo3 post-norm — residual + post_attn_norm(attn(x)) then
+        #   residual + post_ff_norm(mlp(x)).  Per-layer norms:
+        #   {post_attention_layernorm, post_feedforward_layernorm}.
+        # "qwen":           Qwen3 pre-norm — residual + attn(input_norm(x)) then
+        #   residual + mlp(post_attn_norm(x)) where post_attn_norm acts as the pre-MLP norm.
+        #   Per-layer norms: {input_layernorm, post_attention_layernorm}.
+        # Auto-detected from incoming model_type below (qwen_lhsa -> "qwen").
+        decoder_variant: Optional[str] = None,
         **kwargs,
     ):
         self.vocab_size = vocab_size
@@ -183,6 +192,19 @@ class FlashHSAConfig(PretrainedConfig):
         # Base model variant (kept for config compat; OLMo3 post-norm is the only supported path)
         self.base_model = str(kwargs.pop("base_model", "olmo3"))
 
+        # Decoder norm topology. Auto-pick from the source config's model_type
+        # if the caller didn't pass an explicit override. qwen_lhsa -> "qwen"
+        # (pre-norm with {input_layernorm, post_attention_layernorm}); everything
+        # else -> "olmo" (post-norm with {post_attention_layernorm, post_feedforward_layernorm}).
+        if decoder_variant is None:
+            _incoming_mt = str(kwargs.get("model_type", "")).lower()
+            decoder_variant = "qwen" if _incoming_mt == "qwen_lhsa" else "olmo"
+        if decoder_variant not in {"olmo", "qwen"}:
+            raise ValueError(
+                f"FlashHSAConfig: decoder_variant must be 'olmo' or 'qwen', got {decoder_variant!r}"
+            )
+        self.decoder_variant = decoder_variant
+
         # RoPE validation (mirrors HF style)
         if self.rope_scaling is not None and isinstance(self.rope_scaling, dict):
             if "type" in self.rope_scaling and "rope_type" not in self.rope_scaling:
@@ -215,6 +237,8 @@ def _register_flash_hsa_autoconfig() -> None:
             CONFIG_MAPPING.register("flash_hsa_innerx", FlashHSAConfig)
         if "olmo_lhsa" not in CONFIG_MAPPING:
             CONFIG_MAPPING.register("olmo_lhsa", FlashHSAConfig)
+        if "qwen_lhsa" not in CONFIG_MAPPING:
+            CONFIG_MAPPING.register("qwen_lhsa", FlashHSAConfig)
     except Exception:
         # Be conservative: any import/version mismatch should not break SGLang.
         print("[ERROR] Failed to register FlashHSAConfig into Transformers AutoConfig mapping")

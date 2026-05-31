@@ -63,7 +63,11 @@ def _build_official(cfg_dict: dict, device, dtype):
     cfg.pad_token_id = None
     if not hasattr(cfg, 'num_swa_layers'):
         cfg.num_swa_layers = 0
-    return cfg, OfficialModel(cfg).to(device=device, dtype=dtype).eval()
+    # Pick model class by model_type — default is olmo (the 1-layer canonical).
+    cls = OfficialModel
+    if cfg_dict.get('model_type') == 'qwen_lhsa':
+        from models.FlashHSA.modeling_qwen_lhsa import HSAForCausalLM as cls
+    return cfg, cls(cfg).to(device=device, dtype=dtype).eval()
 
 
 def _build_sglang(cfg_dict: dict, device, dtype):
@@ -76,8 +80,13 @@ def _build_sglang(cfg_dict: dict, device, dtype):
     kw['hsa_sliding_window'] = sw
     kw['sliding_window_merging_size'] = sw
     kw['use_sliding_window_merging'] = use_sw
+    # Preserve original model_type before overriding so FlashHSAConfig can
+    # pick the right decoder topology (qwen_lhsa -> pre-norm, else -> post-norm).
+    original_model_type = str(kw.get('model_type', 'olmo_lhsa')).lower()
     kw['model_type'] = 'flash_hsa_innerx'
     kw['architectures'] = ['HSAForCausalLM']
+    if 'decoder_variant' not in kw:
+        kw['decoder_variant'] = 'qwen' if original_model_type == 'qwen_lhsa' else 'olmo'
     cfg = SGConfig(**kw)
     return cfg, SGModel(cfg).to(device=device, dtype=dtype).eval()
 
