@@ -12,6 +12,9 @@ from sglang.srt.layers.attention.hsa.kernels import hsa_decode_paged_fwd
 from sglang.srt.layers.attention.hsa.kernels.chunk_weight import (
     fused_chunk_weight_per_qhead_decode,
 )
+from sglang.srt.layers.attention.hsa.kernels.cuda_graph_buffers import (
+    update_hsa_cg_buffers,
+)
 from sglang.srt.layers.attention.hsa.metadata import HSAMetadata
 from sglang.srt.layers.attention.hsa.selector import (
     _online_topk_group,
@@ -95,6 +98,11 @@ class HSAAttnBackend(AttentionBackend):
         # SWA window and LMK visibility are controlled by per-layer kwargs.
         self.hsa_window_size = None
         self.hsa_enable_swa_merging = False
+
+        # R15: cuda-graph persistent buffers (allocated in init_cuda_graph_state).
+        self._cg_page_table_1 = None
+        self._cg_cache_seqlens_i32 = None
+        self._cg_max_seqlen_k = 0
 
         # Delegate dense attention implementation for now.
         # NOTE: For encoder-decoder models, triton backend is not supported.
@@ -506,6 +514,52 @@ class HSAAttnBackend(AttentionBackend):
         # SWA layers will use these indices directly.
         self._dense_backend.init_forward_metadata(forward_batch)
 
+        # R15: cuda-graph buffer path.  When persistent buffers are allocated
+        # AND we're in decode-or-idle (the only mode cuda graph captures),
+        # write into the buffers via triton kernels so the captured kernel
+        # pointers stay valid across replays.  R10 already makes max_seqlen_k
+        # constant (=graph max) so all derived shapes are stable.
+        if (
+            getattr(self, "_cg_page_table_1", None) is not None
+            and forward_batch.forward_mode.is_decode_or_idle()
+        ):
+            B = int(forward_batch.batch_size)
+            max_seqlen_k = self._cg_max_seqlen_k
+            update_hsa_cg_buffers(
+                bs=B,
+                req_pool_indices=forward_batch.req_pool_indices,
+                seq_lens=forward_batch.seq_lens,
+                req_to_token=forward_batch.req_to_token_pool.req_to_token,
+                page_table_1_buf=self._cg_page_table_1,
+                cache_seqlens_i32_buf=self._cg_cache_seqlens_i32,
+            )
+            page_table_1 = self._cg_page_table_1[:B]
+            cache_seqlens_int32 = self._cg_cache_seqlens_i32[:B]
+            real_page_table = None  # only NSA uses this field
+            dense_md = getattr(self._dense_backend, "forward_metadata", None)
+            self.forward_metadata = HSAMetadata(
+                page_size=self.page_size,
+                cache_seqlens_int32=cache_seqlens_int32,
+                max_seqlen_k=max_seqlen_k,
+                page_table_1=page_table_1,
+                real_page_table=real_page_table,
+                kv_indptr=getattr(dense_md, "kv_indptr", None),
+                kv_indices=getattr(dense_md, "kv_indices", None),
+                window_kv_indptr=getattr(dense_md, "window_kv_indptr", None),
+                window_kv_indices=getattr(dense_md, "window_kv_indices", None),
+                hsa_kv_indptr=None,
+                hsa_kv_indices=None,
+                hsa_kv_lens=None,
+                hsa_num_kv_splits=None,
+                token_positions=None,
+                token_to_seq_id=None,
+                extend_seq_lens=None,
+                extend_prefix_lens=None,
+                engine_indices=None,
+            )
+            return
+
+        # ---- Non-cuda-graph path (extend, or HSA without --cuda-graph-max-bs) ----
         # Build HSA metadata scaffold (paged-KV-first).
         if forward_batch.seq_lens_cpu is not None:
             max_seqlen_k = int(forward_batch.seq_lens_cpu.max().item())
@@ -517,11 +571,7 @@ class HSAAttnBackend(AttentionBackend):
         ]
 
         # R12: overlay out_cache_loc into page_table_1 at position (seq_len - 1)
-        # once per step instead of once per layer.  The advanced indexing above
-        # produces a fresh tensor (not a view), so this is safe to mutate.
-        # Previously _run_selection_decode and forward_decode each cloned +
-        # overlaid page_table_1 per HSA layer; for 16 layers that was 32 clones
-        # of an [1, max_seqlen] tensor per decode step.
+        # once per step instead of once per layer.
         if (
             forward_batch.forward_mode.is_decode_or_idle()
             and getattr(forward_batch, "out_cache_loc", None) is not None
@@ -597,10 +647,29 @@ class HSAAttnBackend(AttentionBackend):
             engine_indices=engine_indices,
         )
 
-    # ---- CUDA graph plumbing: delegate to dense backend for now ----
+    # ---- CUDA graph plumbing (R15) ----
+    # Dense state is still set up via delegation, so kv_indptr / kv_indices
+    # / window_kv_indices are populated by the dense backend.  HSA owns two
+    # extra persistent buffers (page_table_1 + cache_seqlens) so the captured
+    # graph's HSA kernels read from stable addresses; replay-time updates go
+    # in through `update_hsa_cg_buffers` (graph-safe triton kernels — no
+    # intermediate Python allocations).
 
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
-        return self._dense_backend.init_cuda_graph_state(max_bs, max_num_tokens)
+        self._dense_backend.init_cuda_graph_state(max_bs, max_num_tokens)
+
+        max_context_len = int(self.model_runner.model_config.context_len)
+        device = self.device
+
+        # Force max_seqlen_k to graph-max so C_max / cand_* / selected_* all
+        # have stable shapes across captures and replays.
+        self._cg_max_seqlen_k = max_context_len
+        self._cg_page_table_1 = torch.zeros(
+            (max_bs, max_context_len), dtype=torch.int32, device=device
+        )
+        self._cg_cache_seqlens_i32 = torch.zeros(
+            (max_bs,), dtype=torch.int32, device=device
+        )
 
     def init_forward_metadata_capture_cuda_graph(
         self,
@@ -612,7 +681,7 @@ class HSAAttnBackend(AttentionBackend):
         forward_mode: ForwardMode,
         spec_info: Optional[SpecInput],
     ):
-        return self._dense_backend.init_forward_metadata_capture_cuda_graph(
+        self._dense_backend.init_forward_metadata_capture_cuda_graph(
             bs,
             num_tokens,
             req_pool_indices,
@@ -621,6 +690,9 @@ class HSAAttnBackend(AttentionBackend):
             forward_mode,
             spec_info,
         )
+        # HSA buffer contents will be populated when init_forward_metadata is
+        # invoked inside the capture's run_once() — the buffer path in
+        # init_forward_metadata handles it.
 
     def init_forward_metadata_replay_cuda_graph(
         self,
@@ -633,7 +705,7 @@ class HSAAttnBackend(AttentionBackend):
         spec_info: Optional[SpecInput],
         seq_lens_cpu: Optional[torch.Tensor],
     ):
-        return self._dense_backend.init_forward_metadata_replay_cuda_graph(
+        self._dense_backend.init_forward_metadata_replay_cuda_graph(
             bs,
             req_pool_indices,
             seq_lens,
@@ -643,6 +715,16 @@ class HSAAttnBackend(AttentionBackend):
             spec_info,
             seq_lens_cpu,
         )
+        # Update HSA buffers in place (so captured kernels see fresh data).
+        if forward_mode.is_decode_or_idle() and getattr(self, "_cg_page_table_1", None) is not None:
+            update_hsa_cg_buffers(
+                bs=int(bs),
+                req_pool_indices=req_pool_indices,
+                seq_lens=seq_lens,
+                req_to_token=self.model_runner.req_to_token_pool.req_to_token,
+                page_table_1_buf=self._cg_page_table_1,
+                cache_seqlens_i32_buf=self._cg_cache_seqlens_i32,
+            )
 
     def get_cuda_graph_seq_len_fill_value(self):
         return self._dense_backend.get_cuda_graph_seq_len_fill_value()
