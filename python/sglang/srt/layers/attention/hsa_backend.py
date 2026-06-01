@@ -201,18 +201,9 @@ class HSAAttnBackend(AttentionBackend):
         H_sel = int(kv_head_count) if kv_head_count is not None else int(layer.tp_k_head_num)
         device = q.device
 
-        # Overlay out_cache_loc into page_table_1 at position (seq_len - 1).
-        # Vectorised on GPU (R9) — the prior Python loop with `seq_lens[b].item()`
-        # forced a CUDA->CPU sync per HSA layer per decode step.
+        # page_table_1 already has the out_cache_loc overlay applied once per
+        # step in init_forward_metadata (R12).  No per-layer clone needed.
         page_table_1 = md.page_table_1
-        if getattr(forward_batch, "out_cache_loc", None) is not None and B > 0:
-            page_table_1 = page_table_1.clone()
-            out_locs = forward_batch.out_cache_loc[:B].to(torch.int32)
-            seq_lens_i64_b = md.cache_seqlens_int32[:B].to(torch.int64)
-            cap = page_table_1.shape[1] - 1
-            positions = (seq_lens_i64_b - 1).clamp_(min=0, max=cap)
-            batch_idx = torch.arange(B, device=page_table_1.device, dtype=torch.int64)
-            page_table_1[batch_idx, positions] = out_locs
 
         seq_lens_i64 = md.cache_seqlens_int32.to(torch.int64)
 
@@ -521,6 +512,28 @@ class HSAAttnBackend(AttentionBackend):
         page_table_1 = forward_batch.req_to_token_pool.req_to_token[
             forward_batch.req_pool_indices, :max_seqlen_k
         ]
+
+        # R12: overlay out_cache_loc into page_table_1 at position (seq_len - 1)
+        # once per step instead of once per layer.  The advanced indexing above
+        # produces a fresh tensor (not a view), so this is safe to mutate.
+        # Previously _run_selection_decode and forward_decode each cloned +
+        # overlaid page_table_1 per HSA layer; for 16 layers that was 32 clones
+        # of an [1, max_seqlen] tensor per decode step.
+        if (
+            forward_batch.forward_mode.is_decode_or_idle()
+            and getattr(forward_batch, "out_cache_loc", None) is not None
+        ):
+            B = int(forward_batch.batch_size)
+            if B > 0:
+                out_locs = forward_batch.out_cache_loc[:B].to(torch.int32)
+                seq_lens_i64 = forward_batch.seq_lens[:B].to(torch.int64)
+                cap = page_table_1.shape[1] - 1
+                positions = (seq_lens_i64 - 1).clamp_(min=0, max=cap)
+                batch_idx = torch.arange(
+                    B, device=page_table_1.device, dtype=torch.int64
+                )
+                page_table_1[batch_idx, positions] = out_locs
+
         real_page_table = transform_page_table_1_to_real(page_table_1, self.page_size)
 
         dense_md = getattr(self._dense_backend, "forward_metadata", None)
@@ -701,22 +714,9 @@ class HSAAttnBackend(AttentionBackend):
                 "HSAAttnBackend.hsa_decode_paged_fwd currently assumes qk_head_dim == v_head_dim."
             )
 
-        # Robustness: overlay out_cache_loc into a temporary token->slot table at position (seq_len - 1).
-        # Vectorised on GPU — the previous Python loop with `seq_lens[b].item()` forced a
-        # CUDA->CPU sync per layer per decode step, breaking cuda-graph batching and
-        # adding ~10-30us per sync × 16 layers = the bulk of HSA's per-step Python overhead.
+        # page_table_1 already has the out_cache_loc overlay applied once per
+        # step in init_forward_metadata (R12).
         page_table_1 = md.page_table_1
-        if getattr(forward_batch, "out_cache_loc", None) is not None:
-            B = int(forward_batch.batch_size)
-            if B > 0:
-                page_table_1 = page_table_1.clone()
-                out_locs = forward_batch.out_cache_loc[:B].to(torch.int32)
-                # positions[b] = seq_lens[b] - 1, clamped into valid index range.
-                seq_lens_i64 = md.cache_seqlens_int32[:B].to(torch.int64)
-                cap = page_table_1.shape[1] - 1
-                positions = (seq_lens_i64 - 1).clamp_(min=0, max=cap)
-                batch_idx = torch.arange(B, device=page_table_1.device, dtype=torch.int64)
-                page_table_1[batch_idx, positions] = out_locs
 
         # ---- InnerX split-head HSA (ultra reference) ----
         # In this mode, the layer output is a head-wise concatenation:
