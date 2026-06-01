@@ -671,17 +671,21 @@ class HSAAttnBackend(AttentionBackend):
             )
 
         # Robustness: overlay out_cache_loc into a temporary token->slot table at position (seq_len - 1).
+        # Vectorised on GPU — the previous Python loop with `seq_lens[b].item()` forced a
+        # CUDA->CPU sync per layer per decode step, breaking cuda-graph batching and
+        # adding ~10-30us per sync × 16 layers = the bulk of HSA's per-step Python overhead.
         page_table_1 = md.page_table_1
         if getattr(forward_batch, "out_cache_loc", None) is not None:
-            seq_lens_i64 = md.cache_seqlens_int32.to(torch.int64)
             B = int(forward_batch.batch_size)
             if B > 0:
                 page_table_1 = page_table_1.clone()
                 out_locs = forward_batch.out_cache_loc[:B].to(torch.int32)
-                for b in range(B):
-                    seqlen = int(seq_lens_i64[b].item())
-                    if seqlen > 0 and seqlen <= page_table_1.shape[1]:
-                        page_table_1[b, seqlen - 1] = out_locs[b]
+                # positions[b] = seq_lens[b] - 1, clamped into valid index range.
+                seq_lens_i64 = md.cache_seqlens_int32[:B].to(torch.int64)
+                cap = page_table_1.shape[1] - 1
+                positions = (seq_lens_i64 - 1).clamp_(min=0, max=cap)
+                batch_idx = torch.arange(B, device=page_table_1.device, dtype=torch.int64)
+                page_table_1[batch_idx, positions] = out_locs
 
         # ---- InnerX split-head HSA (ultra reference) ----
         # In this mode, the layer output is a head-wise concatenation:
