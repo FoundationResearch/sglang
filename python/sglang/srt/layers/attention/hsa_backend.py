@@ -9,6 +9,9 @@ import torch
 
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.hsa.kernels import hsa_decode_paged_fwd
+from sglang.srt.layers.attention.hsa.kernels.chunk_weight import (
+    fused_chunk_weight_per_qhead_decode,
+)
 from sglang.srt.layers.attention.hsa.metadata import HSAMetadata
 from sglang.srt.layers.attention.hsa.selector import (
     _online_topk_group,
@@ -844,32 +847,19 @@ class HSAAttnBackend(AttentionBackend):
             )
 
             if per_qhead_fusion and hsa_window > 0:
-                # GQA-broadcast valid mask from h_kv to h_q.
-                valid_hq = valid.unsqueeze(2).expand(B, H_hsa, Gh, TOPK).reshape(B, HQ_hsa, TOPK)
-                scores_hq = per_qhead_scores.masked_fill(~valid_hq, float("-inf"))
-                if not self.enable_softmax1:
-                    cat_scores = torch.cat(
-                        [scores_hq, per_qhead_lse.unsqueeze(-1)], dim=-1
-                    )  # [B, HQ_hsa, K+1]
-                    swa_weight_idx = -1
-                else:
-                    cat_scores = torch.cat(
-                        [
-                            scores_hq,
-                            per_qhead_lse.unsqueeze(-1),
-                            torch.zeros(B, HQ_hsa, 1, device=scores_hq.device, dtype=scores_hq.dtype),
-                        ],
-                        dim=-1,
-                    )  # [B, HQ_hsa, K+2]
-                    swa_weight_idx = -2
-                merged_w = torch.softmax(cat_scores, dim=-1)
-                merged_w = torch.nan_to_num(merged_w, nan=0.0)
-                w_q = merged_w[:, :, :TOPK].to(q_hsa.dtype).contiguous()  # already h_q
-                # The SWA weight is per-q-head; aggregate to h_kv by mean
-                # only when we still need to feed an h_kv-shaped swa_w for
-                # the SWA blending downstream.  But the official applies
-                # swa_w per q-head: keep h_q.
-                swa_w_q = merged_w[:, :, swa_weight_idx]  # [B, HQ_hsa]
+                # R13: fused chunk-weight softmax (8 ops -> 1 triton kernel).
+                # Replaces masked_fill + expand/reshape + cat + softmax +
+                # nan_to_num + slice + contiguous + cast.
+                w_q, swa_w_q = fused_chunk_weight_per_qhead_decode(
+                    per_qhead_scores=per_qhead_scores,
+                    per_qhead_lse=per_qhead_lse,
+                    selected_page_ids=selected_page_ids.to(torch.int32).contiguous()
+                    if selected_page_ids.dtype != torch.int32 or not selected_page_ids.is_contiguous()
+                    else selected_page_ids,
+                    Gh=Gh,
+                    enable_softmax1=bool(self.enable_softmax1),
+                    out_dtype=q_hsa.dtype,
+                )
                 swa_w_kv = None  # signal: use swa_w_q downstream
             elif hsa_window > 0:
                 # Legacy h_kv fusion + broadcast (shared-K path).
