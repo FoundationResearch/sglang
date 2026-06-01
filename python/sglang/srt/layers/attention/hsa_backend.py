@@ -450,23 +450,33 @@ class HSAAttnBackend(AttentionBackend):
         token_locs = torch.gather(page_table_1.to(torch.int64), 1, tok_pos_safe)  # [B, W]
 
         # Slice HSA kv-heads from the cache *before* the gather to cut memory traffic.
+        # R16: keep K/V in their native bf16 dtype so the einsum picks tensor-core
+        # GEMM (nvjet_tst_*) instead of the float32 simt cutlass kernel.  We
+        # cast Q to bf16 too (it's already bf16 upstream) and only promote to
+        # fp32 right after the matmul for the softmax/logsumexp where precision
+        # actually matters.  At decode this turns the 10.7us cutlass3x_sm100_simt_sgemm
+        # call (per layer, fp32 simt) into a sub-2us nvjet_tst (bf16 tensor core).
         k_hsa = k_cache_all[:, H_swa : H_swa + H_hsa, :]  # [num_locs, H_hsa, D]
         v_hsa = v_cache_all[:, H_swa : H_swa + H_hsa, :]
         flat_locs = token_locs.reshape(-1)  # [B*W]
-        k_win = k_hsa[flat_locs].view(B, W, H_hsa, D).to(torch.float32)  # [B, W, H_hsa, D]
-        v_win = v_hsa[flat_locs].view(B, W, H_hsa, D).to(torch.float32)
+        k_win = k_hsa[flat_locs].view(B, W, H_hsa, D)  # [B, W, H_hsa, D] (bf16)
+        v_win = v_hsa[flat_locs].view(B, W, H_hsa, D)  # bf16
 
-        # Q: [B, HQ_hsa, D] -> [B, H_hsa, Gh, D]
-        q_hgd = q_hsa.view(B, H_hsa, Gh, D).to(torch.float32)
+        # Q: [B, HQ_hsa, D] -> [B, H_hsa, Gh, D]  (bf16)
+        q_hgd = q_hsa.view(B, H_hsa, Gh, D)
 
-        # Logits: [B, H_hsa, Gh, W]
-        logits = torch.einsum("bhgd,bwhd->bhgw", q_hgd, k_win) * sm_scale
+        # Logits in fp32 (einsum auto-promotes); use tensor-core bf16 GEMM
+        # internally because both operands are bf16.
+        logits = torch.einsum("bhgd,bwhd->bhgw", q_hgd, k_win).to(torch.float32) * sm_scale
         logits = logits.masked_fill(~valid_mask[:, None, None, :], float("-inf"))
 
-        lse_per_q = torch.logsumexp(logits, dim=-1)  # [B, H_hsa, Gh]
-        p = torch.softmax(logits, dim=-1)            # [B, H_hsa, Gh, W]
+        lse_per_q = torch.logsumexp(logits, dim=-1)  # [B, H_hsa, Gh] fp32
+        p = torch.softmax(logits, dim=-1)            # [B, H_hsa, Gh, W] fp32
         p = torch.nan_to_num(p, nan=0.0)
-        o = torch.einsum("bhgw,bwhd->bhgd", p, v_win)  # [B, H_hsa, Gh, D]
+        # Cast attention weights back to bf16 for the P @ V tensor-core GEMM.
+        o = torch.einsum("bhgw,bwhd->bhgd", p.to(v_win.dtype), v_win).to(torch.float32)
+        # ^ [B, H_hsa, Gh, D] fp32 to preserve precision in the final swa_o output
+        #   (which feeds back into the blend below).
 
         swa_o = o.reshape(B, HQ_hsa, D)
         lse_kv = torch.logsumexp(lse_per_q, dim=-1)  # [B, H_hsa]
