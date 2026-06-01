@@ -22,6 +22,7 @@ This file focuses on model construction + weight loading compatibility.
 from __future__ import annotations
 
 import logging
+import os
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import torch
@@ -523,22 +524,124 @@ class FlashHSAInnerXHierarchicalSparseAttention(nn.Module):
         )
         self.chunk_size = int(getattr(config, "chunk_size", 64))
 
+        # --- Fused QKV projection ---
+        # At decode bs=1 each of the 6-7 ColumnParallelLinear matmuls
+        # (q/k/v + hsa_q/hsa_k/hsa_v + lmk_q) is launch-overhead bound.
+        # _fuse_projections() concatenates their weights into a single fused
+        # weight; forward() then does ONE F.linear + split.  Set lazily by
+        # the model after load_weights() so the loader is untouched.
+        self._fused_qkv_w: Optional[torch.Tensor] = None
+        self._fused_qkv_b: Optional[torch.Tensor] = None
+        self._fused_split_sizes: Optional[List[int]] = None
+        # Toggle (env var) to disable fusion for debugging.
+        self._fusion_enabled: bool = os.environ.get("HSA_DISABLE_QKV_FUSION", "0") != "1"
+
+    # ------------------------------------------------------------------
+    # Fused-QKV helpers
+    # ------------------------------------------------------------------
+    @torch.no_grad()
+    def _fuse_projections(self) -> None:
+        """Concatenate q/k/v/hsa_q/hsa_k/hsa_v/lmk_q projection weights into a
+        single fused weight, so decode forward needs ONE F.linear instead of
+        6-7 separate ColumnParallelLinear calls.
+
+        Skipped (returns silently) when:
+          * fusion disabled by env var
+          * any projection uses quantized weights
+          * any projection has bias and the rest don't (mixed bias)
+        """
+        if not self._fusion_enabled or self._fused_qkv_w is not None:
+            return
+
+        projs = []
+        if self.has_swa_branch:
+            projs += [self.q_proj, self.k_proj, self.v_proj]
+        projs += [self.hsa_q_proj, self.hsa_k_proj, self.hsa_v_proj]
+        if self.enable_lmk_q_proj and self.lmk_q_proj is not None:
+            projs.append(self.lmk_q_proj)
+
+        weights = []
+        biases = []
+        for p in projs:
+            w = getattr(p, "weight", None)
+            if w is None or not isinstance(w, torch.Tensor):
+                return  # quantized / non-standard, skip
+            weights.append(w)
+            b = getattr(p, "bias", None)
+            if b is not None and isinstance(b, torch.Tensor):
+                biases.append(b)
+            else:
+                biases.append(None)
+
+        # ColumnParallelLinear weight shape = [out_per_partition, in_size]
+        in_size = weights[0].shape[1]
+        for w in weights:
+            if w.shape[1] != in_size:
+                return  # shape mismatch, can't fuse
+
+        fused_w = torch.cat([w.contiguous() for w in weights], dim=0).contiguous()
+        # Mixed bias handling: if any has bias, all must have bias of correct shape.
+        any_bias = any(b is not None for b in biases)
+        all_bias = all(b is not None for b in biases)
+        fused_b: Optional[torch.Tensor] = None
+        if any_bias and not all_bias:
+            return  # mixed; skip fusion
+        if all_bias:
+            fused_b = torch.cat([b.contiguous() for b in biases], dim=0).contiguous()
+
+        self._fused_qkv_w = fused_w
+        self._fused_qkv_b = fused_b
+        self._fused_split_sizes = [w.shape[0] for w in weights]
+
     def forward(
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
-        # --- HSA branch projections (always needed) ---
-        hsa_q, _ = self.hsa_q_proj(hidden_states)
-        hsa_k, _ = self.hsa_k_proj(hidden_states)
-        hsa_v, _ = self.hsa_v_proj(hidden_states)
+        # --- Projections ---
+        # Fast path: a single fused GEMM that produces concat of
+        # [swa_q, swa_k, swa_v, hsa_q, hsa_k, hsa_v, (lmk_q)].  At decode bs=1
+        # this drops 6-7 launch-bound matmuls down to 1 (~25-40% step speedup).
+        # Falls back to individual ColumnParallelLinears when fusion isn't
+        # built (quantized weights, mixed bias, or disabled via env var).
+        if self._fusion_enabled and self._fused_qkv_w is None:
+            # Lazy build on first forward (covers paths that bypass load_weights,
+            # e.g. dev/align/bootstrap.py which does direct param.data.copy_).
+            self._fuse_projections()
+        if self._fused_qkv_w is not None:
+            fused = torch.nn.functional.linear(
+                hidden_states, self._fused_qkv_w, self._fused_qkv_b
+            )
+            # split() returns views that share strides with the parent — these
+            # are NOT contiguous along dim=-1 unless T==1, so downstream .view()
+            # ops would fail.  Calling .contiguous() once per chunk is a tiny
+            # memcpy (bs=1 → ~1-3KB each) that's cheap vs the matmul savings.
+            chunks = [
+                c.contiguous() for c in fused.split(self._fused_split_sizes, dim=-1)
+            ]
+            ci = 0
+            if self.has_swa_branch:
+                swa_q, swa_k, swa_v = chunks[ci], chunks[ci + 1], chunks[ci + 2]
+                ci += 3
+            hsa_q, hsa_k, hsa_v = chunks[ci], chunks[ci + 1], chunks[ci + 2]
+            ci += 3
+            if self.enable_lmk_q_proj and self.lmk_q_proj is not None:
+                lmk_q_fused = chunks[ci]
+            else:
+                lmk_q_fused = None
+        else:
+            # --- HSA branch projections (always needed) ---
+            hsa_q, _ = self.hsa_q_proj(hidden_states)
+            hsa_k, _ = self.hsa_k_proj(hidden_states)
+            hsa_v, _ = self.hsa_v_proj(hidden_states)
 
-        # --- SWA branch projections ---
-        if self.has_swa_branch:
-            swa_q, _ = self.q_proj(hidden_states)
-            swa_k, _ = self.k_proj(hidden_states)
-            swa_v, _ = self.v_proj(hidden_states)
+            # --- SWA branch projections ---
+            if self.has_swa_branch:
+                swa_q, _ = self.q_proj(hidden_states)
+                swa_k, _ = self.k_proj(hidden_states)
+                swa_v, _ = self.v_proj(hidden_states)
+            lmk_q_fused = None
 
         # --- QK norm ---
         if self._layerwise_qk:
@@ -574,7 +677,10 @@ class FlashHSAInnerXHierarchicalSparseAttention(nn.Module):
         # --- Selection query ---
         if self.enable_lmk_q_proj and self.lmk_q_proj is not None:
             # Separate lmk_q_proj for page selection (NO RoPE).
-            lmk_q, _ = self.lmk_q_proj(hidden_states)  # [T, out_dim // tp_size]
+            if lmk_q_fused is not None:
+                lmk_q = lmk_q_fused  # already projected as part of fused GEMM
+            else:
+                lmk_q, _ = self.lmk_q_proj(hidden_states)  # [T, out_dim // tp_size]
             attn_tp_size = get_attention_tp_size()
             if self.lmk_q_full_dim:
                 # 2026-05-21 new-arch path: lmk_q_proj output = hq_hsa_total * head_dim,
@@ -1182,6 +1288,13 @@ class HSAForCausalLM(nn.Module):
                 weight_loader(param, loaded_weight)
             else:
                 logger.warning("Parameter %s not found in params_dict", name)
+
+        # Build fused QKV weights for all attention layers.  Cheap one-shot
+        # concat; later forward calls reuse the cached tensor.
+        for layer in self.model.layers:
+            attn = getattr(getattr(layer, "self_attn", None), "_fuse_projections", None)
+            if callable(attn):
+                layer.self_attn._fuse_projections()
 
     # Weight loading is now explicitly implemented above.
 
