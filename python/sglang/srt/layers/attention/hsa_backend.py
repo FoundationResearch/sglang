@@ -439,7 +439,11 @@ class HSAAttnBackend(AttentionBackend):
             # weight fusion that matches the official layer line 782.
             lse_hq[b] = lse_per_q.reshape(HQ_hsa)
 
-        self._last_swa_lse_hq_decode = lse_hq
+        # Match official lhsa_layer.py:625 — lse_sum.to(hidden_states.dtype)
+        # casts the per-q-head LSE to bf16 before it feeds the chunk_weight
+        # softmax.  Keeping fp32 here would give us MORE precision than the
+        # reference and cause a small consistent drift in cat_scores.
+        self._last_swa_lse_hq_decode = lse_hq.to(q_hsa.dtype)
         return swa_o, lse_kv
 
     def _build_hsa_lmk_excluded_indices(self, forward_batch: ForwardBatch):
@@ -914,6 +918,12 @@ class HSAAttnBackend(AttentionBackend):
     # ---- Extend helpers (production + reference) ----
 
     _USE_EXTEND_REFERENCE = os.getenv("SGLANG_HSA_EXTEND_REFERENCE", "0") == "1"
+    # Independent SWA-only reference toggle (used to bisect whether the
+    # remaining alignment gap is in the triton extend SWA kernel or in the
+    # HSA aggregation kernel).  When True it overrides the SWA path
+    # specifically while leaving selection + HSA aggregation on the
+    # production path (so per-q-head fixes still apply).
+    _USE_SWA_EXTEND_REFERENCE = os.getenv("SGLANG_HSA_SWA_REFERENCE", "0") == "1"
 
     def _compute_internal_swa_extend(
         self,
@@ -928,7 +938,7 @@ class HSAAttnBackend(AttentionBackend):
         hsa_window: int,
     ) -> tuple:
         """Dispatch to batched (production) or reference implementation."""
-        if self._USE_EXTEND_REFERENCE:
+        if self._USE_EXTEND_REFERENCE or self._USE_SWA_EXTEND_REFERENCE:
             return self._compute_internal_swa_extend_reference(
                 q_hsa=q_hsa, layer=layer, forward_batch=forward_batch,
                 page_table_1=page_table_1, H_swa=H_swa, H_hsa=H_hsa,
@@ -1121,7 +1131,8 @@ class HSAAttnBackend(AttentionBackend):
 
         # Stash per-q-head LSE for the per-q-head fusion path (qwen-LHSA).
         # lse_raw is already shape [T, HQ_hsa] which is what the fusion needs.
-        self._last_swa_lse_hq_extend = lse_raw
+        # Cast to q dtype to match the official lhsa_layer.py:625 behaviour.
+        self._last_swa_lse_hq_extend = lse_raw.to(q_hsa.dtype)
 
         return swa_o, lse_kv
 
@@ -1177,6 +1188,9 @@ class HSAAttnBackend(AttentionBackend):
         if engine_indices is None:
             return swa_o, lse_kv
 
+        # Per-q-head LSE (h_q-shape) for the per-q-head fusion path.
+        lse_hq = torch.full((T, HQ_hsa), float("-inf"), device=device, dtype=torch.float32)
+
         for t in range(T):
             eng_idx = int(engine_indices[t].item())
             b = int(token_to_seq_id[t].item())
@@ -1210,7 +1224,11 @@ class HSAAttnBackend(AttentionBackend):
 
             # Aggregate logsumexp across GQA groups → per-kv-head.
             lse_kv[t] = torch.logsumexp(lse_per_q, dim=-1)
+            # Per-q-head LSE for the per-q-head fusion path (matches the
+            # batched variant's stash so the fusion code finds it).
+            lse_hq[t] = lse_per_q.reshape(HQ_hsa)
 
+        self._last_swa_lse_hq_extend = lse_hq.to(q_hsa.dtype)
         return swa_o, lse_kv
 
     def _run_selection_extend(
