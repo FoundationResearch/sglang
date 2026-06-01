@@ -363,6 +363,74 @@ def select_topk_pages_decode_fused(
         result._per_qhead_scores = scores_hq.to(torch.float32)  # [B, h_q, K]
         return result
 
+    # R14: decode fast path — when q has a single query token (q_4d.shape[1]==1),
+    # the tilelang `_online_topk_group` kernel uses (1, h_kv, B) thread blocks
+    # × BLOCK_L=32 threads each, leaving the GB200 ~99% idle.  Plain torch
+    # matmul + topk runs in <1 ms vs the tilelang kernel's 26 ms+ at long
+    # context, and the math is identical (same q.sum-over-G semantics, same
+    # softmax-scale, same ascending-sorted topk).
+    if q_4d.shape[1] == 1 and G is None:  # G>1 path was already handled above
+        import math as _m
+        B_d = q_4d.shape[0]
+        HQ_d = q_4d.shape[2]
+        D_d = q_4d.shape[3]
+        C_d = cand_repr.shape[1]
+        H_sel_d = cand_repr.shape[2]
+
+        # Match `OnlineTopKUnifiedFn.forward` GQA semantics:
+        #   h_q >= h_kv -> sum q over G
+        #   h_q <  h_kv -> sum lmks over G
+        if HQ_d >= H_sel_d:
+            assert HQ_d % H_sel_d == 0
+            G_grp = HQ_d // H_sel_d
+            q_grouped = (
+                q_4d.view(B_d, 1, H_sel_d, G_grp, D_d).sum(dim=3).squeeze(1)
+            )  # [B, h_kv, D]
+            lmks_for_score = cand_repr  # [B, C, h_kv, D]
+        else:
+            assert H_sel_d % HQ_d == 0
+            G_grp = H_sel_d // HQ_d
+            lmks_for_score = cand_repr.view(B_d, C_d, HQ_d, G_grp, D_d).sum(dim=3)
+            q_grouped = q_4d.squeeze(1)  # [B, HQ, D]
+
+        h_shared = q_grouped.shape[1]
+        sm_scale_d = float(sm_scale) if sm_scale is not None else (1.0 / _m.sqrt(D_d))
+        # scores: [B, h_shared, C]
+        scores_d = torch.einsum("bhd,bchd->bhc", q_grouped, lmks_for_score) * sm_scale_d
+        scores_d = scores_d.masked_fill(~cand_mask.unsqueeze(1), float("-inf"))
+
+        eff_topk = min(int(topk), int(C_d))
+        top_scores_d, top_idx_d = scores_d.topk(eff_topk, dim=-1)  # [B, h_shared, K]
+        # Sort selected indices ascending (matches kernel's sort_kernel output).
+        idx_sorted_d, sort_perm = torch.sort(top_idx_d, dim=-1)
+        scores_sorted_d = torch.gather(top_scores_d, dim=-1, index=sort_perm)
+
+        # Pad to topk if fewer candidates than topk.
+        if eff_topk < int(topk):
+            pad_n = int(topk) - eff_topk
+            idx_sorted_d = torch.cat(
+                [idx_sorted_d,
+                 idx_sorted_d.new_full((B_d, h_shared, pad_n), -1)],
+                dim=-1,
+            )
+            scores_sorted_d = torch.cat(
+                [scores_sorted_d,
+                 scores_sorted_d.new_full((B_d, h_shared, pad_n), float("-inf"))],
+                dim=-1,
+            )
+
+        selected_page_ids_d = idx_sorted_d.to(torch.int32)
+        selected_page_ids_d = selected_page_ids_d.masked_fill(
+            scores_sorted_d == float("-inf"), -1
+        )
+
+        return HSASelectionResult(
+            cand_page_ids=cand_page_ids,
+            cand_mask=cand_mask,
+            selected_page_ids=selected_page_ids_d,
+            selected_scores=scores_sorted_d.to(torch.float32),
+        )
+
     fused_indices, fused_scores = _online_topk_group(
         q=q_4d,
         lmks=cand_repr,
