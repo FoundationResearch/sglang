@@ -373,17 +373,31 @@ def transfer_official_to_sglang(src, dst):
             else:
                 skipped.append(name)
         elif name.endswith('.lmk_q_proj.weight'):
-            # Official may use a LoRA Sequential(Linear down, Linear up); sglang
-            # has a single Linear. Compose W_sgl = up.weight @ down.weight (shape
-            # [out, in]) which gives an identical forward y = x @ W_sgl.T to
-            # y = up(down(x)).
+            # Official may use a LoRA Sequential(Linear down, Linear up).  When
+            # ``lmk_q_lora_dim > 0`` the official ALSO adds the hsa_q (=q_proj)
+            # output as a residual: ``lmk_q = up(down(x)) + q_proj(x)``
+            # (see lhsa_layer.py:538-539).  So the equivalent single-Linear
+            # weight that sglang's lmk_q_proj needs is:
+            #     W_sgl_lmk_q  =  (W_up @ W_down)  +  W_q_official
+            # Without the residual, the lmk_q_norm input is wrong and a
+            # ~10% mean shift propagates through every layer (drives the
+            # KL=0.32 layer-0 divergence we were chasing).
             base = name[: -len('.weight')]
             down_k = base + '.0.weight'
             up_k = base + '.1.weight'
             if down_k in ssd and up_k in ssd:
                 w_down = ssd[down_k]                                # (lora, in)
                 w_up = ssd[up_k]                                    # (out, lora)
-                w_composed = (w_up @ w_down).to(param.dtype)        # (out, in)
+                # In sglang ``base`` is e.g. ``model.layers.0.self_attn.lmk_q_proj``;
+                # the residual q comes from official's q_proj for the same layer.
+                q_proj_official_key = (
+                    base.rsplit('.lmk_q_proj', 1)[0] + '.q_proj.weight'
+                )
+                w_q_residual = ssd.get(q_proj_official_key)
+                w_composed = (w_up @ w_down)                        # (out, in)
+                if w_q_residual is not None and w_q_residual.shape == w_composed.shape:
+                    w_composed = w_composed + w_q_residual
+                w_composed = w_composed.to(param.dtype)
                 if w_composed.shape == param.shape:
                     param.data.copy_(w_composed)
                     loaded += 1
@@ -398,11 +412,25 @@ def transfer_official_to_sglang(src, dst):
 
 def force_native_rmsnorm(model):
     """sgl_kernel's bf16 RMSNorm CUDA kernel has a numerical bug; force the
-    native (PyTorch) path on every RMSNorm."""
+    native (PyTorch) path on every RMSNorm.
+
+    Also set ``cast_x_before_out_mul=True`` so the final multiplication by
+    the norm weight happens in input dtype (bf16) rather than the default
+    fp32-mul-then-cast.  This matches the official Qwen3/Olmo3 RMSNorm
+    convention (``return weight * x.to(input_dtype)``) bit-for-bit.  Without
+    this flip, sglang accumulates the weight multiply in fp32 and only casts
+    at the end — strictly more precise than the reference, which actually
+    HURTS alignment (KL drifts because the bf16 rounding diverges from the
+    reference's bf16 rounding at every norm in every layer).
+    """
     from sglang.srt.layers.layernorm import RMSNorm as _RMSNorm
+    n = 0
     for m in model.modules():
         if isinstance(m, _RMSNorm):
             m._forward_method = m.forward_native
+            m.cast_x_before_out_mul = True
+            n += 1
+    print(f'[force_native_rmsnorm] patched {n} RMSNorm modules (cast_x_before_out_mul=True)', flush=True)
 
 
 __all__ = [
