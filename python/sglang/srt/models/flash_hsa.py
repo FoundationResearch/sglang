@@ -240,15 +240,57 @@ class FlashHSAInnerXAttention(nn.Module):
             prefix=add_prefix("attn", prefix),
         )
 
+        # --- Fused QKV (3 separate matmuls → 1) ---
+        # Same launch-overhead motivation as the HSA variant below.  Built lazily
+        # on first forward (also called from load_weights() for safety).
+        self._fused_qkv_w: Optional[torch.Tensor] = None
+        self._fused_qkv_b: Optional[torch.Tensor] = None
+        self._fused_split_sizes: Optional[List[int]] = None
+        self._fusion_enabled: bool = os.environ.get("HSA_DISABLE_QKV_FUSION", "0") != "1"
+
+    @torch.no_grad()
+    def _fuse_projections(self) -> None:
+        if not self._fusion_enabled or self._fused_qkv_w is not None:
+            return
+        projs = [self.q_proj, self.k_proj, self.v_proj]
+        weights, biases = [], []
+        for p in projs:
+            w = getattr(p, "weight", None)
+            if w is None or not isinstance(w, torch.Tensor):
+                return
+            weights.append(w)
+            b = getattr(p, "bias", None)
+            biases.append(b if (b is not None and isinstance(b, torch.Tensor)) else None)
+        in_size = weights[0].shape[1]
+        for w in weights:
+            if w.shape[1] != in_size:
+                return
+        any_b, all_b = any(b is not None for b in biases), all(b is not None for b in biases)
+        if any_b and not all_b:
+            return
+        self._fused_qkv_w = torch.cat([w.contiguous() for w in weights], dim=0).contiguous()
+        self._fused_qkv_b = (
+            torch.cat([b.contiguous() for b in biases], dim=0).contiguous() if all_b else None
+        )
+        self._fused_split_sizes = [w.shape[0] for w in weights]
+
     def forward(
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
-        q, _ = self.q_proj(hidden_states)
-        k, _ = self.k_proj(hidden_states)
-        v, _ = self.v_proj(hidden_states)
+        if self._fusion_enabled and self._fused_qkv_w is None:
+            self._fuse_projections()
+        if self._fused_qkv_w is not None:
+            fused = torch.nn.functional.linear(
+                hidden_states, self._fused_qkv_w, self._fused_qkv_b
+            )
+            q, k, v = (c.contiguous() for c in fused.split(self._fused_split_sizes, dim=-1))
+        else:
+            q, _ = self.q_proj(hidden_states)
+            k, _ = self.k_proj(hidden_states)
+            v, _ = self.v_proj(hidden_states)
 
         # OLMo3 full-tensor QK norm: all-gather → norm → split (matches OLMo2).
         if self.tp_size > 1:
@@ -1289,12 +1331,13 @@ class HSAForCausalLM(nn.Module):
             else:
                 logger.warning("Parameter %s not found in params_dict", name)
 
-        # Build fused QKV weights for all attention layers.  Cheap one-shot
-        # concat; later forward calls reuse the cached tensor.
+        # Build fused QKV weights for all attention layers (both dense and HSA
+        # variants implement _fuse_projections).  Cheap one-shot concat; later
+        # forward calls reuse the cached tensor.
         for layer in self.model.layers:
-            attn = getattr(getattr(layer, "self_attn", None), "_fuse_projections", None)
-            if callable(attn):
-                layer.self_attn._fuse_projections()
+            attn = getattr(layer, "self_attn", None)
+            if attn is not None and callable(getattr(attn, "_fuse_projections", None)):
+                attn._fuse_projections()
 
     # Weight loading is now explicitly implemented above.
 
