@@ -19,9 +19,34 @@ Both branches run on the same per-step path — no cuda-graph amortisation
 either side, single GB200, batch=1, 345M apples-to-apples (qwen_lhsa vs
 qwen3, same 16L / 16q / 2kv / hidden=1024 / head_dim=64 arch).
 
+### Post-R14 (selector decode fast path)
+
 ```
 Length   HSA Pf(s)  Dense Pf(s)  Pf ratio   HSA Dc(ms)  Dense Dc(ms)  Dc ratio
                                   (>1 means HSA faster)
+-----------------------------------------------------------------------------
+  8K       1.80        0.52       0.29×        51            9         0.18×
+ 32K       2.05        0.71       0.35×        51           11         0.22×
+128K       3.36        3.58      *1.07×*       49           18         0.37×
+256K       4.33       17.77      *4.10×*       55           34         0.62×
+512K      15.31       73.82      *4.82×*       47           66        *1.40×*
+```
+
+**HSA decode is now O(1) in context length** (~50 ms regardless of context):
+the tilelang topk kernel was prefill-tuned (1×h_kv×B thread blocks for
+decode = <1% GPU utilisation), so R14 swapped in a plain torch matmul +
+topk fast path for the q_seq_len == 1 case.  Selector cost shifted from
+the 26 ms/layer serial scan to a single batched matmul + topk that
+finishes in microseconds.
+
+**512K decode now reverses dense — 1.40× faster.**  Combined with the
+pre-existing 4.82× prefill reversal at 512K, HSA is faster than dense
+on both phases at long context.
+
+### Pre-R14 (selector tilelang kernel)
+
+```
+Length   HSA Pf(s)  Dense Pf(s)  Pf ratio   HSA Dc(ms)  Dense Dc(ms)  Dc ratio
 -----------------------------------------------------------------------------
   8K       2.05        0.73       0.36×        90           11         0.13×
  32K       2.38        1.97       0.83×       159           11         0.07×
