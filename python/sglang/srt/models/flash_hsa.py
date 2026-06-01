@@ -39,6 +39,7 @@ from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
 )
 from sglang.srt.layers.layernorm import RMSNorm
+from sglang.srt.layers.elementwise import fused_post_norm_add
 from sglang.srt.layers.linear import ColumnParallelLinear, MergedColumnParallelLinear, RowParallelLinear
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
@@ -1142,6 +1143,16 @@ class FlashHSAInnerXDecoderLayer(nn.Module):
         else:  # qwen
             self.input_layernorm = RMSNorm(self.hidden_size, eps=rms_norm_eps)
 
+        # Enable the custom triton fused_post_norm_add kernel for the olmo
+        # branch when it's safe (no RMSNorm special modes that would change
+        # numerics).  Disable via HSA_DISABLE_POST_NORM_FUSION=1.
+        _has_rl_target = get_global_server_args().rl_on_policy_target is not None
+        self._use_fused_post_norm = (
+            self.decoder_variant == "olmo"
+            and os.environ.get("HSA_DISABLE_POST_NORM_FUSION", "0") != "1"
+            and not _has_rl_target
+        )
+
     def forward(
         self,
         positions: torch.Tensor,
@@ -1150,22 +1161,39 @@ class FlashHSAInnerXDecoderLayer(nn.Module):
         residual: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         if self.decoder_variant == "olmo":
-            # OLMo3 post-norm — pattern is `residual + norm(attn|mlp(x))`, which
-            # doesn't fit the standard fused_add_rmsnorm (it implements
-            # `norm(x + residual)`).  Keep the explicit add for now.
+            # OLMo3 post-norm — pattern is `residual + norm(x)`.  flashinfer's
+            # fused_add_rmsnorm does `norm(x+residual)` so it doesn't fit, but
+            # our triton fused_post_norm_add does exactly this pattern in a
+            # single kernel (saves the explicit add launch).
             residual = hidden_states
             hidden_states = self.self_attn(
                 positions=positions,
                 hidden_states=hidden_states,
                 forward_batch=forward_batch,
             )
-            hidden_states = self.post_attention_layernorm(hidden_states)
-            hidden_states = hidden_states + residual
+            if self._use_fused_post_norm:
+                hidden_states = fused_post_norm_add(
+                    hidden_states,
+                    residual,
+                    self.post_attention_layernorm.weight,
+                    self.post_attention_layernorm.variance_epsilon,
+                )
+            else:
+                hidden_states = self.post_attention_layernorm(hidden_states)
+                hidden_states = hidden_states + residual
 
             residual = hidden_states
             hidden_states = self.mlp(hidden_states)
-            hidden_states = self.post_feedforward_layernorm(hidden_states)
-            hidden_states = residual + hidden_states
+            if self._use_fused_post_norm:
+                hidden_states = fused_post_norm_add(
+                    hidden_states,
+                    residual,
+                    self.post_feedforward_layernorm.weight,
+                    self.post_feedforward_layernorm.variance_epsilon,
+                )
+            else:
+                hidden_states = self.post_feedforward_layernorm(hidden_states)
+                hidden_states = residual + hidden_states
             return hidden_states, None
 
         # Qwen3 pre-norm — collapse `residual + x` and `norm(...)` into the

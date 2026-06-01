@@ -222,6 +222,73 @@ def fused_dual_residual_rmsnorm(x, residual, weight1, weight2, eps, autotune=Fal
 
 
 @triton.jit
+def fused_post_norm_add_kernel(
+    output_ptr,
+    activ_ptr,
+    residual_ptr,
+    weight_ptr,
+    eps: tl.constexpr,
+    hidden_dim: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    """`out = residual + rmsnorm(activ, weight, eps)` — olmo post-norm pattern."""
+    pid = tl.program_id(axis=0)
+    input_start = pid * hidden_dim
+
+    offsets = tl.arange(0, BLOCK_SIZE)
+    mask = offsets < hidden_dim
+
+    a_ = tl.load(activ_ptr + input_start + offsets, mask=mask, other=0.0)
+    a = a_.to(tl.float32)
+    rms = tl.sqrt(tl.sum(a * a, axis=0) / hidden_dim + eps)
+
+    r = tl.load(residual_ptr + input_start + offsets, mask=mask, other=0.0)
+    w_ = tl.load(weight_ptr + offsets, mask=mask, other=0.0)
+    w = w_.to(tl.float32)
+
+    # Match RMSNorm forward_native default (cast_x_before_out_mul=False):
+    # x = (x * weight).to(orig_dtype), then add residual.
+    tl.store(
+        output_ptr + input_start + offsets,
+        r + (a / rms * w).to(r.dtype),
+        mask=mask,
+    )
+
+
+def fused_post_norm_add(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+) -> torch.Tensor:
+    """Fused `residual + RMSNorm(x, weight, eps)` — replaces the 2-launch
+    olmo post-norm sequence with a single kernel.
+
+    Caller MUST ensure RMSNorm uses the same semantics this kernel implements
+    (no variance_size_override, no batch_invariant_mode, no fp32 weight, no
+    cast_x_before_out_mul).  For the HSA olmo decoder we control all of these.
+    """
+    assert x.shape == residual.shape, f"{x.shape=} {residual.shape=}"
+    assert x.dtype == residual.dtype, f"{x.dtype=} {residual.dtype=}"
+    out_shape = x.shape
+    x_2d = x.reshape(-1, x.shape[-1])
+    r_2d = residual.reshape(-1, residual.shape[-1])
+    output = torch.empty_like(x_2d)
+    bs, hidden_dim = x_2d.shape
+    max_warps = 16 if _is_hip else 32
+    config = {
+        "BLOCK_SIZE": triton.next_power_of_2(hidden_dim),
+        "num_warps": max(
+            min(triton.next_power_of_2(triton.cdiv(hidden_dim, 256)), max_warps), 4
+        ),
+    }
+    fused_post_norm_add_kernel[(bs,)](
+        output, x_2d, r_2d, weight, eps=eps, hidden_dim=hidden_dim, **config
+    )
+    return output.view(out_shape)
+
+
+@triton.jit
 def fused_rmsnorm_kernel(
     output_ptr,
     activ_ptr,
