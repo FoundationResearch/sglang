@@ -671,6 +671,35 @@ class HSAAttnBackend(AttentionBackend):
             (max_bs,), dtype=torch.int32, device=device
         )
 
+    def _build_hsa_cg_metadata(self, bs: int):
+        """Populate self.forward_metadata from the pre-allocated cuda-graph
+        buffers.  Called by both capture and replay hooks so the captured
+        graph reads from the buffer pointers and replay just refreshes the
+        buffer contents.
+        """
+        max_seqlen_k = self._cg_max_seqlen_k
+        dense_md = getattr(self._dense_backend, "forward_metadata", None)
+        self.forward_metadata = HSAMetadata(
+            page_size=self.page_size,
+            cache_seqlens_int32=self._cg_cache_seqlens_i32[:bs],
+            max_seqlen_k=max_seqlen_k,
+            page_table_1=self._cg_page_table_1[:bs],
+            real_page_table=None,  # unused by HSA path
+            kv_indptr=getattr(dense_md, "kv_indptr", None),
+            kv_indices=getattr(dense_md, "kv_indices", None),
+            window_kv_indptr=getattr(dense_md, "window_kv_indptr", None),
+            window_kv_indices=getattr(dense_md, "window_kv_indices", None),
+            hsa_kv_indptr=None,
+            hsa_kv_indices=None,
+            hsa_kv_lens=None,
+            hsa_num_kv_splits=None,
+            token_positions=None,
+            token_to_seq_id=None,
+            extend_seq_lens=None,
+            extend_prefix_lens=None,
+            engine_indices=None,
+        )
+
     def init_forward_metadata_capture_cuda_graph(
         self,
         bs: int,
@@ -690,9 +719,21 @@ class HSAAttnBackend(AttentionBackend):
             forward_mode,
             spec_info,
         )
-        # HSA buffer contents will be populated when init_forward_metadata is
-        # invoked inside the capture's run_once() — the buffer path in
-        # init_forward_metadata handles it.
+        # R15.2: capture's run_once calls model.forward directly (NOT
+        # model_runner.forward_decode), so init_forward_metadata is never
+        # invoked during capture.  We must populate HSA's buffers + metadata
+        # here, otherwise self.forward_metadata stays stale from the previous
+        # EXTEND init and forward_decode silently falls back to dense.
+        if forward_mode.is_decode_or_idle() and self._cg_page_table_1 is not None:
+            update_hsa_cg_buffers(
+                bs=int(bs),
+                req_pool_indices=req_pool_indices,
+                seq_lens=seq_lens,
+                req_to_token=self.model_runner.req_to_token_pool.req_to_token,
+                page_table_1_buf=self._cg_page_table_1,
+                cache_seqlens_i32_buf=self._cg_cache_seqlens_i32,
+            )
+            self._build_hsa_cg_metadata(int(bs))
 
     def init_forward_metadata_replay_cuda_graph(
         self,
@@ -716,7 +757,11 @@ class HSAAttnBackend(AttentionBackend):
             seq_lens_cpu,
         )
         # Update HSA buffers in place (so captured kernels see fresh data).
-        if forward_mode.is_decode_or_idle() and getattr(self, "_cg_page_table_1", None) is not None:
+        # Note: must use the SAME buffer pointers as capture, otherwise the
+        # captured graph reads from stale addresses.  Also re-publish
+        # self.forward_metadata in case anything (e.g. forward_decode fast-path
+        # before graph replay) reads it.
+        if forward_mode.is_decode_or_idle() and self._cg_page_table_1 is not None:
             update_hsa_cg_buffers(
                 bs=int(bs),
                 req_pool_indices=req_pool_indices,
@@ -725,6 +770,7 @@ class HSAAttnBackend(AttentionBackend):
                 page_table_1_buf=self._cg_page_table_1,
                 cache_seqlens_i32_buf=self._cg_cache_seqlens_i32,
             )
+            self._build_hsa_cg_metadata(int(bs))
 
     def get_cuda_graph_seq_len_fill_value(self):
         return self._dense_backend.get_cuda_graph_seq_len_fill_value()

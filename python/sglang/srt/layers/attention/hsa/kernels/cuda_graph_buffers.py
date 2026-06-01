@@ -21,16 +21,21 @@ def hsa_build_page_table_1_kernel(
     max_seqlen_k: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
-    """Copy req_to_token[req_pool_indices[b], :max_seqlen_k] into page_table_1[b]."""
+    """Copy req_to_token[req_pool_indices[b], :max_seqlen_k] into page_table_1[b].
+
+    Grid is (bs, cdiv(max_seqlen_k, BLOCK)) so the seq_len copy parallelises
+    across SMs — critical at long context (R15.1).  The previous single-block
+    grid spent ~15 ms per call serialising a 524K-element copy.
+    """
     b = tl.program_id(0)
+    chunk = tl.program_id(1)
     req_idx = tl.load(req_pool_indices_ptr + b).to(tl.int64)
     base_src = req_idx * stride_rt0
     base_dst = b * max_seqlen_k
-    for offset in range(0, max_seqlen_k, BLOCK):
-        offs = offset + tl.arange(0, BLOCK)
-        mask = offs < max_seqlen_k
-        src = tl.load(req_to_token_ptr + base_src + offs, mask=mask, other=0)
-        tl.store(page_table_1_ptr + base_dst + offs, src, mask=mask)
+    offs = chunk * BLOCK + tl.arange(0, BLOCK)
+    mask = offs < max_seqlen_k
+    src = tl.load(req_to_token_ptr + base_src + offs, mask=mask, other=0)
+    tl.store(page_table_1_ptr + base_dst + offs, src, mask=mask)
 
 
 @triton.jit
@@ -63,16 +68,21 @@ def update_hsa_cg_buffers(
     graph capture context.
     """
     max_seqlen_k = page_table_1_buf.shape[1]
-    BLOCK = min(2048, triton.next_power_of_2(max_seqlen_k))
+    # 4096-element blocks (8 warps × 512 ints) — small enough to fit lots of
+    # SMs in parallel for the seq_len dimension; large enough that loop +
+    # launch overhead stays small.  At max_seqlen_k = 524288 that's 128
+    # parallel grid blocks per batch instead of one — saturates GB200 SMs.
+    BLOCK = min(4096, triton.next_power_of_2(max_seqlen_k))
+    num_chunks = (int(max_seqlen_k) + BLOCK - 1) // BLOCK
 
-    hsa_build_page_table_1_kernel[(bs,)](
+    hsa_build_page_table_1_kernel[(bs, num_chunks)](
         req_to_token,
         req_pool_indices,
         page_table_1_buf,
         stride_rt0=int(req_to_token.stride(0)),
         max_seqlen_k=int(max_seqlen_k),
         BLOCK=int(BLOCK),
-        num_warps=4,
+        num_warps=8,
     )
 
     hsa_copy_seq_lens_kernel[(bs,)](
