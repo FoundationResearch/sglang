@@ -584,8 +584,10 @@ class FlashHSAInnerXHierarchicalSparseAttention(nn.Module):
     @torch.no_grad()
     def _fuse_projections(self) -> None:
         """Concatenate q/k/v/hsa_q/hsa_k/hsa_v/lmk_q projection weights into a
-        single fused weight, so decode forward needs ONE F.linear instead of
-        6-7 separate ColumnParallelLinear calls.
+        single fused weight in the layout [q_full | k_full | v_full | lmk_q],
+        where q_full = [swa_q ; hsa_q] (k/v similarly).  This lets the forward
+        slice q_full/k_full/v_full as contiguous chunks (no torch.cat) AND norm
+        them in a single call per branch (instead of one per swa/hsa half).
 
         Skipped (returns silently) when:
           * fusion disabled by env var
@@ -595,25 +597,32 @@ class FlashHSAInnerXHierarchicalSparseAttention(nn.Module):
         if not self._fusion_enabled or self._fused_qkv_w is not None:
             return
 
-        projs = []
+        # Group projections by role so q_full / k_full / v_full come out as
+        # contiguous slices of the fused output.
+        q_projs: List = []
+        k_projs: List = []
+        v_projs: List = []
         if self.has_swa_branch:
-            projs += [self.q_proj, self.k_proj, self.v_proj]
-        projs += [self.hsa_q_proj, self.hsa_k_proj, self.hsa_v_proj]
+            q_projs.append(self.q_proj)
+            k_projs.append(self.k_proj)
+            v_projs.append(self.v_proj)
+        q_projs.append(self.hsa_q_proj)
+        k_projs.append(self.hsa_k_proj)
+        v_projs.append(self.hsa_v_proj)
+
+        projs_ordered = q_projs + k_projs + v_projs
         if self.enable_lmk_q_proj and self.lmk_q_proj is not None:
-            projs.append(self.lmk_q_proj)
+            projs_ordered.append(self.lmk_q_proj)
 
         weights = []
         biases = []
-        for p in projs:
+        for p in projs_ordered:
             w = getattr(p, "weight", None)
             if w is None or not isinstance(w, torch.Tensor):
                 return  # quantized / non-standard, skip
             weights.append(w)
             b = getattr(p, "bias", None)
-            if b is not None and isinstance(b, torch.Tensor):
-                biases.append(b)
-            else:
-                biases.append(None)
+            biases.append(b if (b is not None and isinstance(b, torch.Tensor)) else None)
 
         # ColumnParallelLinear weight shape = [out_per_partition, in_size]
         in_size = weights[0].shape[1]
@@ -622,7 +631,6 @@ class FlashHSAInnerXHierarchicalSparseAttention(nn.Module):
                 return  # shape mismatch, can't fuse
 
         fused_w = torch.cat([w.contiguous() for w in weights], dim=0).contiguous()
-        # Mixed bias handling: if any has bias, all must have bias of correct shape.
         any_bias = any(b is not None for b in biases)
         all_bias = all(b is not None for b in biases)
         fused_b: Optional[torch.Tensor] = None
@@ -631,9 +639,34 @@ class FlashHSAInnerXHierarchicalSparseAttention(nn.Module):
         if all_bias:
             fused_b = torch.cat([b.contiguous() for b in biases], dim=0).contiguous()
 
+        # Sum per-role rows = the contiguous slice for q_full / k_full / v_full.
+        q_full_dim = sum(p.weight.shape[0] for p in q_projs)
+        k_full_dim = sum(p.weight.shape[0] for p in k_projs)
+        v_full_dim = sum(p.weight.shape[0] for p in v_projs)
+        lmk_dim = (
+            self.lmk_q_proj.weight.shape[0]
+            if (self.enable_lmk_q_proj and self.lmk_q_proj is not None)
+            else 0
+        )
+
         self._fused_qkv_w = fused_w
         self._fused_qkv_b = fused_b
-        self._fused_split_sizes = [w.shape[0] for w in weights]
+        # Coarse split = how forward() reads the fused output (no cat needed).
+        if lmk_dim > 0:
+            self._fused_split_sizes = [q_full_dim, k_full_dim, v_full_dim, lmk_dim]
+        else:
+            self._fused_split_sizes = [q_full_dim, k_full_dim, v_full_dim]
+        # Per-branch sizes within q_full / k_full / v_full (used for the rare
+        # !apply_hsa_rope split before RoPE).
+        self._fused_q_swa_dim = (
+            self.q_proj.weight.shape[0] if self.has_swa_branch else 0
+        )
+        self._fused_k_swa_dim = (
+            self.k_proj.weight.shape[0] if self.has_swa_branch else 0
+        )
+        self._fused_v_swa_dim = (
+            self.v_proj.weight.shape[0] if self.has_swa_branch else 0
+        )
 
     def forward(
         self,
@@ -642,15 +675,30 @@ class FlashHSAInnerXHierarchicalSparseAttention(nn.Module):
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
         # --- Projections ---
-        # Fast path: a single fused GEMM that produces concat of
-        # [swa_q, swa_k, swa_v, hsa_q, hsa_k, hsa_v, (lmk_q)].  At decode bs=1
-        # this drops 6-7 launch-bound matmuls down to 1 (~25-40% step speedup).
-        # Falls back to individual ColumnParallelLinears when fusion isn't
-        # built (quantized weights, mixed bias, or disabled via env var).
+        # Fast path: a single fused GEMM laid out as
+        #   [q_full | k_full | v_full | (lmk_q)]
+        # where q_full = [swa_q ; hsa_q] (k/v similarly).  Slicing the fused
+        # output already produces q_full / k_full / v_full as adjacent regions,
+        # so we don't need an explicit torch.cat downstream.  We also norm and
+        # RoPE the full q/k tensors in a single call each (when apply_hsa_rope
+        # is on, which is the common config).
         if self._fusion_enabled and self._fused_qkv_w is None:
             # Lazy build on first forward (covers paths that bypass load_weights,
             # e.g. dev/align/bootstrap.py which does direct param.data.copy_).
             self._fuse_projections()
+        # Local fast-path flag: per-head norm AND apply_hsa_rope (or no SWA
+        # branch).  These are the configs where we can keep q_full/k_full/v_full
+        # unified throughout — matches both 7B HSA (olmo) and 345M (qwen).
+        unified_path = (
+            self._fused_qkv_w is not None
+            and not self._layerwise_qk
+            and (self.apply_hsa_rope or not self.has_swa_branch)
+        )
+        swa_q = swa_k = swa_v = None
+        hsa_q = hsa_k = hsa_v = None
+        q_full = k_full = v_full = None
+        lmk_q_fused = None
+
         if self._fused_qkv_w is not None:
             fused = torch.nn.functional.linear(
                 hidden_states, self._fused_qkv_w, self._fused_qkv_b
@@ -662,16 +710,34 @@ class FlashHSAInnerXHierarchicalSparseAttention(nn.Module):
             chunks = [
                 c.contiguous() for c in fused.split(self._fused_split_sizes, dim=-1)
             ]
-            ci = 0
-            if self.has_swa_branch:
-                swa_q, swa_k, swa_v = chunks[ci], chunks[ci + 1], chunks[ci + 2]
-                ci += 3
-            hsa_q, hsa_k, hsa_v = chunks[ci], chunks[ci + 1], chunks[ci + 2]
-            ci += 3
+            q_full, k_full, v_full = chunks[0], chunks[1], chunks[2]
             if self.enable_lmk_q_proj and self.lmk_q_proj is not None:
-                lmk_q_fused = chunks[ci]
-            else:
-                lmk_q_fused = None
+                lmk_q_fused = chunks[3]
+            if not unified_path:
+                # Re-split q_full/k_full/v_full into swa/hsa halves so the
+                # rare branches (_layerwise_qk, !apply_hsa_rope) match the
+                # original semantics.
+                if self.has_swa_branch:
+                    swa_q, hsa_q = q_full.split(
+                        [self._fused_q_swa_dim, q_full.shape[-1] - self._fused_q_swa_dim],
+                        dim=-1,
+                    )
+                    swa_k, hsa_k = k_full.split(
+                        [self._fused_k_swa_dim, k_full.shape[-1] - self._fused_k_swa_dim],
+                        dim=-1,
+                    )
+                    swa_v, hsa_v = v_full.split(
+                        [self._fused_v_swa_dim, v_full.shape[-1] - self._fused_v_swa_dim],
+                        dim=-1,
+                    )
+                    swa_q = swa_q.contiguous()
+                    swa_k = swa_k.contiguous()
+                    swa_v = swa_v.contiguous()
+                    hsa_q = hsa_q.contiguous()
+                    hsa_k = hsa_k.contiguous()
+                    hsa_v = hsa_v.contiguous()
+                else:
+                    hsa_q, hsa_k, hsa_v = q_full, k_full, v_full
         else:
             # --- HSA branch projections (always needed) ---
             hsa_q, _ = self.hsa_q_proj(hidden_states)
@@ -683,10 +749,15 @@ class FlashHSAInnerXHierarchicalSparseAttention(nn.Module):
                 swa_q, _ = self.q_proj(hidden_states)
                 swa_k, _ = self.k_proj(hidden_states)
                 swa_v, _ = self.v_proj(hidden_states)
-            lmk_q_fused = None
 
         # --- QK norm ---
-        if self._layerwise_qk:
+        if unified_path:
+            # Unified per-head norm on the entire q_full / k_full.  All heads
+            # use the same head_dim-wide norm weight, so this is mathematically
+            # identical to per-branch norm but with one launch instead of two.
+            q_full = self.q_norm(q_full.view(-1, self.head_dim)).view(q_full.shape)
+            k_full = self.k_norm(k_full.view(-1, self.head_dim)).view(k_full.shape)
+        elif self._layerwise_qk:
             # Per-layer norm: concat SWA + HSA, norm with full [hidden_size] weight, split back
             if self.has_swa_branch:
                 swa_q_dim = swa_q.shape[-1]
@@ -711,10 +782,14 @@ class FlashHSAInnerXHierarchicalSparseAttention(nn.Module):
             hsa_k = self.k_norm(hsa_k.view(-1, self.head_dim)).view(hsa_k.shape)
 
         # --- RoPE ---
-        if self.has_swa_branch:
-            swa_q, swa_k = self.rotary_emb(positions, swa_q, swa_k)
-        if self.apply_hsa_rope:
-            hsa_q, hsa_k = self.rotary_emb(positions, hsa_q, hsa_k)
+        if unified_path:
+            # Single RoPE call on q_full/k_full (instead of one per branch).
+            q_full, k_full = self.rotary_emb(positions, q_full, k_full)
+        else:
+            if self.has_swa_branch:
+                swa_q, swa_k = self.rotary_emb(positions, swa_q, swa_k)
+            if self.apply_hsa_rope:
+                hsa_q, hsa_k = self.rotary_emb(positions, hsa_q, hsa_k)
 
         # --- Selection query ---
         if self.enable_lmk_q_proj and self.lmk_q_proj is not None:
@@ -779,10 +854,20 @@ class FlashHSAInnerXHierarchicalSparseAttention(nn.Module):
         else:
             # No separate lmk_q_proj: use hsa_q directly for selection
             # (matches official behavior when enable_lmk_q_proj=False).
+            # In unified_path, hsa_q wasn't materialised — slice the SWA-suffix
+            # of q_full (post-RoPE) to recover it cheaply.
+            if unified_path and self.has_swa_branch:
+                hsa_q = q_full[..., self._fused_q_swa_dim:].contiguous()
+            elif unified_path:
+                hsa_q = q_full
             sel_q = hsa_q.view(-1, self.hq_hsa, self.head_dim)
 
         # Concatenate heads into the single KV cache layout: [SWA | HSA].
-        if self.has_swa_branch:
+        if unified_path:
+            # q_full/k_full/v_full were produced directly by the fused GEMM in
+            # the right [SWA | HSA] layout; no explicit cat needed.
+            pass
+        elif self.has_swa_branch:
             q_full = torch.cat([swa_q, hsa_q], dim=-1)
             k_full = torch.cat([swa_k, hsa_k], dim=-1)
             v_full = torch.cat([swa_v, hsa_v], dim=-1)
@@ -825,6 +910,13 @@ class FlashHSAInnerXHierarchicalSparseAttention(nn.Module):
         # whenever this prefill completes new chunks.  Pure side-effect; the
         # selector at decode reads from the LandmarkLmkKPool.
         if self._per_qhead_lmk_k_active and forward_batch.forward_mode.is_extend():
+            # In unified_path we never materialised hsa_k; slice it on demand
+            # (only when actually needed, i.e. during prefill with active LMK).
+            if unified_path and hsa_k is None:
+                if self.has_swa_branch:
+                    hsa_k = k_full[..., self._fused_k_swa_dim:].contiguous()
+                else:
+                    hsa_k = k_full
             self._maybe_write_chunk_lmk_k(forward_batch, sel_q, hsa_k)
         attn_output = self.attn(
             q_full,
