@@ -788,6 +788,10 @@ class FlashHSAInnerXHierarchicalSparseAttention(nn.Module):
         )  # (N, S, h_kv, D)
 
         # Pure-pytorch chunk_attn_pool — fp32 internal, cast back at the end.
+        # Computes both ``lmk_k`` (softmax-weighted V-substitute K used as the
+        # landmark KEY in the topk selector) AND ``prior_b`` (entropy of the
+        # per-q-head attention distribution, added as a bias to selection
+        # scores — mirrors lhsa_layer's ``lmk_b``).
         sm_scale = 1.0 / _math.sqrt(head_dim)
         mu_f32 = mu_q_batch.float()
         k_f32 = k_chunk_batch.float()
@@ -798,6 +802,13 @@ class FlashHSAInnerXHierarchicalSparseAttention(nn.Module):
         logits = logits.masked_fill(last_mask.view(1, chunk_size, 1), float("-inf"))
         p = torch.softmax(logits, dim=1)  # (N, S, h_q)
         lmk_k = torch.einsum("nsh,nshd->nhd", p, k_q).to(lmk_k_pool.dtype)  # (N, h_q, D)
+        # Entropy bias.  log_softmax puts -inf where logits were -inf; the
+        # corresponding ``p`` is exactly 0 there, but ``p * log_p`` would be
+        # ``0 * (-inf) = NaN``.  Replace the -inf entries with 0 so the sum is
+        # well-defined.  Matches lhsa_layer.py:_chunk_attn_pool_impl.
+        log_p = torch.log_softmax(logits, dim=1)
+        log_p_safe = torch.where(torch.isfinite(log_p), log_p, log_p.new_zeros(()))
+        prior_b = -(p * log_p_safe).sum(dim=1)  # (N, h_q) fp32
 
         # Allocate + write + register.
         slots = lmk_k_pool.alloc(N)
@@ -805,7 +816,7 @@ class FlashHSAInnerXHierarchicalSparseAttention(nn.Module):
             # Pool exhausted — skip silently.  Selector will fall back to the
             # h_kv path for these chunks (their req_to_chunk row stays 0).
             return
-        lmk_k_pool.set(self.layer_id, slots, lmk_k)
+        lmk_k_pool.set(self.layer_id, slots, lmk_k, prior_b=prior_b)
 
         chunk_ids_t = torch.tensor([c for c, _, _ in kept], dtype=torch.int32, device=slots.device)
         req_idx_t = torch.full((N,), req_idx, dtype=torch.int32, device=slots.device)

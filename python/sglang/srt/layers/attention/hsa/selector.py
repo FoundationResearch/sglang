@@ -235,6 +235,7 @@ def select_topk_pages_decode_fused(
     sm_scale: Optional[float] = None,
     selection_strategy: str = "group",
     G: Optional[int] = None,
+    per_qhead_prior_b: Optional[torch.Tensor] = None,
 ) -> Optional[HSASelectionResult]:
     """使用 fused online_topk_group kernel 进行 top-k page selection。
 
@@ -282,6 +283,16 @@ def select_topk_pages_decode_fused(
     # alignment needs.  Fused kernel still handles the H_sel == h_kv (shared K)
     # case, which is the existing default.
     if G is not None and G > 1:
+        # Pure-PyTorch per-q-head topk + max-over-G selection, matching the
+        # official online_softmax_topk_head with explicit G:
+        #   1. per-q-head scores   = q · lmk_k  (per q-head)
+        #   2. selection scores    = max over G  → h_kv
+        #   3. topk on selection   → indices at h_kv
+        #   4. output scores       = gather per-q-head scores at those indices
+        #                            (broadcast h_kv indices to h_q)  → h_q-shape
+        # Indices stay h_kv-shaped (one selection per kv group).  Per-q-head
+        # scores are returned separately via _per_qhead_scores so the
+        # downstream chunk-weight fusion can use them.
         import math as _m
         B_c, C_c, h_q_c, D_c = cand_repr.shape
         h_kv_c = h_q_c // G
@@ -289,19 +300,38 @@ def select_topk_pages_decode_fused(
         q_3 = q_4d.view(B_c, h_q_c, D_c).float()                              # [B, h_q, D]
         cand_f = cand_repr.float()                                            # [B, C, h_q, D]
         scores_pqh = torch.einsum("bhd,bchd->bhc", q_3, cand_f) * sm_scale_ref  # [B, h_q, C]
-        scores_kv = scores_pqh.view(B_c, h_kv_c, G, C_c).max(dim=2).values   # [B, h_kv, C]
+        # NOTE: We deliberately do NOT add ``per_qhead_prior_b`` here even
+        # though the official's online_softmax_topk_head with explicit G
+        # threads a bias through.  Empirically (compare v9 vs v8) adding the
+        # entropy bias produces WORSE KL on this trained checkpoint than
+        # leaving it out — likely because the chunk_attn_pool intermediate
+        # ``p`` we use to compute prior_b is slightly off from the official's
+        # internal one, and the bias has magnitude O(log(chunk_size)) which
+        # dominates the much smaller raw scaled-qk scores.  Until we close
+        # that intermediate gap, the no-bias variant aligns much better.
+        # Selection scores: max over G  → [B, h_kv, C]
+        scores_kv_sel = scores_pqh.view(B_c, h_kv_c, G, C_c).max(dim=2).values
         valid_mask = cand_mask.unsqueeze(1).expand(B_c, h_kv_c, C_c)
-        scores_kv = scores_kv.masked_fill(~valid_mask, float("-inf"))
+        scores_kv_sel = scores_kv_sel.masked_fill(~valid_mask, float("-inf"))
         eff_topk = min(int(topk), int(C_c))
-        topk_scores_kv, topk_idx_kv = scores_kv.topk(eff_topk, dim=-1)        # [B, h_kv, topk]
-        topk_scores_kv = torch.sort(topk_scores_kv, dim=-1, descending=True).values
-        topk_idx_kv = torch.gather(
-            topk_idx_kv,
-            -1,
-            torch.argsort(-topk_scores_kv, dim=-1),  # already sorted, but keep aligned
-        ) if False else topk_idx_kv  # sort by ascending index per HSASelectionResult convention
-        # Convention from existing path: indices ascending (kernel sorts that way).
-        topk_idx_kv, _ = torch.sort(topk_idx_kv, dim=-1)
+        _, topk_idx_kv = scores_kv_sel.topk(eff_topk, dim=-1)                # [B, h_kv, K]
+        topk_idx_kv, _ = torch.sort(topk_idx_kv, dim=-1)                     # ascending
+        # Gather per-q-head scores at the selected h_kv indices.  Each q-head
+        # in the same group sees the SAME chunks (kernel semantics: indices
+        # are shared per kv-group) but its OWN score for that chunk.
+        topk_idx_hq = topk_idx_kv.unsqueeze(2).expand(B_c, h_kv_c, G, eff_topk).reshape(
+            B_c, h_q_c, eff_topk
+        )
+        scores_hq = torch.gather(scores_pqh, dim=-1, index=topk_idx_hq.clamp_min(0))
+        # Mask invalid chunks back to -inf for both the h_kv (selection) and
+        # h_q (output) scores; the fusion uses the h_q ones.
+        invalid = topk_idx_kv < 0
+        scores_kv_out = torch.gather(scores_kv_sel, dim=-1, index=topk_idx_kv.clamp_min(0))
+        scores_kv_out = scores_kv_out.masked_fill(invalid, float("-inf"))
+        scores_hq = scores_hq.masked_fill(
+            invalid.unsqueeze(2).expand(B_c, h_kv_c, G, eff_topk).reshape(B_c, h_q_c, eff_topk),
+            float("-inf"),
+        )
         # Pad to `topk` if eff_topk < topk
         if eff_topk < int(topk):
             pad = int(topk) - eff_topk
@@ -310,19 +340,28 @@ def select_topk_pages_decode_fused(
                  topk_idx_kv.new_full((B_c, h_kv_c, pad), -1, dtype=topk_idx_kv.dtype)],
                 dim=-1,
             )
-            topk_scores_kv = torch.cat(
-                [topk_scores_kv,
-                 topk_scores_kv.new_full((B_c, h_kv_c, pad), float("-inf"))],
+            scores_kv_out = torch.cat(
+                [scores_kv_out,
+                 scores_kv_out.new_full((B_c, h_kv_c, pad), float("-inf"))],
+                dim=-1,
+            )
+            scores_hq = torch.cat(
+                [scores_hq,
+                 scores_hq.new_full((B_c, h_q_c, pad), float("-inf"))],
                 dim=-1,
             )
         selected_page_ids = topk_idx_kv.to(torch.int32)
         selected_page_ids = selected_page_ids.masked_fill(selected_page_ids < 0, -1)
-        return HSASelectionResult(
+        # Attach per-q-head scores onto the result via a side-channel attribute
+        # (the dataclass HSASelectionResult doesn't have a field for it).
+        result = HSASelectionResult(
             cand_page_ids=cand_page_ids,
             cand_mask=cand_mask,
             selected_page_ids=selected_page_ids,
-            selected_scores=topk_scores_kv.to(torch.float32),
+            selected_scores=scores_kv_out.to(torch.float32),
         )
+        result._per_qhead_scores = scores_hq.to(torch.float32)  # [B, h_q, K]
+        return result
 
     fused_indices, fused_scores = _online_topk_group(
         q=q_4d,

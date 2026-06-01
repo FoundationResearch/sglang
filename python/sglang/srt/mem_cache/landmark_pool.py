@@ -69,6 +69,16 @@ class LandmarkLmkKPool:
             device=device,
         )
 
+        # Parallel buffer for the chunk_attn_pool's ``prior_b`` (entropy bias),
+        # shape ``[num_layers, num_chunk_slots+1, h_q]``.  Always allocated so
+        # callers don't have to special-case its presence (4 bytes × h_q ×
+        # num_chunks × layers — negligible vs the K storage which is ×D bigger).
+        self.prior_b_pool = torch.zeros(
+            (self.num_layers, self.num_chunk_slots + 1, self.h_q),
+            dtype=torch.float32,
+            device=device,
+        )
+
         # Free list: real slot ids 1..num_chunk_slots
         self._free = list(range(1, self.num_chunk_slots + 1))
 
@@ -101,10 +111,18 @@ class LandmarkLmkKPool:
 
     # ---- I/O ----
 
-    def set(self, layer_id: int, slots: torch.Tensor, values: torch.Tensor) -> None:
+    def set(
+        self,
+        layer_id: int,
+        slots: torch.Tensor,
+        values: torch.Tensor,
+        prior_b: Optional[torch.Tensor] = None,
+    ) -> None:
         """Write ``values`` shape ``[n, h_q, head_dim]`` at ``slots`` (int).
 
-        Caller guarantees slots are real (>0) and distinct.
+        If ``prior_b`` (shape ``[n, h_q]``) is provided, write into the
+        parallel prior_b_pool at the same slots.  Caller guarantees slots are
+        real (>0) and distinct.
         """
         if slots.numel() == 0:
             return
@@ -112,6 +130,9 @@ class LandmarkLmkKPool:
         v = values.to(dtype=self.pool.dtype, device=self.pool.device)
         # pool: [L, N+1, H, D]
         self.pool[int(layer_id)].index_copy_(0, idx, v)
+        if prior_b is not None:
+            pb = prior_b.to(dtype=self.prior_b_pool.dtype, device=self.prior_b_pool.device)
+            self.prior_b_pool[int(layer_id)].index_copy_(0, idx, pb)
 
     def get(self, layer_id: int, slots: torch.Tensor) -> torch.Tensor:
         """Gather ``[..., h_q, head_dim]`` from ``slots`` shape ``[...]`` int.
@@ -124,6 +145,14 @@ class LandmarkLmkKPool:
         flat = idx.reshape(-1)
         gathered = self.pool[int(layer_id)].index_select(0, flat)  # [n, H, D]
         return gathered.view(*idx.shape, self.h_q, self.head_dim)
+
+    def get_prior_b(self, layer_id: int, slots: torch.Tensor) -> torch.Tensor:
+        """Gather ``[..., h_q]`` prior_b from ``slots``.  Slot 0 returns zeros
+        (additive identity), so masked positions contribute nothing to scores."""
+        idx = slots.clamp(min=0).to(self.prior_b_pool.device, torch.int64)
+        flat = idx.reshape(-1)
+        gathered = self.prior_b_pool[int(layer_id)].index_select(0, flat)  # [n, H]
+        return gathered.view(*idx.shape, self.h_q)
 
 
 class ReqToChunkPool:

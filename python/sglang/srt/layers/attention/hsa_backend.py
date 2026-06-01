@@ -113,6 +113,17 @@ class HSAAttnBackend(AttentionBackend):
         # the path entirely → selector uses the existing shared-K behaviour.
         self.lmk_k_pool = None
         self.req_to_chunk_pool = None
+        # When per_qhead is active, the selector also computes per-q-head
+        # scores (gathered at the chunks selected by max-over-G) and the SWA
+        # branch exposes per-q-head LSE.  These are consumed by the
+        # forward_decode / forward_extend fusion blocks to do the chunk_weight
+        # softmax at h_q granularity — matching the official lhsa_layer.py
+        # line 782 ``cat([scores, lse_sum.unsqueeze(-1)], dim=-1)``.  Empty
+        # default means "fall back to h_kv fusion" (current behaviour).
+        self._last_per_qhead_scores_decode = None  # [B, h_q, K]
+        self._last_per_qhead_scores_extend = None  # [T, h_q, K]
+        self._last_swa_lse_hq_decode = None        # [B, h_q]
+        self._last_swa_lse_hq_extend = None        # [T, h_q]
 
     def _resolve_hsa_layer_ids(self) -> Optional[Set[int]]:
         """Resolve per-layer HSA enable set.
@@ -256,6 +267,8 @@ class HSAAttnBackend(AttentionBackend):
                 forward_batch.req_pool_indices, cand_page_ids
             )
             cand_repr = self.lmk_k_pool.get(int(layer.layer_id), slots)
+            # prior_b (entropy bias) per chunk per q-head, [B, C_max, h_q]
+            self._per_qhead_prior_b = self.lmk_k_pool.get_prior_b(int(layer.layer_id), slots)
             H_sel = cand_repr.shape[2]
             D = cand_repr.shape[3]
             # G for the topk kernel — switches it to per-q-head mode.
@@ -263,6 +276,7 @@ class HSAAttnBackend(AttentionBackend):
         else:
             # Existing path: gather last-token K from KV cache (h_kv shape).
             self._per_qhead_G = None
+            self._per_qhead_prior_b = None
             safe_page_ids = cand_page_ids.clamp(min=0).to(torch.int64)
             lmk_token_pos = safe_page_ids * page_size + (page_size - 1)  # [B, C_max]
             lmk_token_pos_safe = lmk_token_pos.clamp(max=page_table_1.shape[1] - 1)
@@ -316,6 +330,7 @@ class HSAAttnBackend(AttentionBackend):
             sm_scale=sm_scale_val,
             selection_strategy=str(self.hsa_selection_strategy),
             G=getattr(self, "_per_qhead_G", None),
+            per_qhead_prior_b=getattr(self, "_per_qhead_prior_b", None),
         )
         if sel is None:
             sel = select_topk_pages_decode(
@@ -333,6 +348,9 @@ class HSAAttnBackend(AttentionBackend):
         md.hsa_cand_mask = sel.cand_mask
         md.hsa_selected_page_ids = sel.selected_page_ids
         md.hsa_selected_scores = sel.selected_scores
+        # Per-q-head scores side-channel — used by the per-q-head fusion in
+        # forward_decode when active.  Stash on self (single-request scope).
+        self._last_per_qhead_scores_decode = getattr(sel, "_per_qhead_scores", None)
 
     def _compute_internal_swa_decode(
         self,
@@ -380,6 +398,10 @@ class HSAAttnBackend(AttentionBackend):
         page_size = int(self.page_size)
         sm_scale = float(getattr(layer, "scaling", 1.0))
 
+        # Also keep the per-q-head LSE for the per-q-head fusion path
+        # (h_q chunk_weight softmax matching the official Qwen3-LHSA layer).
+        lse_hq = torch.full((B, HQ_hsa), float("-inf"), device=device, dtype=torch.float32)
+
         for b in range(B):
             seqlen = int(seq_lens_i64[b].item())
             if seqlen <= 0:
@@ -411,9 +433,13 @@ class HSAAttnBackend(AttentionBackend):
                 hq_start = kv_h * Gh
                 swa_o[b, hq_start : hq_start + Gh, :] = o
 
-            # Aggregate logsumexp across GQA groups → per-kv-head.
+            # Aggregate logsumexp across GQA groups → per-kv-head (legacy path).
             lse_kv[b] = torch.logsumexp(lse_per_q, dim=-1)
+            # Per-q-head LSE (h_q-shaped), needed for the per-q-head chunk
+            # weight fusion that matches the official layer line 782.
+            lse_hq[b] = lse_per_q.reshape(HQ_hsa)
 
+        self._last_swa_lse_hq_decode = lse_hq
         return swa_o, lse_kv
 
     def _build_hsa_lmk_excluded_indices(self, forward_batch: ForwardBatch):
@@ -764,10 +790,51 @@ class HSAAttnBackend(AttentionBackend):
             Gh = HQ_hsa // H_hsa
             TOPK = int(selected_page_ids.shape[2])
             valid = selected_page_ids >= 0
-            scores = selected_scores.masked_fill(~valid, float("-inf"))
 
-            if hsa_window > 0:
-                # Merged softmax: cat([chunk_scores, swa_lse]) → globally normalized.
+            # Per-q-head fusion path: when the selector exposed per-q-head
+            # scores AND the SWA branch exposed per-q-head LSE, do the entire
+            # cat+softmax at h_q granularity (matching official Qwen3-LHSA
+            # line 782).  Otherwise fall back to the h_kv path then broadcast.
+            per_qhead_scores = self._last_per_qhead_scores_decode  # [B, h_q, K] or None
+            per_qhead_lse = self._last_swa_lse_hq_decode           # [B, h_q] or None
+            per_qhead_fusion = (
+                per_qhead_scores is not None
+                and per_qhead_lse is not None
+                and per_qhead_scores.shape == (B, HQ_hsa, TOPK)
+                and per_qhead_lse.shape == (B, HQ_hsa)
+            )
+
+            if per_qhead_fusion and hsa_window > 0:
+                # GQA-broadcast valid mask from h_kv to h_q.
+                valid_hq = valid.unsqueeze(2).expand(B, H_hsa, Gh, TOPK).reshape(B, HQ_hsa, TOPK)
+                scores_hq = per_qhead_scores.masked_fill(~valid_hq, float("-inf"))
+                if not self.enable_softmax1:
+                    cat_scores = torch.cat(
+                        [scores_hq, per_qhead_lse.unsqueeze(-1)], dim=-1
+                    )  # [B, HQ_hsa, K+1]
+                    swa_weight_idx = -1
+                else:
+                    cat_scores = torch.cat(
+                        [
+                            scores_hq,
+                            per_qhead_lse.unsqueeze(-1),
+                            torch.zeros(B, HQ_hsa, 1, device=scores_hq.device, dtype=scores_hq.dtype),
+                        ],
+                        dim=-1,
+                    )  # [B, HQ_hsa, K+2]
+                    swa_weight_idx = -2
+                merged_w = torch.softmax(cat_scores, dim=-1)
+                merged_w = torch.nan_to_num(merged_w, nan=0.0)
+                w_q = merged_w[:, :, :TOPK].to(q_hsa.dtype).contiguous()  # already h_q
+                # The SWA weight is per-q-head; aggregate to h_kv by mean
+                # only when we still need to feed an h_kv-shaped swa_w for
+                # the SWA blending downstream.  But the official applies
+                # swa_w per q-head: keep h_q.
+                swa_w_q = merged_w[:, :, swa_weight_idx]  # [B, HQ_hsa]
+                swa_w_kv = None  # signal: use swa_w_q downstream
+            elif hsa_window > 0:
+                # Legacy h_kv fusion + broadcast (shared-K path).
+                scores = selected_scores.masked_fill(~valid, float("-inf"))
                 if not self.enable_softmax1:
                     cat_scores = torch.cat(
                         [scores, lse_kv.unsqueeze(-1)], dim=-1
@@ -787,18 +854,26 @@ class HSAAttnBackend(AttentionBackend):
                 merged_w = torch.nan_to_num(merged_w, nan=0.0)
                 w_kv = merged_w[:, :, :TOPK].to(q_hsa.dtype)
                 swa_w_kv = merged_w[:, :, swa_weight_idx]  # [B, H_hsa]
+                w_q = (
+                    w_kv[:, :, None, :]
+                    .expand(B, H_hsa, Gh, TOPK)
+                    .reshape(B, HQ_hsa, TOPK)
+                    .contiguous()
+                )
+                swa_w_q = None
             else:
-                # Backward compat: independent softmax (no internal SWA).
+                # No internal SWA: independent softmax over scores.
+                scores = selected_scores.masked_fill(~valid, float("-inf"))
                 w_kv = torch.softmax(scores, dim=-1)
                 w_kv = torch.nan_to_num(w_kv, nan=0.0).to(q_hsa.dtype)
                 swa_w_kv = None
-
-            w_q = (
-                w_kv[:, :, None, :]
-                .expand(B, H_hsa, Gh, TOPK)
-                .reshape(B, HQ_hsa, TOPK)
-                .contiguous()
-            )
+                w_q = (
+                    w_kv[:, :, None, :]
+                    .expand(B, H_hsa, Gh, TOPK)
+                    .reshape(B, HQ_hsa, TOPK)
+                    .contiguous()
+                )
+                swa_w_q = None
 
             k_cache_hsa = pool.get_key_buffer(layer.layer_id)[:, H_swa : H_swa + H_hsa, :]
             v_cache_hsa = pool.get_value_buffer(layer.layer_id)[:, H_swa : H_swa + H_hsa, :]
@@ -815,12 +890,16 @@ class HSAAttnBackend(AttentionBackend):
             )  # [B, HQ_hsa, D]
 
             # Weighted SWA fusion (LHSA: o_lower = hsa_o + swa_o * swa_weight).
-            if swa_w_kv is not None:
+            # Two paths share this final blend:
+            #   * legacy h_kv path: swa_w_kv [B, H_hsa] broadcast to h_q
+            #   * per-q-head path:  swa_w_q already [B, HQ_hsa], no broadcast
+            if swa_w_q is None and swa_w_kv is not None:
                 swa_w_q = (
                     swa_w_kv[:, :, None]
                     .expand(B, H_hsa, Gh)
                     .reshape(B, HQ_hsa)
                 )
+            if swa_w_q is not None:
                 out_hsa = out_hsa.to(torch.float32) + swa_o_inner * swa_w_q[:, :, None]
 
             out_all = torch.empty((B, HQ_total, D), device=q3.device, dtype=torch.bfloat16)
@@ -1040,6 +1119,10 @@ class HSAAttnBackend(AttentionBackend):
         lse_per_group = lse_raw.view(T, H_hsa, Gh)  # [T, H_hsa, Gh]
         lse_kv = torch.logsumexp(lse_per_group, dim=-1)  # [T, H_hsa]
 
+        # Stash per-q-head LSE for the per-q-head fusion path (qwen-LHSA).
+        # lse_raw is already shape [T, HQ_hsa] which is what the fusion needs.
+        self._last_swa_lse_hq_extend = lse_raw
+
         return swa_o, lse_kv
 
     def _compute_internal_swa_extend_reference(
@@ -1257,6 +1340,7 @@ class HSAAttnBackend(AttentionBackend):
             slots = self.req_to_chunk_pool.gather_slots(req_idx_t, chunk_ids)[0]  # [S]
             lmk_keys_full = self.lmk_k_pool.get(int(layer.layer_id), slots)  # [S, h_q, D]
             self._per_qhead_lmk_keys_full = lmk_keys_full
+            self._per_qhead_prior_b_ext = self.lmk_k_pool.get_prior_b(int(layer.layer_id), slots)  # [S, h_q]
             self._per_qhead_G_ext = int(split_info["hq_hsa"]) // int(split_info["h_hsa"])
             # Surface to the kernel as h_kv-shaped (mean over G) so the topk
             # kernel runs in shared-K mode (no shape mismatch).  The pytorch
@@ -1324,6 +1408,9 @@ class HSAAttnBackend(AttentionBackend):
             lmk_full_f = lmk_full.float()                              # [S, h_q, D]
             # Per-q-head scores: einsum(t,h,d ; s,h,d -> t,h,s)
             scores_pqh = torch.einsum("thd,shd->ths", q_full, lmk_full_f) * sm_scale_ref
+            # NOTE: prior_b deliberately not added (see selector.py for the
+            # rationale — adding entropy bias hurts alignment until the
+            # chunk_attn_pool intermediate matches the official exactly).
             # Causal: query at global pos p sees chunks with end_pos < p.
             # chunk c's end_pos = (c+1)*page_size - 1.  Visible iff end_pos < p
             # i.e. c < p // page_size.  When sliding window, also exclude chunks
@@ -1339,12 +1426,24 @@ class HSAAttnBackend(AttentionBackend):
                 visible = visible_causal & outside_window
             else:
                 visible = visible_causal
-            # Max over G: [T, h_q, S] -> [T, h_kv, S]
-            scores_kv = scores_pqh.view(T_q, h_kv_e, G_e, S_k).max(dim=2).values
-            scores_kv = scores_kv.masked_fill(~visible.unsqueeze(1), float("-inf"))
+            # Max over G: [T, h_q, S] -> [T, h_kv, S] for selection.
+            scores_kv_sel = scores_pqh.view(T_q, h_kv_e, G_e, S_k).max(dim=2).values
+            scores_kv_sel = scores_kv_sel.masked_fill(~visible.unsqueeze(1), float("-inf"))
             eff_topk = min(int(self.hsa_topk), S_k)
-            topk_scores_kv, topk_idx_kv = scores_kv.topk(eff_topk, dim=-1)         # [T, h_kv, K]
+            _, topk_idx_kv = scores_kv_sel.topk(eff_topk, dim=-1)                # [T, h_kv, K]
             topk_idx_kv, _ = torch.sort(topk_idx_kv, dim=-1)
+            # Per-q-head scores at selected chunks (broadcast h_kv idx to h_q).
+            topk_idx_hq = topk_idx_kv.unsqueeze(2).expand(T_q, h_kv_e, G_e, eff_topk).reshape(
+                T_q, h_q_e, eff_topk
+            )
+            scores_hq_sel = torch.gather(scores_pqh, dim=-1, index=topk_idx_hq.clamp_min(0))
+            invalid = topk_idx_kv < 0
+            topk_scores_kv = torch.gather(scores_kv_sel, dim=-1, index=topk_idx_kv.clamp_min(0))
+            topk_scores_kv = topk_scores_kv.masked_fill(invalid, float("-inf"))
+            scores_hq_sel = scores_hq_sel.masked_fill(
+                invalid.unsqueeze(2).expand(T_q, h_kv_e, G_e, eff_topk).reshape(T_q, h_q_e, eff_topk),
+                float("-inf"),
+            )
             if eff_topk < int(self.hsa_topk):
                 pad = int(self.hsa_topk) - eff_topk
                 topk_idx_kv = torch.cat(
@@ -1357,9 +1456,16 @@ class HSAAttnBackend(AttentionBackend):
                      topk_scores_kv.new_full((T_q, h_kv_e, pad), float("-inf"))],
                     dim=-1,
                 )
+                scores_hq_sel = torch.cat(
+                    [scores_hq_sel,
+                     scores_hq_sel.new_full((T_q, h_q_e, pad), float("-inf"))],
+                    dim=-1,
+                )
             # Match kernel output layout: fused_indices [1, T, h_kv, K], fused_scores same.
             fused_indices = topk_idx_kv.unsqueeze(0).to(torch.int32)
             fused_scores = topk_scores_kv.unsqueeze(0).to(torch.float32)
+            # Stash per-q-head scores for the fusion path: [T, h_q, K]
+            self._last_per_qhead_scores_extend = scores_hq_sel.to(torch.float32)
         else:
             fused_indices, fused_scores = _online_topk_group(
                 q=q_4d,
@@ -1777,9 +1883,44 @@ class HSAAttnBackend(AttentionBackend):
             selected_scores = selected_scores.expand(T, H_hsa, TOPK).contiguous()
 
         valid = selected_page_ids >= 0
-        scores = selected_scores.masked_fill(~valid, float("-inf"))
+        # Per-q-head fusion path: when the selector exposed per-q-head scores
+        # AND the SWA branch exposed per-q-head LSE, do the entire
+        # cat+softmax at h_q granularity (matching official Qwen3-LHSA
+        # line 782).  Otherwise fall back to the h_kv path then broadcast.
+        per_qhead_scores = self._last_per_qhead_scores_extend  # [T, h_q, K] or None
+        per_qhead_lse = self._last_swa_lse_hq_extend           # [T, h_q] or None
+        per_qhead_fusion = (
+            per_qhead_scores is not None
+            and per_qhead_lse is not None
+            and per_qhead_scores.shape == (T, HQ_hsa, TOPK)
+            and per_qhead_lse.shape == (T, HQ_hsa)
+        )
 
-        if hsa_window > 0:
+        if per_qhead_fusion and hsa_window > 0:
+            valid_hq = valid.unsqueeze(2).expand(T, H_hsa, Gh, TOPK).reshape(T, HQ_hsa, TOPK)
+            scores_hq = per_qhead_scores.masked_fill(~valid_hq, float("-inf"))
+            if not self.enable_softmax1:
+                cat_scores = torch.cat(
+                    [scores_hq, per_qhead_lse.unsqueeze(-1)], dim=-1
+                )  # [T, HQ_hsa, K+1]
+                swa_weight_idx = -1
+            else:
+                cat_scores = torch.cat(
+                    [
+                        scores_hq,
+                        per_qhead_lse.unsqueeze(-1),
+                        torch.zeros(T, HQ_hsa, 1, device=scores_hq.device, dtype=scores_hq.dtype),
+                    ],
+                    dim=-1,
+                )  # [T, HQ_hsa, K+2]
+                swa_weight_idx = -2
+            merged_w = torch.softmax(cat_scores, dim=-1)
+            merged_w = torch.nan_to_num(merged_w, nan=0.0)
+            w_q = merged_w[:, :, :TOPK].to(q_hsa.dtype).contiguous()  # already h_q
+            swa_w_q = merged_w[:, :, swa_weight_idx]  # [T, HQ_hsa]
+            swa_w_kv = None
+        elif hsa_window > 0:
+            scores = selected_scores.masked_fill(~valid, float("-inf"))
             if not self.enable_softmax1:
                 cat_scores = torch.cat(
                     [scores, lse_kv.unsqueeze(-1)], dim=-1
@@ -1799,18 +1940,25 @@ class HSAAttnBackend(AttentionBackend):
             merged_w = torch.nan_to_num(merged_w, nan=0.0)
             w_kv = merged_w[:, :, :TOPK].to(q_hsa.dtype)
             swa_w_kv = merged_w[:, :, swa_weight_idx]  # [T, H_hsa]
+            swa_w_q = None
+            w_q = (
+                w_kv[:, :, None, :]
+                .expand(T, H_hsa, Gh, TOPK)
+                .reshape(T, HQ_hsa, TOPK)
+                .contiguous()
+            )
         else:
+            scores = selected_scores.masked_fill(~valid, float("-inf"))
             w_kv = torch.softmax(scores, dim=-1)
             w_kv = torch.nan_to_num(w_kv, nan=0.0).to(q_hsa.dtype)
             swa_w_kv = None
-
-        # Expand weights to q-head space: [T, H_hsa, K] → [T, HQ_hsa, K].
-        w_q = (
-            w_kv[:, :, None, :]
-            .expand(T, H_hsa, Gh, TOPK)
-            .reshape(T, HQ_hsa, TOPK)
-            .contiguous()
-        )
+            swa_w_q = None
+            w_q = (
+                w_kv[:, :, None, :]
+                .expand(T, H_hsa, Gh, TOPK)
+                .reshape(T, HQ_hsa, TOPK)
+                .contiguous()
+            )
 
         # Step 6: Paged HSA sparse attention.
         k_cache_hsa = pool.get_key_buffer(layer.layer_id)[:, H_swa : H_swa + H_hsa, :]
@@ -1828,12 +1976,13 @@ class HSAAttnBackend(AttentionBackend):
         )  # [T, HQ_hsa, D] bf16
 
         # Step 7: Weighted SWA fusion (LHSA: o_lower = hsa_o + swa_o * swa_weight).
-        if swa_w_kv is not None:
+        if swa_w_q is None and swa_w_kv is not None:
             swa_w_q = (
                 swa_w_kv[:, :, None]
                 .expand(T, H_hsa, Gh)
                 .reshape(T, HQ_hsa)
             )
+        if swa_w_q is not None:
             out_hsa = out_hsa.to(torch.float32) + swa_o_inner * swa_w_q[:, :, None]
 
         # Step 8: Write HSA heads into the pre-allocated output tensor.
