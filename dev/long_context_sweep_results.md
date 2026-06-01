@@ -91,30 +91,27 @@ overhead per step and is not directly comparable to the cuda-graph buckets.
 The Qwen2.5-7B baseline also has a different architecture (different layer
 count, GQA ratio); cf. 345M section for the apples-to-apples picture.
 
-## 512K HSA: root cause is sglang core, not HSA
+## 512K landed
 
-Re-ran the 512K bench with `python -u` + timestamped output and inspected
-process state.  The main Python thread sat in the `do_wait` syscall and the
-only active child was `ptxas` (NVIDIA assembler), pegged at 99.9% CPU for
-3+ minutes compiling a 3.5 MB PTX file:
+The earlier 512K hang was just `alloc_extend_kernel` JIT compilation
+(triton emits a 3.5 MB PTX file from `tl.arange(0, 524288)`, and ptxas
+takes ~5 min per compile on sm_100a).  After waiting it out the kernel
+gets cached in `~/.triton/cache`, so subsequent 512K runs are fast.
 
-  ptxas -lineinfo -v --gpu-name sm_100a /tmp/.../tmppuajidrc.ptx -o ...ptx.o
+Also had to drop `--mem-fraction-static` from 0.85 to 0.50 — at 0.85 the
+HSA dummy's KV pool ate 155 GB and left no room for the 512K-prefill
+activations.
 
-The PTX belongs to `alloc_extend_kernel` in
-`python/sglang/srt/mem_cache/allocator.py:174-251` — a triton kernel with
-`max_num_extend_tokens: tl.constexpr` that becomes `tl.arange(0, 524288)`
-at line 229 when prefill is 524288 tokens.  Triton evidently emits the full
-unrolled form (24,652 64-bit registers per thread; 3.5 MB PTX), and ptxas
-chokes on it for many minutes on sm_100a (Blackwell).
+345M numbers at 512K (after the JIT cache is warm + mem_fraction=0.5):
 
-This is a **sglang core problem at very long context, not HSA-specific** —
-any model hitting `--input-len 524288` on the paged allocator goes through
-the same kernel.  Fixes worth trying (none attempted yet):
-- chunk the alloc_extend into a loop over fixed-size tiles (e.g. 4096)
-  instead of one constexpr `tl.arange(0, N)` over the whole prefill
-- pre-compile the kernel ahead of time so the JIT cost is paid once
-- fall back to the Python-side allocator when max_num_extend_tokens is huge
+  HSA-345M   : Prefill 10039.89 ms  Decode 2.44 ms  (median)
+  Dense-Fair : Prefill  9991.88 ms  Decode 2.20 ms  (median)
 
-For our latency comparison, the 512K bucket is a known-broken row — would
-need the fix above (or a smaller prefill split into multiple extends) to
-get a meaningful number.
+  Pf ratio (Dense/HSA): 0.995×  (effectively tied — within run noise)
+  Dc ratio (Dense/HSA): 0.90×   (HSA 10% behind)
+
+The Pf curve goes 8K→512K: 0.96→0.92→0.95→0.97→0.98→0.99→0.995.  HSA's
+prefill at 345M approaches but doesn't cross dense even at 512K; the
+sparse-attention advantage gets fully consumed by HSA's per-step
+overhead (selector, lmk_q projection, page-table bookkeeping) on a
+model this small.  Decode never crosses — dense stays 8-15% ahead.
