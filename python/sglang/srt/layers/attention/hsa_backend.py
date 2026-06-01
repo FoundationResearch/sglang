@@ -105,6 +105,15 @@ class HSAAttnBackend(AttentionBackend):
         self._dense_backend = TritonAttnBackend(model_runner, **kwargs)
         self.forward_metadata: Optional[HSAMetadata] = None
 
+        # Per-q-head lmk_k pools.  Optional — populated externally (e.g. by
+        # dev/align/compare.py or a server scaffold for the qwen_lhsa /
+        # high-GQA variants).  When set, the HSA layer's prefill writes
+        # chunk-aggregated lmk_k here and the selector reads from it instead
+        # of synthesising from last-token-K in the KV cache.  None disables
+        # the path entirely → selector uses the existing shared-K behaviour.
+        self.lmk_k_pool = None
+        self.req_to_chunk_pool = None
+
     def _resolve_hsa_layer_ids(self) -> Optional[Set[int]]:
         """Resolve per-layer HSA enable set.
 
@@ -230,21 +239,44 @@ class HSAAttnBackend(AttentionBackend):
         cand_mask = cand_page_ids < effective_cands.unsqueeze(1).to(torch.int32)
         cand_page_ids = cand_page_ids.masked_fill(~cand_mask, -1)
 
-        # Load LMK keys via page_table_1 (logical page → KV slot).
-        safe_page_ids = cand_page_ids.clamp(min=0).to(torch.int64)
-        lmk_token_pos = safe_page_ids * page_size + (page_size - 1)  # [B, C_max]
-        lmk_token_pos_safe = lmk_token_pos.clamp(max=page_table_1.shape[1] - 1)
-        lmk_locs = torch.gather(
-            page_table_1.to(torch.int64), 1, lmk_token_pos_safe
-        )  # [B, C_max]
+        # Per-q-head lmk_k path: when the HSA layer pre-computed chunk-aggregated
+        # h_q-headed lmk_k into the LandmarkLmkKPool (mirrors the official
+        # chunk_attn_pool default MHA mode), gather from there instead of
+        # synthesising lmk_k from the last-token K in the paged KV cache.
+        # The split_info carries hq_hsa / h_hsa so we know G = hq_hsa / h_hsa.
+        per_qhead_active = (
+            getattr(self, "lmk_k_pool", None) is not None
+            and getattr(self, "req_to_chunk_pool", None) is not None
+            and split_info is not None
+            and int(split_info.get("hq_hsa", 0)) > int(split_info.get("h_hsa", 0))
+        )
+        if per_qhead_active:
+            # cand_page_ids[B, C_max] -> slot ids -> [B, C_max, h_q, D]
+            slots = self.req_to_chunk_pool.gather_slots(
+                forward_batch.req_pool_indices, cand_page_ids
+            )
+            cand_repr = self.lmk_k_pool.get(int(layer.layer_id), slots)
+            H_sel = cand_repr.shape[2]
+            D = cand_repr.shape[3]
+            # G for the topk kernel — switches it to per-q-head mode.
+            self._per_qhead_G = int(split_info["hq_hsa"]) // int(split_info["h_hsa"])
+        else:
+            # Existing path: gather last-token K from KV cache (h_kv shape).
+            self._per_qhead_G = None
+            safe_page_ids = cand_page_ids.clamp(min=0).to(torch.int64)
+            lmk_token_pos = safe_page_ids * page_size + (page_size - 1)  # [B, C_max]
+            lmk_token_pos_safe = lmk_token_pos.clamp(max=page_table_1.shape[1] - 1)
+            lmk_locs = torch.gather(
+                page_table_1.to(torch.int64), 1, lmk_token_pos_safe
+            )  # [B, C_max]
 
-        k_cache = pool.get_key_buffer(layer.layer_id)  # [num_locs, H_total, D]
-        D = int(k_cache.shape[2])
-        flat_lmk_locs = lmk_locs.reshape(-1)
-        flat_repr = k_cache[flat_lmk_locs]  # [B*C_max, H_total, D]
-        if kv_head_count is not None:
-            flat_repr = flat_repr[:, int(kv_head_offset):int(kv_head_offset) + int(kv_head_count), :]
-        cand_repr = flat_repr.view(B, C_max, H_sel, D)
+            k_cache = pool.get_key_buffer(layer.layer_id)  # [num_locs, H_total, D]
+            D = int(k_cache.shape[2])
+            flat_lmk_locs = lmk_locs.reshape(-1)
+            flat_repr = k_cache[flat_lmk_locs]  # [B*C_max, H_total, D]
+            if kv_head_count is not None:
+                flat_repr = flat_repr[:, int(kv_head_offset):int(kv_head_offset) + int(kv_head_count), :]
+            cand_repr = flat_repr.view(B, C_max, H_sel, D)
 
         # unified_retrieval: group+sum KV heads to match retrieval_dim.
         unified = split_info is not None and split_info.get("unified_retrieval", False)
@@ -283,6 +315,7 @@ class HSAAttnBackend(AttentionBackend):
             page_size=int(self.page_size),
             sm_scale=sm_scale_val,
             selection_strategy=str(self.hsa_selection_strategy),
+            G=getattr(self, "_per_qhead_G", None),
         )
         if sel is None:
             sel = select_topk_pages_decode(
@@ -1201,14 +1234,48 @@ class HSAAttnBackend(AttentionBackend):
             )
             return
 
-        # --- 1. 只 gather 一次共享的 LMK [S, H, D] ---
-        lmk_positions = torch.arange(S, device=device, dtype=torch.int64) * page_size + (page_size - 1)  # [S]
-        lmk_positions = lmk_positions.clamp(max=page_table_1.shape[1] - 1)
-        lmk_locs = page_table_1[0, lmk_positions].to(torch.int64)  # [S]
-        lmk_keys = k_cache[lmk_locs]  # [S, H_total, D]
-        if kv_head_count is not None:
-            lmk_keys = lmk_keys[:, int(kv_head_offset):int(kv_head_offset) + int(kv_head_count), :]
-        # lmk_keys: [S, H_sel, D]
+        # Per-q-head lmk_k path mirrors the decode-side fast-path: when the
+        # HSA layer has stashed chunk-aggregated h_q-headed lmk_k into the
+        # LandmarkLmkKPool (mode triggered by hq_hsa > h_hsa, see flash_hsa.py
+        # `_maybe_write_chunk_lmk_k`), gather those instead of synthesising
+        # an h_kv-shape surrogate from the chunk's last-token K. The layer's
+        # writer runs BEFORE this call (attn() comes after the write hook in
+        # the layer's forward), so all S chunks of the current prefill are
+        # already in the pool.
+        per_qhead_ext_active = (
+            getattr(self, "lmk_k_pool", None) is not None
+            and getattr(self, "req_to_chunk_pool", None) is not None
+            and split_info is not None
+            and int(split_info.get("hq_hsa", 0)) > int(split_info.get("h_hsa", 0))
+        )
+        self._per_qhead_G_ext = None
+        self._per_qhead_lmk_keys_full = None  # cache for the per-token-aware pytorch path
+        if per_qhead_ext_active:
+            req_idx = int(forward_batch.req_pool_indices[0].item())
+            chunk_ids = torch.arange(S, device=device, dtype=torch.int32).unsqueeze(0)  # [1, S]
+            req_idx_t = torch.tensor([req_idx], dtype=torch.int32, device=device)
+            slots = self.req_to_chunk_pool.gather_slots(req_idx_t, chunk_ids)[0]  # [S]
+            lmk_keys_full = self.lmk_k_pool.get(int(layer.layer_id), slots)  # [S, h_q, D]
+            self._per_qhead_lmk_keys_full = lmk_keys_full
+            self._per_qhead_G_ext = int(split_info["hq_hsa"]) // int(split_info["h_hsa"])
+            # Surface to the kernel as h_kv-shaped (mean over G) so the topk
+            # kernel runs in shared-K mode (no shape mismatch).  The pytorch
+            # post-pass below replaces the kernel's output with the
+            # algorithmically correct max-over-G per-q-head topk.
+            h_q_e = lmk_keys_full.shape[1]
+            G_e = self._per_qhead_G_ext
+            h_kv_e = h_q_e // G_e
+            lmk_keys = lmk_keys_full.view(S, h_kv_e, G_e, lmk_keys_full.shape[-1]).mean(dim=2)
+            H_sel = h_kv_e
+        else:
+            # --- 1. 只 gather 一次共享的 LMK [S, H, D] ---
+            lmk_positions = torch.arange(S, device=device, dtype=torch.int64) * page_size + (page_size - 1)  # [S]
+            lmk_positions = lmk_positions.clamp(max=page_table_1.shape[1] - 1)
+            lmk_locs = page_table_1[0, lmk_positions].to(torch.int64)  # [S]
+            lmk_keys = k_cache[lmk_locs]  # [S, H_total, D]
+            if kv_head_count is not None:
+                lmk_keys = lmk_keys[:, int(kv_head_offset):int(kv_head_offset) + int(kv_head_count), :]
+            # lmk_keys: [S, H_sel, D]
 
         # --- 2. unified_retrieval 降维（跟 training 一致）---
         unified = split_info is not None and split_info.get("unified_retrieval", False)
@@ -1241,16 +1308,69 @@ class HSAAttnBackend(AttentionBackend):
         lmk_4d = lmk_keys.unsqueeze(0)  # [1, S, H_sel_kernel, D_kernel]
 
         # q_offset = prefix_len，表示 extend 的第一个 token 在全局序列中的位置
-        fused_indices, fused_scores = _online_topk_group(
-            q=q_4d,
-            lmks=lmk_4d,
-            topk=int(self.hsa_topk),
-            block_size=page_size,
-            window_size=hsa_window if hsa_window > 0 else 0,
-            is_causal=True,
-            q_offset=prefix_len,
-            is_training=False,
-        )
+        if self._per_qhead_G_ext is not None and self._per_qhead_lmk_keys_full is not None:
+            # Pure-PyTorch correct per-q-head topk (max-over-G).  Slow but
+            # matches the official's online_softmax_topk_head with G > 1.
+            import math as _m
+            G_e = int(self._per_qhead_G_ext)
+            lmk_full = self._per_qhead_lmk_keys_full  # [S, h_q, D]
+            h_q_e = lmk_full.shape[1]
+            h_kv_e = h_q_e // G_e
+            D_e = lmk_full.shape[2]
+            sm_scale_ref = 1.0 / _m.sqrt(D_e)
+            # q_sel_3 here is the full h_q query [T, h_q, D] (per_qhead path
+            # is non-unified so q_sel_3 stays at the original h_q layout).
+            q_full = q_sel_3.float()                                   # [T, h_q, D]
+            lmk_full_f = lmk_full.float()                              # [S, h_q, D]
+            # Per-q-head scores: einsum(t,h,d ; s,h,d -> t,h,s)
+            scores_pqh = torch.einsum("thd,shd->ths", q_full, lmk_full_f) * sm_scale_ref
+            # Causal: query at global pos p sees chunks with end_pos < p.
+            # chunk c's end_pos = (c+1)*page_size - 1.  Visible iff end_pos < p
+            # i.e. c < p // page_size.  When sliding window, also exclude chunks
+            # whose start_pos >= p - window_size + 1 -> c >= (p - window + 1) / page_size.
+            T_q = q_full.shape[0]
+            S_k = lmk_full_f.shape[0]
+            q_pos = torch.arange(prefix_len, prefix_len + T_q, device=device)
+            chunk_end_pos = torch.arange(1, S_k + 1, device=device) * page_size - 1
+            chunk_start_pos = torch.arange(0, S_k, device=device) * page_size
+            visible_causal = chunk_end_pos.unsqueeze(0) < q_pos.unsqueeze(1)         # [T, S]
+            if hsa_window > 0:
+                outside_window = chunk_start_pos.unsqueeze(0) < (q_pos.unsqueeze(1) - hsa_window + 1)
+                visible = visible_causal & outside_window
+            else:
+                visible = visible_causal
+            # Max over G: [T, h_q, S] -> [T, h_kv, S]
+            scores_kv = scores_pqh.view(T_q, h_kv_e, G_e, S_k).max(dim=2).values
+            scores_kv = scores_kv.masked_fill(~visible.unsqueeze(1), float("-inf"))
+            eff_topk = min(int(self.hsa_topk), S_k)
+            topk_scores_kv, topk_idx_kv = scores_kv.topk(eff_topk, dim=-1)         # [T, h_kv, K]
+            topk_idx_kv, _ = torch.sort(topk_idx_kv, dim=-1)
+            if eff_topk < int(self.hsa_topk):
+                pad = int(self.hsa_topk) - eff_topk
+                topk_idx_kv = torch.cat(
+                    [topk_idx_kv,
+                     topk_idx_kv.new_full((T_q, h_kv_e, pad), -1, dtype=topk_idx_kv.dtype)],
+                    dim=-1,
+                )
+                topk_scores_kv = torch.cat(
+                    [topk_scores_kv,
+                     topk_scores_kv.new_full((T_q, h_kv_e, pad), float("-inf"))],
+                    dim=-1,
+                )
+            # Match kernel output layout: fused_indices [1, T, h_kv, K], fused_scores same.
+            fused_indices = topk_idx_kv.unsqueeze(0).to(torch.int32)
+            fused_scores = topk_scores_kv.unsqueeze(0).to(torch.float32)
+        else:
+            fused_indices, fused_scores = _online_topk_group(
+                q=q_4d,
+                lmks=lmk_4d,
+                topk=int(self.hsa_topk),
+                block_size=page_size,
+                window_size=hsa_window if hsa_window > 0 else 0,
+                is_causal=True,
+                q_offset=prefix_len,
+                is_training=False,
+            )
         # fused_indices: [1, T, h_shared, topk], fused_scores: [1, T, h_shared, topk]
 
         # --- 4. 转换输出格式 ---

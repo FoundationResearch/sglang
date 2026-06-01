@@ -234,6 +234,7 @@ def select_topk_pages_decode_fused(
     page_size: int,
     sm_scale: Optional[float] = None,
     selection_strategy: str = "group",
+    G: Optional[int] = None,
 ) -> Optional[HSASelectionResult]:
     """使用 fused online_topk_group kernel 进行 top-k page selection。
 
@@ -249,6 +250,11 @@ def select_topk_pages_decode_fused(
       page_size: chunk/page 大小
       sm_scale: 可选的 attention scale（fused kernel 内部处理）
       selection_strategy: "group" or "head"（fused kernel 仅支持 group 模式）
+      G: optional GQA group multiplier for the landmark heads.  ``None`` (default)
+         delegates to the underlying kernel's shared-K path (lmks at h_kv
+         granularity).  ``G > 1`` activates the per-q-head path: requires
+         ``cand_repr.shape[2] == q_heads == h_kv * G``.  Used when sglang's
+         layer has pre-computed per-q-head landmark Ks via chunk_attn_pool.
     """
     if _online_topk_group is None:
         return None
@@ -265,8 +271,59 @@ def select_topk_pages_decode_fused(
     else:
         return None  # 不支持的 shape，fallback
 
-    # cand_repr: [B, C_max, H_sel, D] — 已经是 [B, S, h_kv, D] 格式
-    # window 排除已在外部完成，设 window_size=0, is_causal=False
+    # cand_repr: [B, C_max, H_sel, D].
+    #
+    # Per-q-head path (G > 1): cand_repr arrives with H_sel == h_q.  sglang's
+    # fused online_topk_group does ``q.sum(over G)`` when h_q > h_kv (kernel
+    # semantics), which is NOT what the official wants for per-q-head lmks.
+    # The official's online_softmax_topk_head with explicit G uses
+    # ``max(over G) of per-q-head scores`` then topk.  We replicate that in
+    # pure PyTorch — slower but algorithmically faithful, which is what
+    # alignment needs.  Fused kernel still handles the H_sel == h_kv (shared K)
+    # case, which is the existing default.
+    if G is not None and G > 1:
+        import math as _m
+        B_c, C_c, h_q_c, D_c = cand_repr.shape
+        h_kv_c = h_q_c // G
+        sm_scale_ref = float(sm_scale) if sm_scale is not None else (1.0 / _m.sqrt(D_c))
+        q_3 = q_4d.view(B_c, h_q_c, D_c).float()                              # [B, h_q, D]
+        cand_f = cand_repr.float()                                            # [B, C, h_q, D]
+        scores_pqh = torch.einsum("bhd,bchd->bhc", q_3, cand_f) * sm_scale_ref  # [B, h_q, C]
+        scores_kv = scores_pqh.view(B_c, h_kv_c, G, C_c).max(dim=2).values   # [B, h_kv, C]
+        valid_mask = cand_mask.unsqueeze(1).expand(B_c, h_kv_c, C_c)
+        scores_kv = scores_kv.masked_fill(~valid_mask, float("-inf"))
+        eff_topk = min(int(topk), int(C_c))
+        topk_scores_kv, topk_idx_kv = scores_kv.topk(eff_topk, dim=-1)        # [B, h_kv, topk]
+        topk_scores_kv = torch.sort(topk_scores_kv, dim=-1, descending=True).values
+        topk_idx_kv = torch.gather(
+            topk_idx_kv,
+            -1,
+            torch.argsort(-topk_scores_kv, dim=-1),  # already sorted, but keep aligned
+        ) if False else topk_idx_kv  # sort by ascending index per HSASelectionResult convention
+        # Convention from existing path: indices ascending (kernel sorts that way).
+        topk_idx_kv, _ = torch.sort(topk_idx_kv, dim=-1)
+        # Pad to `topk` if eff_topk < topk
+        if eff_topk < int(topk):
+            pad = int(topk) - eff_topk
+            topk_idx_kv = torch.cat(
+                [topk_idx_kv,
+                 topk_idx_kv.new_full((B_c, h_kv_c, pad), -1, dtype=topk_idx_kv.dtype)],
+                dim=-1,
+            )
+            topk_scores_kv = torch.cat(
+                [topk_scores_kv,
+                 topk_scores_kv.new_full((B_c, h_kv_c, pad), float("-inf"))],
+                dim=-1,
+            )
+        selected_page_ids = topk_idx_kv.to(torch.int32)
+        selected_page_ids = selected_page_ids.masked_fill(selected_page_ids < 0, -1)
+        return HSASelectionResult(
+            cand_page_ids=cand_page_ids,
+            cand_mask=cand_mask,
+            selected_page_ids=selected_page_ids,
+            selected_scores=topk_scores_kv.to(torch.float32),
+        )
+
     fused_indices, fused_scores = _online_topk_group(
         q=q_4d,
         lmks=cand_repr,

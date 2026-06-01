@@ -509,6 +509,20 @@ class FlashHSAInnerXHierarchicalSparseAttention(nn.Module):
             prefix=add_prefix("attn", prefix),
         )
 
+        # Per-q-head lmk_k path (mirrors the official chunk_attn_pool default
+        # MHA-style mode).  Active when (a) we have lmk_q_proj producing
+        # h_q-headed query *and* (b) HSA branch uses GQA on the q-side
+        # (hq_hsa > hk_hsa).  When active, prefill computes the chunk-aggregated
+        # h_q-headed lmk_k once per chunk and stores it in the backend's
+        # LandmarkLmkKPool; the selector reads it at decode time and passes
+        # G = hq_hsa // hk_hsa to the topk kernel.
+        self._per_qhead_lmk_k_active = bool(
+            self.enable_lmk_q_proj
+            and self.lmk_q_full_dim
+            and (self.hq_hsa > self.hk_hsa)
+        )
+        self.chunk_size = int(getattr(config, "chunk_size", 64))
+
     def forward(
         self,
         positions: torch.Tensor,
@@ -659,6 +673,11 @@ class FlashHSAInnerXHierarchicalSparseAttention(nn.Module):
             upper_swa_window_size=upper_swa_window,
             swa_exclude_lmk=False,
         )
+        # Per-q-head lmk_k path: compute and stash chunk-aggregated lmk_k
+        # whenever this prefill completes new chunks.  Pure side-effect; the
+        # selector at decode reads from the LandmarkLmkKPool.
+        if self._per_qhead_lmk_k_active and forward_batch.forward_mode.is_extend():
+            self._maybe_write_chunk_lmk_k(forward_batch, sel_q, hsa_k)
         attn_output = self.attn(
             q_full,
             k_full,
@@ -679,6 +698,118 @@ class FlashHSAInnerXHierarchicalSparseAttention(nn.Module):
 
         out, _ = self.o_proj(attn_output)
         return out
+
+    # ------------------------------------------------------------------
+    # Per-q-head lmk_k cache write (prefill helper)
+    # ------------------------------------------------------------------
+    def _maybe_write_chunk_lmk_k(self, forward_batch, sel_q, hsa_k) -> None:
+        """Compute chunk-aggregated h_q-headed lmk_k for any chunks that this
+        prefill *completes*, store them in the backend's LandmarkLmkKPool, and
+        record the (req, chunk) -> slot mapping.
+
+        Inputs (local to this forward):
+          * ``sel_q``: ``[T, hq_hsa, head_dim]`` post-norm landmark query.
+          * ``hsa_k``: ``[T, hk_hsa * head_dim]`` HSA-branch keys.
+
+        The math mirrors the official ``chunk_attn_pool`` MHA-style mode:
+
+            mu_q  = sel_q[chunk_end_token]                 # (h_q, D)
+            K_chk = hsa_k[chunk_start : chunk_end+1]       # (S, h_kv, D)
+            G     = h_q // h_kv
+            K_qhd = K_chk.repeat_interleave(G, dim=1)      # (S, h_q, D)
+            logits = einsum("hd, shd -> sh", mu_q, K_qhd) * sm_scale
+            logits[last_token_of_chunk] = -inf             # landmark anchor
+            p     = softmax(logits, dim=0)
+            lmk_k = einsum("sh, shd -> hd", p, K_qhd)     # (h_q, D)
+
+        Only single-request batches are supported right now (alignment harness
+        + low-volume serving cases).  Multi-batch / chunked-prefill / TP > 1
+        all fall back to no-op silently — the selector will still work, just
+        with sglang's existing h_kv-shared-K path.
+        """
+        backend = getattr(forward_batch, "attn_backend", None)
+        if backend is None:
+            return
+        lmk_k_pool = getattr(backend, "lmk_k_pool", None)
+        req_to_chunk = getattr(backend, "req_to_chunk_pool", None)
+        if lmk_k_pool is None or req_to_chunk is None:
+            return
+        if get_attention_tp_size() > 1:
+            # Per-q-head lmk_k under TP would need an all-gather on hsa_k AND
+            # storing the full h_q heads (vs sliced).  Not in this POC.
+            return
+        if int(forward_batch.batch_size) != 1:
+            return
+
+        import math as _math
+
+        chunk_size = int(self.chunk_size)
+        h_q = int(self.hq_hsa)
+        h_kv = int(self.hk_hsa)
+        head_dim = int(self.head_dim)
+        if h_q % h_kv != 0:
+            return
+        G = h_q // h_kv
+
+        req_idx = int(forward_batch.req_pool_indices[0].item())
+        prefix_len = int(
+            forward_batch.extend_prefix_lens[0].item()
+            if forward_batch.extend_prefix_lens is not None
+            else 0
+        )
+        extend_len = int(forward_batch.extend_seq_lens[0].item())
+
+        already_done = prefix_len // chunk_size
+        total_done_after = (prefix_len + extend_len) // chunk_size
+        if total_done_after <= already_done:
+            return  # no new chunks finish in this extend
+
+        # Reshape K to per-head view.
+        k_local = hsa_k.view(extend_len, h_kv, head_dim)
+
+        # Vectorise across all newly-complete chunks.  Each chunk's start/end
+        # is required to lie fully inside this extend window.
+        new_chunk_ids = list(range(already_done, total_done_after))
+        starts = [c * chunk_size - prefix_len for c in new_chunk_ids]
+        ends = [(c + 1) * chunk_size - 1 - prefix_len for c in new_chunk_ids]
+        kept = [
+            (c, s, e)
+            for (c, s, e) in zip(new_chunk_ids, starts, ends)
+            if 0 <= s and e < extend_len
+        ]
+        if not kept:
+            return
+        N = len(kept)
+
+        # Build (N, head_dim_axes) batches.
+        mu_q_batch = torch.stack([sel_q[e] for (_, _, e) in kept], dim=0)  # (N, h_q, D)
+        k_chunk_batch = torch.stack(
+            [k_local[s : s + chunk_size] for (_, s, _) in kept], dim=0
+        )  # (N, S, h_kv, D)
+
+        # Pure-pytorch chunk_attn_pool — fp32 internal, cast back at the end.
+        sm_scale = 1.0 / _math.sqrt(head_dim)
+        mu_f32 = mu_q_batch.float()
+        k_f32 = k_chunk_batch.float()
+        k_q = k_f32.repeat_interleave(G, dim=2) if G != 1 else k_f32  # (N, S, h_q, D)
+        logits = torch.einsum("nhd,nshd->nsh", mu_f32, k_q) * sm_scale  # (N, S, h_q)
+        last_mask = torch.zeros(chunk_size, dtype=torch.bool, device=mu_f32.device)
+        last_mask[-1] = True
+        logits = logits.masked_fill(last_mask.view(1, chunk_size, 1), float("-inf"))
+        p = torch.softmax(logits, dim=1)  # (N, S, h_q)
+        lmk_k = torch.einsum("nsh,nshd->nhd", p, k_q).to(lmk_k_pool.dtype)  # (N, h_q, D)
+
+        # Allocate + write + register.
+        slots = lmk_k_pool.alloc(N)
+        if slots is None:
+            # Pool exhausted — skip silently.  Selector will fall back to the
+            # h_kv path for these chunks (their req_to_chunk row stays 0).
+            return
+        lmk_k_pool.set(self.layer_id, slots, lmk_k)
+
+        chunk_ids_t = torch.tensor([c for c, _, _ in kept], dtype=torch.int32, device=slots.device)
+        req_idx_t = torch.full((N,), req_idx, dtype=torch.int32, device=slots.device)
+        req_to_chunk.assign(req_idx_t, chunk_ids_t, slots)
 
 
 class FlashHSAInnerXDecoderLayer(nn.Module):

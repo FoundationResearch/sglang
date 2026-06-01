@@ -157,6 +157,24 @@ def sglang_prefill_and_decode(sg_model, cfg, real_base, decode_tokens, device, d
     mr.token_to_kv_pool_allocator = object()
     be = HSAAttnBackend(mr)
 
+    # Per-q-head lmk_k pools — only used when the model config has GQA on
+    # the HSA branch (hq_hsa > hk_hsa) AND the layer was built with
+    # _per_qhead_lmk_k_active=True.  Inactive otherwise (1-layer canonical
+    # has hq_hsa == hk_hsa so this is a no-op).
+    _hq_hsa = int(getattr(cfg, "num_attention_heads"))
+    _hk_hsa = int(getattr(cfg, "num_key_value_heads"))
+    if _hq_hsa > _hk_hsa:
+        from sglang.srt.mem_cache.landmark_pool import LandmarkLmkKPool, ReqToChunkPool
+        _max_chunks = (mc + PS - 1) // PS
+        be.lmk_k_pool = LandmarkLmkKPool(
+            num_chunk_slots=_max_chunks * 2,  # head-room for re-allocs in stress runs
+            num_layers=int(cfg.num_hidden_layers), h_q=_hq_hsa, head_dim=int(cfg.head_dim),
+            dtype=dtype, device=device,
+        )
+        be.req_to_chunk_pool = ReqToChunkPool(
+            num_reqs=1, max_chunks_per_req=_max_chunks, device=device,
+        )
+
     # Prefill
     fi = Req._hsa_insert_lmk_prompt(real_base, page_size=PS, lmk_id=lmk_id)
     pl = len(fi)
@@ -332,6 +350,9 @@ def sglang_run_one_request(
     all_idx = torch.cat([s.flatten() for s in all_slots]).to(torch.int64)
     allocator.free(all_idx)
     req_to_token_pool.free(req_idx)
+    # Per-q-head lmk_k pool: return chunk slots to the free list.
+    if getattr(backend, "req_to_chunk_pool", None) is not None:
+        backend.req_to_chunk_pool.free(req_idx, backend.lmk_k_pool)
     torch.cuda.synchronize()
     mem_after = torch.cuda.memory_allocated()
 
@@ -405,6 +426,20 @@ def stress_sequential_churn(sg_model, om, cfg_dict, dtype, device,
     mr.token_to_kv_pool = pool
     mr.token_to_kv_pool_allocator = allocator
     backend = HSAAttnBackend(mr)
+
+    _hq_hsa = int(cfg_dict['num_attention_heads'])
+    _hk_hsa = int(cfg_dict['num_key_value_heads'])
+    if _hq_hsa > _hk_hsa:
+        from sglang.srt.mem_cache.landmark_pool import LandmarkLmkKPool, ReqToChunkPool
+        _max_chunks = (max_ctx + PS - 1) // PS
+        backend.lmk_k_pool = LandmarkLmkKPool(
+            num_chunk_slots=_max_chunks * num_req_slots * 2,
+            num_layers=int(cfg_dict['num_hidden_layers']), h_q=_hq_hsa, head_dim=int(cfg_dict['head_dim']),
+            dtype=dtype, device=device,
+        )
+        backend.req_to_chunk_pool = ReqToChunkPool(
+            num_reqs=num_req_slots, max_chunks_per_req=_max_chunks, device=device,
+        )
 
     cfg_for_request = types.SimpleNamespace(
         chunk_size=PS, vocab_size=VS,
