@@ -1147,9 +1147,12 @@ class FlashHSAInnerXDecoderLayer(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
-    ) -> torch.Tensor:
+        residual: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         if self.decoder_variant == "olmo":
-            # OLMo3 post-norm
+            # OLMo3 post-norm — pattern is `residual + norm(attn|mlp(x))`, which
+            # doesn't fit the standard fused_add_rmsnorm (it implements
+            # `norm(x + residual)`).  Keep the explicit add for now.
             residual = hidden_states
             hidden_states = self.self_attn(
                 positions=positions,
@@ -1163,22 +1166,32 @@ class FlashHSAInnerXDecoderLayer(nn.Module):
             hidden_states = self.mlp(hidden_states)
             hidden_states = self.post_feedforward_layernorm(hidden_states)
             hidden_states = residual + hidden_states
-        else:
-            # Qwen3 pre-norm
+            return hidden_states, None
+
+        # Qwen3 pre-norm — collapse `residual + x` and `norm(...)` into the
+        # fused_add_rmsnorm kernel by threading (hidden_states, residual)
+        # through the layer.  The final residual is folded into model.norm.
+        if residual is None:
+            # First layer: no residual to fuse yet → plain norm.
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
-            hidden_states = self.self_attn(
-                positions=positions,
-                hidden_states=hidden_states,
-                forward_batch=forward_batch,
-            )
-            hidden_states = residual + hidden_states
+        else:
+            # input_layernorm(x, residual) returns (norm(x+residual), x+residual)
+            hidden_states, residual = self.input_layernorm(hidden_states, residual)
 
-            residual = hidden_states
-            hidden_states = self.post_attention_layernorm(hidden_states)
-            hidden_states = self.mlp(hidden_states)
-            hidden_states = residual + hidden_states
-        return hidden_states
+        hidden_states = self.self_attn(
+            positions=positions,
+            hidden_states=hidden_states,
+            forward_batch=forward_batch,
+        )
+
+        # post_attention_layernorm fuses the post-attn residual add into the
+        # pre-MLP norm: input is attn_out + residual, output is norm of that.
+        hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
+        hidden_states = self.mlp(hidden_states)
+        # Defer the post-MLP residual add to the *next* layer's input_layernorm
+        # (which will fuse it).  Return (mlp_out, residual_so_far).
+        return hidden_states, residual
 
 
 class FlashHSAInnerXModel(nn.Module):
@@ -1229,10 +1242,21 @@ class FlashHSAInnerXModel(nn.Module):
         else:
             hidden_states = input_embeds
 
+        # Thread (hidden_states, residual) through layers so the qwen variant
+        # can fold per-layer residual adds into fused_add_rmsnorm in the next
+        # layer's input_layernorm.  Olmo layers ignore `residual` and always
+        # return (out, None) — same end-to-end shape.
+        residual: Optional[torch.Tensor] = None
         for decoder_layer in self.layers:
-            hidden_states = decoder_layer(positions, hidden_states, forward_batch)
+            hidden_states, residual = decoder_layer(
+                positions, hidden_states, forward_batch, residual
+            )
 
-        hidden_states = self.norm(hidden_states)
+        if residual is not None:
+            # Fuse the trailing residual add into the final norm (qwen path).
+            hidden_states, _ = self.norm(hidden_states, residual)
+        else:
+            hidden_states = self.norm(hidden_states)
         return hidden_states
 
 
