@@ -91,16 +91,30 @@ overhead per step and is not directly comparable to the cuda-graph buckets.
 The Qwen2.5-7B baseline also has a different architecture (different layer
 count, GQA ratio); cf. 345M section for the apples-to-apples picture.
 
-## 512K HSA: hangs in warmup
+## 512K HSA: root cause is sglang core, not HSA
 
-The 345M HSA-345M bench at 512K consistently sits in the bench `Warmup ...`
-phase for >2 min with GPU at 0% utilization.  The main Python thread is in
-the `do_wait` syscall (waiting for a child) while CPU sits at 20-80%.  The
-KV pool allocates 20M token slots (155 GB) before warmup begins — that part
-is fine.  Possible causes (not yet narrowed down):
-- tilelang HSA forward kernel JIT compilation for the new seq_len=524288
-  shape (the kernel is shape-specialised)
-- O(N) Python loop in the HSA selector / metadata builder at 8192 chunks
+Re-ran the 512K bench with `python -u` + timestamped output and inspected
+process state.  The main Python thread sat in the `do_wait` syscall and the
+only active child was `ptxas` (NVIDIA assembler), pegged at 99.9% CPU for
+3+ minutes compiling a 3.5 MB PTX file:
 
-Next step: re-run with `TILELANG_*` env vars to disable autotune, or trace
-with py-spy.
+  ptxas -lineinfo -v --gpu-name sm_100a /tmp/.../tmppuajidrc.ptx -o ...ptx.o
+
+The PTX belongs to `alloc_extend_kernel` in
+`python/sglang/srt/mem_cache/allocator.py:174-251` — a triton kernel with
+`max_num_extend_tokens: tl.constexpr` that becomes `tl.arange(0, 524288)`
+at line 229 when prefill is 524288 tokens.  Triton evidently emits the full
+unrolled form (24,652 64-bit registers per thread; 3.5 MB PTX), and ptxas
+chokes on it for many minutes on sm_100a (Blackwell).
+
+This is a **sglang core problem at very long context, not HSA-specific** —
+any model hitting `--input-len 524288` on the paged allocator goes through
+the same kernel.  Fixes worth trying (none attempted yet):
+- chunk the alloc_extend into a loop over fixed-size tiles (e.g. 4096)
+  instead of one constexpr `tl.arange(0, N)` over the whole prefill
+- pre-compile the kernel ahead of time so the JIT cost is paid once
+- fall back to the Python-side allocator when max_num_extend_tokens is huge
+
+For our latency comparison, the 512K bucket is a known-broken row — would
+need the fix above (or a smaller prefill split into multiple extends) to
+get a meaningful number.
