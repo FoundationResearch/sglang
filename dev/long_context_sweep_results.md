@@ -1,5 +1,73 @@
 # Long-context latency sweep — HSA vs Dense (sglang, GB200, bs=1)
 
+> **2026-06-01 update.** The earlier "HSA loses 6-30% at 8K-256K" picture below
+> was **measuring the wrong path** — sglang's cuda-graph capture for the HSA
+> backend delegates to dense (`hsa_backend.py:555-598`), so the `--cuda-graph-max-bs 1`
+> bench was always running HSA-model-with-dense-attention, not real HSA.
+>
+> **Real HSA** (forward through `HSAAttnBackend.forward_decode` →
+> `_run_selection_decode` + `hsa_decode_paged_fwd` + per-q-head fusion)
+> only runs when `--disable-cuda-graph --attention-backend hsa` is set.
+> Re-benching that path (`dev/bench_real_hsa.sh`) after the R9-R12 sync /
+> Python-loop elimination commits (`d5d3b163` … `59b9046a`) gives the
+> headline numbers we actually care about, in the **"Real HSA (apples-
+> to-apples, both --disable-cuda-graph)"** table below.
+
+## Real HSA (apples-to-apples, both --disable-cuda-graph)
+
+Both branches run on the same per-step path — no cuda-graph amortisation
+either side, single GB200, batch=1, 345M apples-to-apples (qwen_lhsa vs
+qwen3, same 16L / 16q / 2kv / hidden=1024 / head_dim=64 arch).
+
+```
+Length   HSA Pf(s)  Dense Pf(s)  Pf ratio   HSA Dc(ms)  Dense Dc(ms)  Dc ratio
+                                  (>1 means HSA faster)
+-----------------------------------------------------------------------------
+  8K       2.05        0.73       0.36×        90           11         0.13×
+ 32K       2.38        1.97       0.83×       159           11         0.07×
+128K       4.42        8.26      *1.87×*      504           38         0.08×
+256K      10.08       31.94      *3.17×*      996           74         0.07×
+512K      16.54       74.27      *4.49×*      919           91         0.10×
+```
+
+* **Prefill crosses over at ~64K.**  By 256K HSA prefill is 3.17× faster,
+  by 512K it is **4.49× faster** than apples-to-apples dense.  This is
+  the answer to "why doesn't HSA beat dense at 512K?" — it does, on
+  prefill.  The crossover gets steeper with length because dense is
+  O(N²) while HSA is O(N · topk·page_size).
+* **Decode is still bound by per-step Python + kernel-launch overhead.**
+  R9-R12 cut 32K decode from 291ms → 159ms (1.83×) by removing
+  per-layer `.item()` syncs and vectorising the `for kv_h` matmul loop,
+  but at 128K-512K the bottleneck shifts onto the selector kernel +
+  `hsa_decode_paged_fwd` + chunk-weight softmax fusion, which need
+  CUDA-graph integration (see below) or kernel-level fusion to close
+  the gap with dense's heavily-tuned `_fwd_grouped_kernel_stage1`.
+* The **earlier cuda-graph numbers below** are therefore a comparison
+  of *(HSA model + dense attention) vs (Dense model + dense attention)*.
+  The 6-30% gap there is dominated by HSA's extra model-side ops
+  (lmk_q projection, selector head, residual q split), which R1-R7
+  shrank as much as possible.
+
+## CUDA-graph integration (not yet fixed)
+
+`hsa_backend.py` currently delegates `init_cuda_graph_state`,
+`init_forward_metadata_capture_cuda_graph`, and
+`init_forward_metadata_replay_cuda_graph` to the dense backend, so the
+captured graph contains dense attention kernels instead of HSA's.
+Until that is fixed:
+
+* Reported "HSA" cuda-graph numbers always reflect dense attention.
+* True HSA path runs only with `--disable-cuda-graph --attention-backend hsa`.
+
+Fix scope: HSAAttnBackend needs its own cuda-graph state (pre-allocated
+`cand_page_ids`, `cand_mask`, `hsa_selected_page_ids`, `hsa_selected_scores`,
+`page_table_1` overlay buffer), and selection / paged-decode kernels
+must be confirmed graph-safe (no host-side `.item()` syncs).  R9-R12
+removed the known host-side syncs from the decode path; the remaining
+gating item is the capture/replay metadata plumbing.
+
+
+
 Latency comparison across context-length buckets, single GB200, batch_size=1,
 decode_len=128 (matching the H20 paper table's settings).  Each cell shows the
 median benchmark latency from `sglang.bench_one_batch`.
