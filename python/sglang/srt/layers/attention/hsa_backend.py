@@ -202,16 +202,17 @@ class HSAAttnBackend(AttentionBackend):
         device = q.device
 
         # Overlay out_cache_loc into page_table_1 at position (seq_len - 1).
+        # Vectorised on GPU (R9) — the prior Python loop with `seq_lens[b].item()`
+        # forced a CUDA->CPU sync per HSA layer per decode step.
         page_table_1 = md.page_table_1
-        if getattr(forward_batch, "out_cache_loc", None) is not None:
-            seq_lens_i64 = md.cache_seqlens_int32.to(torch.int64)
-            if B > 0:
-                page_table_1 = page_table_1.clone()
-                out_locs = forward_batch.out_cache_loc[:B].to(torch.int32)
-                for b in range(B):
-                    seqlen = int(seq_lens_i64[b].item())
-                    if seqlen > 0 and seqlen <= page_table_1.shape[1]:
-                        page_table_1[b, seqlen - 1] = out_locs[b]
+        if getattr(forward_batch, "out_cache_loc", None) is not None and B > 0:
+            page_table_1 = page_table_1.clone()
+            out_locs = forward_batch.out_cache_loc[:B].to(torch.int32)
+            seq_lens_i64_b = md.cache_seqlens_int32[:B].to(torch.int64)
+            cap = page_table_1.shape[1] - 1
+            positions = (seq_lens_i64_b - 1).clamp_(min=0, max=cap)
+            batch_idx = torch.arange(B, device=page_table_1.device, dtype=torch.int64)
+            page_table_1[batch_idx, positions] = out_locs
 
         seq_lens_i64 = md.cache_seqlens_int32.to(torch.int64)
 
@@ -231,7 +232,14 @@ class HSAAttnBackend(AttentionBackend):
             effective_cands = completed_pages  # [B]
 
         effective_cands = effective_cands.clamp(min=0)
-        C_max = int(effective_cands.max().item())
+
+        # R10: avoid `effective_cands.max().item()` sync.  Use the metadata-known
+        # upper bound (max_seqlen_k // page_size); cand_mask handles unused entries
+        # below the upper bound so the selection kernel still ignores padding.
+        # The early-exit for "all batches have 0 candidates" (context < page_size)
+        # is folded into the regular kernel path — at that point context is so
+        # short that the extra work is negligible compared to a saved sync.
+        C_max = max(int(md.max_seqlen_k) // page_size, 0)
 
         if C_max == 0:
             md.hsa_cand_page_ids = page_table_1.new_full((B, 0), -1, dtype=torch.int32)
@@ -380,64 +388,87 @@ class HSAAttnBackend(AttentionBackend):
 
         swa_o = torch.zeros((B, HQ_hsa, D), device=device, dtype=torch.float32)
         lse_kv = torch.full((B, H_hsa), float("-inf"), device=device, dtype=torch.float32)
+        # Per-q-head LSE for the per-q-head fusion path (matches official
+        # Qwen3-LHSA layer line 782).
+        lse_hq = torch.full((B, HQ_hsa), float("-inf"), device=device, dtype=torch.float32)
 
         if hsa_window <= 0:
+            self._last_swa_lse_hq_decode = lse_hq.to(q_hsa.dtype)
             return swa_o, lse_kv
 
         md = self.forward_metadata
         pool = getattr(forward_batch, "token_to_kv_pool", None)
         if md is None or pool is None:
+            self._last_swa_lse_hq_decode = lse_hq.to(q_hsa.dtype)
             return swa_o, lse_kv
 
         k_cache_all = pool.get_key_buffer(layer.layer_id)
         v_cache_all = pool.get_value_buffer(layer.layer_id)
-        seq_lens_i64 = md.cache_seqlens_int32.to(torch.int64)
+        seq_lens_i64 = md.cache_seqlens_int32.to(torch.int64)  # [B]
 
         assert HQ_hsa % H_hsa == 0
         Gh = HQ_hsa // H_hsa
         page_size = int(self.page_size)
         sm_scale = float(getattr(layer, "scaling", 1.0))
 
-        # Also keep the per-q-head LSE for the per-q-head fusion path
-        # (h_q chunk_weight softmax matching the official Qwen3-LHSA layer).
-        lse_hq = torch.full((B, HQ_hsa), float("-inf"), device=device, dtype=torch.float32)
+        # ---- R11: batch-vectorised SWA on HSA heads (replaces nested Python
+        # for-b / for-kv_h loops + .item() syncs). ----
+        #
+        # Reference semantics (per batch b):
+        #   q_pos = seqlen - 1
+        #   raw_start = q_pos - hsa_window + 1
+        #   chunk_start = max(0, (raw_start // page_size) * page_size)  if raw_start >= 0 else 0
+        #   tok_pos ∈ [chunk_start, seqlen) where (pos % page_size) != (page_size - 1)
+        #
+        # Strategy: build a padded [B, W] tok_pos grid with W = hsa_window + page_size
+        # (safe upper bound on chunk-aligned window length), mask invalid entries,
+        # then run one batched einsum over [B, H_hsa, Gh, W].
 
-        for b in range(B):
-            seqlen = int(seq_lens_i64[b].item())
-            if seqlen <= 0:
-                continue
-            q_pos = seqlen - 1
-            # Chunk-aligned window start (reference: block_causal_mask).
-            raw_start = q_pos - hsa_window + 1
-            chunk_start = max(0, (raw_start // page_size) * page_size) if raw_start >= 0 else 0
+        q_pos = seq_lens_i64 - 1
+        raw_start = q_pos - hsa_window + 1
+        chunk_start = torch.where(
+            raw_start >= 0,
+            (raw_start // page_size) * page_size,
+            torch.zeros_like(raw_start),
+        ).clamp_(min=0)  # [B]
 
-            # Positions [chunk_start, q_pos], excluding LMK slots.
-            tok_pos = torch.arange(chunk_start, seqlen, device=device, dtype=torch.int64)
-            keep = (tok_pos % page_size) != (page_size - 1)
-            tok_pos = tok_pos[keep]
-            if tok_pos.numel() == 0:
-                continue
+        W = int(hsa_window) + int(page_size)
+        pos_offsets = torch.arange(W, device=device, dtype=torch.int64)  # [W]
+        tok_pos = chunk_start[:, None] + pos_offsets[None, :]  # [B, W]
 
-            token_locs = page_table_1[b, tok_pos].to(torch.int64)
-            q_hgd = q_hsa[b].view(H_hsa, Gh, D).to(torch.float32)
+        valid_mask = (
+            (tok_pos < seq_lens_i64[:, None])
+            & ((tok_pos % page_size) != (page_size - 1))
+            & (seq_lens_i64[:, None] > 0)
+        )  # [B, W]
 
-            lse_per_q = torch.full((H_hsa, Gh), float("-inf"), device=device, dtype=torch.float32)
-            for kv_h in range(H_hsa):
-                kv_h_global = H_swa + kv_h
-                k_win = k_cache_all[token_locs, kv_h_global, :].to(torch.float32)
-                v_win = v_cache_all[token_locs, kv_h_global, :].to(torch.float32)
-                logits = (q_hgd[kv_h] @ k_win.transpose(0, 1)) * sm_scale
-                lse_per_q[kv_h] = torch.logsumexp(logits, dim=-1)
-                p = torch.softmax(logits, dim=-1)
-                o = p @ v_win
-                hq_start = kv_h * Gh
-                swa_o[b, hq_start : hq_start + Gh, :] = o
+        # Safe gather indices (out-of-range entries are masked out downstream).
+        cap = page_table_1.shape[1] - 1
+        tok_pos_safe = tok_pos.clamp(min=0, max=cap)
+        token_locs = torch.gather(page_table_1.to(torch.int64), 1, tok_pos_safe)  # [B, W]
 
-            # Aggregate logsumexp across GQA groups → per-kv-head (legacy path).
-            lse_kv[b] = torch.logsumexp(lse_per_q, dim=-1)
-            # Per-q-head LSE (h_q-shaped), needed for the per-q-head chunk
-            # weight fusion that matches the official layer line 782.
-            lse_hq[b] = lse_per_q.reshape(HQ_hsa)
+        # Slice HSA kv-heads from the cache *before* the gather to cut memory traffic.
+        k_hsa = k_cache_all[:, H_swa : H_swa + H_hsa, :]  # [num_locs, H_hsa, D]
+        v_hsa = v_cache_all[:, H_swa : H_swa + H_hsa, :]
+        flat_locs = token_locs.reshape(-1)  # [B*W]
+        k_win = k_hsa[flat_locs].view(B, W, H_hsa, D).to(torch.float32)  # [B, W, H_hsa, D]
+        v_win = v_hsa[flat_locs].view(B, W, H_hsa, D).to(torch.float32)
+
+        # Q: [B, HQ_hsa, D] -> [B, H_hsa, Gh, D]
+        q_hgd = q_hsa.view(B, H_hsa, Gh, D).to(torch.float32)
+
+        # Logits: [B, H_hsa, Gh, W]
+        logits = torch.einsum("bhgd,bwhd->bhgw", q_hgd, k_win) * sm_scale
+        logits = logits.masked_fill(~valid_mask[:, None, None, :], float("-inf"))
+
+        lse_per_q = torch.logsumexp(logits, dim=-1)  # [B, H_hsa, Gh]
+        p = torch.softmax(logits, dim=-1)            # [B, H_hsa, Gh, W]
+        p = torch.nan_to_num(p, nan=0.0)
+        o = torch.einsum("bhgw,bwhd->bhgd", p, v_win)  # [B, H_hsa, Gh, D]
+
+        swa_o = o.reshape(B, HQ_hsa, D)
+        lse_kv = torch.logsumexp(lse_per_q, dim=-1)  # [B, H_hsa]
+        lse_hq = lse_per_q.reshape(B, HQ_hsa)
 
         # Match official lhsa_layer.py:625 — lse_sum.to(hidden_states.dtype)
         # casts the per-q-head LSE to bf16 before it feeds the chunk_weight
