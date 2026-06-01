@@ -41,6 +41,49 @@ from sglang.srt.layers.dp_attention import (
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.elementwise import fused_post_norm_add
 from sglang.srt.models.utils import apply_qk_norm
+try:
+    from sglang.jit_kernel.norm import (
+        can_use_fused_inplace_qknorm as _can_use_fused_qknorm,
+        fused_inplace_qknorm as _fused_qknorm,
+    )
+    _HAVE_FUSED_QKNORM = True
+except Exception:  # pragma: no cover — fallback when JIT module missing
+    _HAVE_FUSED_QKNORM = False
+
+
+def _try_fused_per_head_rmsnorm_3d_inplace(
+    x: torch.Tensor, weight: torch.Tensor, eps: float, head_dim: int
+) -> bool:
+    """Per-head RMSNorm via the fused JIT QK-Norm kernel (in-place on `x`).
+
+    `x` must be a contiguous 3D tensor [batch, num_heads, head_dim].  We split
+    `num_heads` in half and pass each half as the q / k argument with the SAME
+    weight — the kernel normalises each half independently, so using identical
+    weights is equivalent to one big head-wise norm.
+
+    flashinfer's RMSNormKernel on head_dim=64 is launch-bound (~1ms per call on
+    long-context shapes), but the fused QK-Norm kernel is shape-specialised and
+    ~10x faster.
+
+    Returns True on success (x normalised in-place), False if conditions for
+    the fast path aren't met — caller should fall back to its module path.
+    """
+    if x.dim() != 3:
+        return False
+    num_heads = x.shape[1]
+    if not (
+        _HAVE_FUSED_QKNORM
+        and num_heads >= 2
+        and num_heads % 2 == 0
+        and x.is_contiguous()
+        and _can_use_fused_qknorm(head_dim, x.dtype)
+    ):
+        return False
+    half = num_heads // 2
+    # Slice along the heads dim — both halves still see contiguous head_dim
+    # rows because the heads stride is `head_dim` for a contiguous 3D tensor.
+    _fused_qknorm(x[:, :half, :], x[:, half:, :], weight, weight, eps=eps, head_dim=head_dim)
+    return True
 from sglang.srt.layers.linear import ColumnParallelLinear, MergedColumnParallelLinear, RowParallelLinear
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
@@ -812,10 +855,20 @@ class FlashHSAInnerXHierarchicalSparseAttention(nn.Module):
                 if attn_tp_size > 1:
                     lmk_q = tensor_model_parallel_all_gather(lmk_q.contiguous())
                 # After all-gather lmk_q has hq_hsa_total heads' worth.
-                lmk_q_h = lmk_q.view(-1, self.hq_hsa_total, self.head_dim)
-                lmk_q_h_norm = self.lmk_q_norm(lmk_q_h.reshape(-1, self.head_dim)).reshape(
-                    lmk_q_h.shape
-                )
+                lmk_q_h = lmk_q.view(-1, self.hq_hsa_total, self.head_dim).contiguous()
+                # Fast path: use the fused QK-Norm kernel (10x faster on
+                # head_dim=64 at long context) via in-place half-split.
+                if _try_fused_per_head_rmsnorm_3d_inplace(
+                    lmk_q_h,
+                    self.lmk_q_norm.weight,
+                    self.lmk_q_norm.variance_epsilon,
+                    self.head_dim,
+                ):
+                    lmk_q_h_norm = lmk_q_h
+                else:
+                    lmk_q_h_norm = self.lmk_q_norm(
+                        lmk_q_h.reshape(-1, self.head_dim)
+                    ).reshape(lmk_q_h.shape)
                 if attn_tp_size > 1:
                     # Slice to local q heads.
                     tp_rank = get_attention_tp_rank()
