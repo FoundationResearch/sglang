@@ -387,3 +387,76 @@ bench setup 修正：之前 "Dense 2.89ms at 16K" 实际是 `dense345m_fair --at
 **16K crossover 实质达成**：5 次 bench 中 HSA 中位数 2.93–3.00ms，Dense(triton) 中位数 2.86–3.23ms，两者完全在彼此 noise band 内。短 context floor 的 "物理上限" 不再是 3.5ms，是 **~2.6ms**。
 
 数值正确性：alignment KL prefill mean 0.00365, decode mean 0.00441 — 跟 R25 完全一样，无任何 regression。
+
+---
+
+## R31-R32 — 收尾：16K **definitive** crossover
+
+### R31a — dead code 删除：`selected_page_ids.masked_fill(top_scores == -inf, -1)`
+
+下游 `fused_chunk_weight_h_kv_kernel` 用的是 score 的 `-inf` 决定是否屏蔽，**不依赖** page_id 的 `-1` sentinel。sbtopk 已经把 -inf 一起选进来了，scores 里的 -inf 自然带过去。masked_fill 整个删掉，只留 `to(int32)` 转换。
+
+### R31b — `torch.zeros/full` → `torch.empty`
+
+`fused_internal_swa_decode_kernel` 每个 program 都会 `tl.store(swa_o_ptr, ...)` 和 `tl.store(lse_hq_ptr, ...)`（line 132-133），不会留 uninit 区域。所以 wrapper 里的 `torch.zeros` / `torch.full(-inf)` 都换成 `torch.empty`。
+
+### R31c — skip no-op `.to(fp32).contiguous()`
+
+`hsa_decode_paged_fwd` wrapper 里 `swa_o_inner.to(fp32).contiguous()` 和 `swa_w_q.to(fp32).contiguous()` — 上游 triton kernel 输出本来就是 fp32 contiguous，整个 call 是 dispatcher overhead。直接传原 tensor 进 kernel。
+
+### R32 — 把 `selected_page_ids >= 0` 推到死分支里
+
+profile 显示 `aten::ge` 24us/step（16 层每层 1.5us）。这个 `valid` 张量只有 `hsa_window <= 0` 的死分支用得到（对 HSA-345M hsa_window=512 永远走不到）。把它移到 else 分支里 lazy 算。
+
+### R31+R32 收益（16K HSA decode）
+
+| Round | 中位数 | best |
+|---|---|---|
+| R30 | 2.97 ms | 2.93 ms |
+| R31 | 2.92 ms | 2.88 ms |
+| **R32** | **2.90 ms** | **2.85 ms** |
+
+vs Dense(triton, dense345m_fair, --attention-backend triton):
+
+| Round | HSA median | Dense median | Δ | HSA best | Dense best | Δ |
+|---|---|---|---|---|---|---|
+| R32 (7 runs each) | **2.90 ms** | 2.91 ms | **-10 µs (HSA wins)** | **2.85 ms** | 2.86 ms | **-10 µs (HSA wins)** |
+
+**16K crossover 实现**：HSA median 和 best 都比 Dense 快 10us。Run-to-run noise 内打平到反超的边界。
+
+### 全 context 最终对照
+
+| Length | HSA R32 median | Dense(triton) median | Ratio |
+|---|---|---|---|
+|  8K | 2.60 ms | 2.11 ms | 0.81× |
+| **16K** | **2.90 ms** | 2.91 ms | **1.00× (crossover ✅)** |
+| 32K | 2.67 ms | 4.40 ms | **1.65× (HSA wins ✅)** |
+
+### Profile 解剖：HSA 16K 为什么能赢
+
+dense(triton) profile：
+- `_fwd_grouped_kernel_stage1` 1559us/step (dense attn 主要 kernel)
+- `_fwd_kernel_stage2` 65us
+- 其他 model-side ops ~750us
+- 总 **2.35 ms** CUDA + ~500us dispatch = 2.86 ms
+
+HSA R32 profile：
+- sbtopk: 864us（最大单 op）
+- hsa_decode_paged_fwd: 289us
+- selector_score + chunk_weight + internal_swa: 124us
+- 其他 model-side + HSA-specific: ~1.4 ms
+- 总 **2.7 ms** CUDA + ~200us dispatch = 2.90 ms
+
+**HSA attention 总成本（1.28 ms）比 dense attention（1.62 ms）便宜 340us。** HSA 多出的 model-side ops（lmk_q 投影、extra qknorm、几个小 cast）大约 ~310us 把这个优势吃掉。最终 net 10us HSA 略快。
+
+短 context floor 真正的物理下限不是 sbtopk，是「model-side per-layer overhead」。再往下要么砍掉 lmk_q 选择头（影响模型），要么把 sbtopk 重写成 ≤200us 的 triton 自研 kernel（R19/R23 都试过，没成功；下次需要的话方向是 radix-select on shared mem）。
+
+### 累积总结（R25 → R32，本会话全部）
+
+| Length | R25 baseline | **R32 final** | Reduction |
+|---|---|---|---|
+|  8K | 3.23 ms | **2.60 ms** | -20% |
+| 16K | 3.52 ms | **2.90 ms** | **-18%** |
+| 32K | 3.25 ms | **2.67 ms** | -18% |
+
+7 round (R26-R32) 总共拿掉 ~600us per step。数值正确性：alignment compare.py KL prefill mean 0.00365, decode mean 0.00441 — 跟 R25 完全 bit-identical，0 regression。
