@@ -204,38 +204,62 @@
 
 ---
 
+### R24 — 融合 selector 的 gather + matmul + mask（**全曲线大杀器**）
+* **改**：写 `fused_selector_score_kernel`，把 selector 中 cand_repr-materialization 那一长串 (`cand_page_ids → lmk_token_pos → page_table_1 gather → k_cache gather → flat_repr slice → cand_repr view → einsum × sm_scale → masked_fill`, 共 ~10 ops) 全部融成一个 triton kernel。直接从 (q, cand_page_ids, cand_mask, page_table_1, k_cache) 输出 scores [B, H, C] bf16
+* **为什么**：profile 显示这一串总耗时 ~500-800us per step at 8K，且 cand_repr 这个中间张量在长 context 时占大量 HBM 带宽
+* **关键工程细节**：第一版 grid=(B*H,) 单 program 处理所有候选 — bench 8K decode 反而 **慢 1.9×** 因为 GB200 144 SMs 大部分空闲。改 grid=(B*H, num_chunks) + BLOCK_C=16-32 让 SM 并行起来后才出效果
+* **commit**：`0df5945e2`
+* **收益**：**全曲线大幅改善**
+  | Length | Post-R22 | **Post-R24** | Δ |
+  |---|---|---|---|
+  | 8K | 3.69 | **3.31** | -10% |
+  | 32K | 4.12 | **3.29** | -20% |
+  | 64K | 4.42 | **3.41** | -23% |
+  | 128K | 5.30 | **3.57** | **-33%** |
+  | 256K | 6.84 | **4.19** | **-39%** |
+  | 512K | 10.08 | **5.25** | **-48%** |
+* **验证**（完整）：
+  - alignment KL prefill 0.003649 / dec 0.004414 = baseline bit-identical
+  - end-to-end CG capture+replay single-step: max_abs_diff = **0.0000e+00** (bit-exact)
+  - end-to-end CG multi-step 4 个 decode iteration: token 全部对齐
+  - probe 确认 `fused_selector_score_kernel × 48` 真的在跑（2.67us/call），0 个 dense kernel fallback
+
 ### 短 context 攻坚阶段总结
 
-R16-R23 五轮总收益（8K decode）：
+R16-R24 总收益（HSA-CG decode, ms）：
 
-| Round | 8K decode | 32K decode | 备注 |
-|---|---|---|---|
-| R15.2 baseline | 5.40 | 5.98 | |
-| R16 | 5.44 | 5.77 | bf16 SWA |
-| R17 | 5.29 | 5.62 | skip sort |
-| R18 | 5.20 | 5.42 | h_kv fused |
-| R20 | 5.18 | 5.47 | swa_w HQ-granularity |
-| **R21** | **3.98** | **4.13** | **streaming flash SWA** |
-| **R22** | **3.69** | **4.12** | **topk sorted=False** |
+| Round | 8K | 32K | 128K | 512K | 备注 |
+|---|---|---|---|---|---|
+| R15.2 baseline | 5.40 | 5.98 | 6.84 | 11.75 | cuda graph 集成完成 |
+| R21 | 3.98 | 4.13 | 5.32 | 10.15 | streaming flash SWA |
+| R22 | 3.69 | 4.12 | 5.30 | 10.08 | topk sorted=False |
+| **R24** | **3.31** | **3.29** | **3.57** | **5.25** | **fused selector score** |
+| **总省** | **-39%** | **-45%** | **-48%** | **-55%** | |
 
-净改善：**8K -32%, 32K -31%**。32K HSA decode 反超 dense，crossover 从 64K 提前到 32K。
+**Decode 整条曲线几乎变 flat**（8K → 512K context × 64 但 decode 仅 1.6×），sparse attention 的 sub-linear 性质完全落地。Decode crossover 仍在 32K（不变），但**所有长度的 HSA/Dense 倍数都大幅放大**：
 
-8K 还差 1.58ms 到 dense。剩余的 3.69ms 分布：sbtopk (1.5ms 不可消) + hsa_decode_paged_fwd (0.84ms 已是 triton) + 模型投影 (0.78ms 已 fused) + 长尾小 op。架构性 floor 大概在 3.5ms。
+| Length | R22 HSA/Dense | R24 HSA/Dense |
+|---|---|---|
+| 32K | 1.06× | **1.33×** |
+| 64K | 1.78× | **2.31×** |
+| 128K | 3.22× | **4.78×** |
+| 256K | 4.89× | **7.98×** |
+| **512K** | **6.53×** | **12.54×** |
 
 ---
 
 ## 最终 R22 后的 HSA vs Dense 总表
 
-**Decode（ms/token, 都开 cuda graph, bs=1）**
+**Decode（ms/token, 都开 cuda graph, bs=1, post-R24）**
 
 | Length | HSA-CG | Dense-CG | **HSA/Dense** |
 |---|---|---|---|
-| 8K | 3.69 | 2.11 | 0.57× |
-| **32K** | **4.12** | **4.37** | **1.06× ✅ crossover** |
-| 64K | 4.42 | 7.89 | **1.78×** |
-| 128K | 5.30 | 17.07 | **3.22×** |
-| 256K | 6.84 | 33.42 | **4.89×** |
-| 512K | 10.08 | 65.83 | **6.53×** |
+| 8K | 3.31 | 2.11 | 0.64× |
+| **32K** | **3.29** | **4.37** | **1.33× ✅ crossover** |
+| 64K | 3.41 | 7.89 | **2.31×** |
+| 128K | 3.57 | 17.07 | **4.78×** |
+| 256K | 4.19 | 33.42 | **7.98×** |
+| **512K** | **5.25** | **65.83** | **12.54×** |
 
 **Prefill（s, R21 不影响）**
 
