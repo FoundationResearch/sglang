@@ -1046,15 +1046,12 @@ class HSAAttnBackend(AttentionBackend):
                 swa_w_q = None
 
             # R25: fuse the SWA blend into hsa_decode_paged_fwd's epilogue.
-            # Need swa_w_q at [B, HQ_hsa] granularity (per_qhead and R20-modified
-            # legacy h_kv path both already output that shape; legacy fallback
-            # below handles the old h_kv expansion).
-            if swa_w_q is None and swa_w_kv is not None:
-                swa_w_q = (
-                    swa_w_kv[:, :, None]
-                    .expand(B, H_hsa, Gh)
-                    .reshape(B, HQ_hsa)
-                )
+            # Need swa_w_q at [B, HQ_hsa] granularity.  Both per_qhead and
+            # R20-modified legacy h_kv paths now ALWAYS output swa_w_q already
+            # at HQ granularity (swa_w_kv is None on both branches above), so
+            # the legacy expansion path is dead.  The fallback (`hsa_window
+            # <= 0` else branch) sets swa_w_q = None — handled in
+            # hsa_decode_paged_fwd by BLEND_SWA=False, no expansion needed.
 
             k_cache_hsa = pool.get_key_buffer(layer.layer_id)[:, H_swa : H_swa + H_hsa, :]
             v_cache_hsa = pool.get_value_buffer(layer.layer_id)[:, H_swa : H_swa + H_hsa, :]
@@ -1072,10 +1069,14 @@ class HSAAttnBackend(AttentionBackend):
                 swa_w_q=swa_w_q,
             )  # [B, HQ_hsa, D] bf16 (blend already applied inside kernel)
 
+            # R34: HSA-345M has HQ_swa == 0 — skip the empty+slice-write that
+            # otherwise copies out_hsa into a fresh out_all (≈2KB/layer × 16
+            # layers under CG = ~30µs/step that's pure data motion for nothing).
+            if HQ_swa == 0:
+                return out_hsa.reshape(q.shape[0], HQ_total * layer.v_head_dim)
             out_all = torch.empty((B, HQ_total, D), device=q3.device, dtype=torch.bfloat16)
-            if HQ_swa > 0:
-                out_all[:, :HQ_swa, :] = out_swa.to(torch.bfloat16)
-            out_all[:, HQ_swa:, :] = out_hsa.to(torch.bfloat16)
+            out_all[:, :HQ_swa, :] = out_swa.to(torch.bfloat16)
+            out_all[:, HQ_swa:, :] = out_hsa
             return out_all.reshape(q.shape[0], HQ_total * layer.v_head_dim)
         raise RuntimeError(
             "InnerX ultra only: HSA layers must pass `hsa_split_head_info` kwargs."
