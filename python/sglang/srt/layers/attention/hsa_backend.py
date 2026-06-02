@@ -1048,6 +1048,17 @@ class HSAAttnBackend(AttentionBackend):
                 )
                 swa_w_q = None
 
+            # R25: fuse the SWA blend into hsa_decode_paged_fwd's epilogue.
+            # Need swa_w_q at [B, HQ_hsa] granularity (per_qhead and R20-modified
+            # legacy h_kv path both already output that shape; legacy fallback
+            # below handles the old h_kv expansion).
+            if swa_w_q is None and swa_w_kv is not None:
+                swa_w_q = (
+                    swa_w_kv[:, :, None]
+                    .expand(B, H_hsa, Gh)
+                    .reshape(B, HQ_hsa)
+                )
+
             k_cache_hsa = pool.get_key_buffer(layer.layer_id)[:, H_swa : H_swa + H_hsa, :]
             v_cache_hsa = pool.get_value_buffer(layer.layer_id)[:, H_swa : H_swa + H_hsa, :]
             out_hsa = hsa_decode_paged_fwd(
@@ -1060,20 +1071,9 @@ class HSAAttnBackend(AttentionBackend):
                 page_size=int(self.page_size),
                 sm_scale=getattr(layer, "scaling", None),
                 mask_last_token=True,
-            )  # [B, HQ_hsa, D]
-
-            # Weighted SWA fusion (LHSA: o_lower = hsa_o + swa_o * swa_weight).
-            # Two paths share this final blend:
-            #   * legacy h_kv path: swa_w_kv [B, H_hsa] broadcast to h_q
-            #   * per-q-head path:  swa_w_q already [B, HQ_hsa], no broadcast
-            if swa_w_q is None and swa_w_kv is not None:
-                swa_w_q = (
-                    swa_w_kv[:, :, None]
-                    .expand(B, H_hsa, Gh)
-                    .reshape(B, HQ_hsa)
-                )
-            if swa_w_q is not None:
-                out_hsa = out_hsa.to(torch.float32) + swa_o_inner * swa_w_q[:, :, None]
+                swa_o_inner=swa_o_inner if swa_w_q is not None else None,
+                swa_w_q=swa_w_q,
+            )  # [B, HQ_hsa, D] bf16 (blend already applied inside kernel)
 
             out_all = torch.empty((B, HQ_total, D), device=q3.device, dtype=torch.bfloat16)
             if HQ_swa > 0:

@@ -64,6 +64,9 @@ def hsa_decode_paged_fwd_kernel(
     W_ptr,
     OUT_ptr,
     SEQ_ID_MAP_ptr,  # [T] int32, token_idx -> seq_idx (or dummy when USE_SEQ_MAP=False)
+    # R25: optional SWA blend inputs (pointers; None at Python side when blend disabled)
+    SWA_O_ptr,        # [B, HQ, D] fp32  (internal-SWA output) — only used when BLEND_SWA
+    SWA_W_ptr,        # [B, HQ]    fp32  (internal-SWA blend weight per q-head)
     stride_qb: tl.constexpr,
     stride_qh: tl.constexpr,
     stride_qd: tl.constexpr,
@@ -94,6 +97,7 @@ def hsa_decode_paged_fwd_kernel(
     MAX_T: tl.constexpr,
     mask_last_token: tl.constexpr,
     USE_SEQ_MAP: tl.constexpr,
+    BLEND_SWA: tl.constexpr,
 ):
     pid_b = tl.program_id(0)
     pid_hq = tl.program_id(1)
@@ -174,6 +178,15 @@ def hsa_decode_paged_fwd_kernel(
         out_page = tl.sum(v * p[:, None], axis=0)  # [D]
         acc += w * out_page
 
+    # R25: optional epilogue — fuse SWA blend
+    #   out = bf16( acc + swa_o[b, hq, :] * swa_w[b, hq] )
+    if BLEND_SWA:
+        swa_o = tl.load(
+            SWA_O_ptr + (pid_b * HQ + pid_hq) * D + offs_d, mask=True, other=0.0,
+        ).to(tl.float32)
+        swa_w = tl.load(SWA_W_ptr + pid_b * HQ + pid_hq).to(tl.float32)
+        acc = acc + swa_o * swa_w
+
     out_ptr = OUT_ptr + pid_b * stride_out_b + pid_hq * stride_out_hq
     # FlashHSA alignment: bf16-only output.
     tl.store(out_ptr + offs_d * stride_out_d, acc.to(tl.bfloat16), mask=True)
@@ -192,6 +205,9 @@ def hsa_decode_paged_fwd(
     mask_last_token: bool = True,
     out: Optional[torch.Tensor] = None,
     token_to_seq_id: Optional[torch.Tensor] = None,
+    # R25: optional SWA blend in the same kernel
+    swa_o_inner: Optional[torch.Tensor] = None,   # [B, HQ, D] fp32
+    swa_w_q: Optional[torch.Tensor] = None,       # [B, HQ]    fp32
 ) -> torch.Tensor:
     """Paged-KV kernel (FlashHSA semantics) for decode and extend.
 
@@ -250,6 +266,18 @@ def hsa_decode_paged_fwd(
     else:
         assert out.shape == (N, HQ, D)
 
+    # R25: blend-in-kernel inputs
+    blend_swa = (swa_o_inner is not None) and (swa_w_q is not None)
+    if blend_swa:
+        assert swa_o_inner.shape == (N, HQ, D), f"{swa_o_inner.shape} != ({N}, {HQ}, {D})"
+        assert swa_w_q.shape == (N, HQ), f"{swa_w_q.shape} != ({N}, {HQ})"
+        swa_o_ = swa_o_inner.to(torch.float32).contiguous()
+        swa_w_ = swa_w_q.to(torch.float32).contiguous()
+    else:
+        # Pass dummy pointers (kernel won't read these when BLEND_SWA=False).
+        swa_o_ = torch.zeros(1, dtype=torch.float32, device=q.device)
+        swa_w_ = torch.zeros(1, dtype=torch.float32, device=q.device)
+
     grid = (N, HQ)
     hsa_decode_paged_fwd_kernel[grid](
         q_,
@@ -260,6 +288,8 @@ def hsa_decode_paged_fwd(
         w_,
         out,
         seq_map_,
+        swa_o_,
+        swa_w_,
         q_.stride(0),
         q_.stride(1),
         q_.stride(2),
@@ -290,6 +320,7 @@ def hsa_decode_paged_fwd(
         MAX_T=MAX_T,
         mask_last_token=bool(mask_last_token),
         USE_SEQ_MAP=use_seq_map,
+        BLEND_SWA=blend_swa,
         num_warps=4,
     )
     return out
