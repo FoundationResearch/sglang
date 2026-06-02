@@ -22,7 +22,7 @@
 | **阶段 A：消除 Python/sync 开销** | R8-R12 | 干掉 `.item()` 同步、Python `for` 循环、冗余 clone | decode 521ms→159ms @32K (3.3×) |
 | **阶段 B：selector 大改** | R14 | prefill-tuned tilelang kernel 在 decode 严重 underutil GPU，换成 torch matmul + topk | decode 504ms→49ms @128K (10.3×) |
 | **阶段 C：CUDA graph 集成** | R15 / R15.1 / R15.2 | HSA 自己的 capture/replay buffer，修 silent dense fallback | decode 49ms→17ms @128K (2.9×) |
-| **阶段 D：短 context 攻坚** | R16-R21 | 各种小 op 融合 + 内部 SWA flash attention 化 | 8K decode 5.40ms→3.98ms (-26%)，32K 反超 dense |
+| **阶段 D：短 context 攻坚** | R16-R23 | 各种小 op 融合 + 内部 SWA flash attention 化 + topk sorted=False | 8K decode 5.40ms→3.69ms (-32%)，32K 反超 dense |
 
 ---
 
@@ -182,18 +182,60 @@
 
 ---
 
-## 最终 R21 后的 HSA vs Dense 总表
+### R22 — `torch.topk(sorted=False)` 白送优化
+* **改**：selector decode fast path 里 `topk(k, dim=-1)` 加 `sorted=False`
+* **为什么**：torch.topk 默认 `sorted=True` 触发内部 `bitonicSortKVInPlace`（profile 显示 195us / 48 calls / 4us per call）。R17 已经去掉了下游的 sort-by-index，根本不需要 value 排序
+* **commit**：`2815dc193`
+* **收益**：
+  | Length | Post-R21 | Post-R22 | Δ |
+  |---|---|---|---|
+  | 8K | 3.98 | 3.69 | **-7.3%** |
+  | 32K | 4.13 | 4.12 | -0.2% |
+  | 128K | 5.32 | 5.30 | -0.4% |
+* **验证**：alignment KL 不变
+
+---
+
+### R23 — ❌ custom triton topk via `tl.sort` + bit-pack（**回滚**）
+* **改**：用 triton 3.5 的 `tl.sort` + bit-packing trick（fp32→sortable uint32 + idx 打包成 int64）写 fused topk
+* **正确性**：bit-exact 通过（44 个 case，C ∈ [16, 2050], K ∈ [4, 32]）
+* **结果**：**比 PyTorch sbtopk 慢 2.8× @8K**（3.68ms→10.47ms）。triton 的 `tl.sort` 在 256-2050 元素的 uint64 上 launch+execute overhead 比 PyTorch 的 radix-based sbtopk 高得多
+* **教训**：PyTorch sbtopk 是 single-block 加 radix selection，已经是这个尺寸的最优解。除非完全融合 (matmul + topk) 否则难超越
+
+---
+
+### 短 context 攻坚阶段总结
+
+R16-R23 五轮总收益（8K decode）：
+
+| Round | 8K decode | 32K decode | 备注 |
+|---|---|---|---|
+| R15.2 baseline | 5.40 | 5.98 | |
+| R16 | 5.44 | 5.77 | bf16 SWA |
+| R17 | 5.29 | 5.62 | skip sort |
+| R18 | 5.20 | 5.42 | h_kv fused |
+| R20 | 5.18 | 5.47 | swa_w HQ-granularity |
+| **R21** | **3.98** | **4.13** | **streaming flash SWA** |
+| **R22** | **3.69** | **4.12** | **topk sorted=False** |
+
+净改善：**8K -32%, 32K -31%**。32K HSA decode 反超 dense，crossover 从 64K 提前到 32K。
+
+8K 还差 1.58ms 到 dense。剩余的 3.69ms 分布：sbtopk (1.5ms 不可消) + hsa_decode_paged_fwd (0.84ms 已是 triton) + 模型投影 (0.78ms 已 fused) + 长尾小 op。架构性 floor 大概在 3.5ms。
+
+---
+
+## 最终 R22 后的 HSA vs Dense 总表
 
 **Decode（ms/token, 都开 cuda graph, bs=1）**
 
 | Length | HSA-CG | Dense-CG | **HSA/Dense** |
 |---|---|---|---|
-| 8K | 3.98 | 2.11 | 0.53× |
-| **32K** | **4.13** | **4.37** | **1.06× ✅ crossover** |
-| 64K | 4.62 | 7.89 | **1.71×** |
-| 128K | 5.32 | 17.07 | **3.21×** |
-| 256K | 6.89 | 33.42 | **4.85×** |
-| 512K | 10.15 | 65.83 | **6.48×** |
+| 8K | 3.69 | 2.11 | 0.57× |
+| **32K** | **4.12** | **4.37** | **1.06× ✅ crossover** |
+| 64K | 4.42 | 7.89 | **1.78×** |
+| 128K | 5.30 | 17.07 | **3.22×** |
+| 256K | 6.84 | 33.42 | **4.89×** |
+| 512K | 10.08 | 65.83 | **6.53×** |
 
 **Prefill（s, R21 不影响）**
 
@@ -215,12 +257,20 @@
 
 ---
 
-## 还在桌上的攻击点（R22+）
+## 还在桌上的攻击点
 
-按 profile 优先级：
-1. **`sbtopk::gatherTopK` 31us/call** — 最大单个 op。R19 试过 custom topk 但失败。要超越需要写 radix-based topk in triton（复杂）
-2. **HSA-only 多出来的 lmk_q_down + lmk_q_up matmul**（~80us/layer × 16 = 1.3ms/step at 8K） — 可能融进 QKV 投影
-3. **hsa_decode_paged_fwd + blend 融合** — 已经是 triton kernel，再加 SWA blend epilogue
-4. **Selector matmul + topk 全融合** — 一个 kernel 做 Q·K + topk + cast
+按 profile 优先级 (R22 之后)：
+1. **`sbtopk::gatherTopK` 31us/call (8K)** — 最大单个 op (1.5ms / 40%)。R19 试过 iterative，R23 试过 tl.sort，**都比 sbtopk 慢**。要超越需要完全融合 (matmul + topk + cast 一个 kernel)，复杂度高、收益不确定
+2. **完全融合 HSA layer (selector + internal_swa + chunk_weight + paged_decode + blend → 单 mega-kernel)** — 工程量数周，估计能把 8K 从 3.69ms 压到 ~2.5ms。但需要重写大量内核，且影响后续 model 改动
+3. **接受架构性 floor** — HSA 在 ≤32K 已经能跟 dense 打平/反超，64K+ 优势越来越大。**短 context 的物理 floor 大概 3.5ms（vs dense 2.1ms），这是 sparse attention 算法的本质开销**
 
-8K 还差 1.87ms 到 dense (3.98 vs 2.11)，攻克需要再 fuse 几个大 kernel。
+## 给团队的结论
+
+HSA 在 sglang 上的实现已经全面跑通：
+- **CUDA graph integration 完成**（带正确性验证防 silent fallback）
+- **数值正确性**：alignment KL 跟 baseline bit-identical；end-to-end CG capture+replay logits 也 bit-identical
+- **性能**：
+  - prefill 在 ≥32K 反超 dense，512K 时快 4×
+  - decode 在 ≥32K 反超 dense，512K 时快 6.5×
+  - 短 context (8K) 仍输 dense ~2×，是 sparse attention 的架构性常数开销
+- **vs 论文 (H20, naive FA baseline)**：我们的 ratio 在每个 long-context 点都比论文大（论文 512K decode 2.46× vs 我们 6.53×），且是打 production-grade FlashInfer baseline
