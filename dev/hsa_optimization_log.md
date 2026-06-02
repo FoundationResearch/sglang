@@ -224,17 +224,45 @@
   - end-to-end CG multi-step 4 个 decode iteration: token 全部对齐
   - probe 确认 `fused_selector_score_kernel × 48` 真的在跑（2.67us/call），0 个 dense kernel fallback
 
+### R25 — SWA blend 融进 `hsa_decode_paged_fwd_kernel` epilogue
+* **改**：让 `hsa_decode_paged_fwd_kernel` 接受可选的 `swa_o_inner` + `swa_w_q` 指针 + `BLEND_SWA` constexpr。开启时在 acc 计算完成后直接加 `swa_o * swa_w` 再 bf16 store
+* **为什么**：原来 hsa_decode 出来还要 `.to(fp32) + swa_o * swa_w_q + .to(bf16)` 共 3-4 个小 op。融进 kernel 省 launch
+* **commit**：`e318df327`
+* **收益**：marginal (~1-2%)
+  | Length | R24 | R25 | Δ |
+  |---|---|---|---|
+  | 8K | 3.31 | 3.23 | -2.4% |
+  | 32K | 3.29 | 3.25 | -1.2% |
+  | 128K | 3.59 | 3.51 | -2.2% |
+  | 512K | 5.25 | 5.15 | -1.9% |
+* **验证**：alignment KL bit-identical, e2e CG capture+replay max_abs_diff = 0
+
 ### 短 context 攻坚阶段总结
 
-R16-R24 总收益（HSA-CG decode, ms）：
+R16-R25 总收益（HSA-CG decode, ms）：
 
 | Round | 8K | 32K | 128K | 512K | 备注 |
 |---|---|---|---|---|---|
 | R15.2 baseline | 5.40 | 5.98 | 6.84 | 11.75 | cuda graph 集成完成 |
 | R21 | 3.98 | 4.13 | 5.32 | 10.15 | streaming flash SWA |
 | R22 | 3.69 | 4.12 | 5.30 | 10.08 | topk sorted=False |
-| **R24** | **3.31** | **3.29** | **3.57** | **5.25** | **fused selector score** |
-| **总省** | **-39%** | **-45%** | **-48%** | **-55%** | |
+| R24 | 3.31 | 3.29 | 3.57 | 5.25 | fused selector score |
+| **R25** | **3.23** | **3.25** | **3.51** | **5.15** | **SWA blend in kernel** |
+| **总省 (R15.2→R25)** | **-40%** | **-46%** | **-49%** | **-56%** | |
+
+### 8K 物理底分析
+
+3.23ms 分布（profile post-R25）：
+- `sbtopk::gatherTopK`: ~500us（PyTorch 内置 radix topk，R19/R23 两次自定义都更慢）
+- `hsa_decode_paged_fwd_kernel`: ~283us（已是优化的 triton kernel）
+- 模型投影 nvjet_tst: ~460us（6 matmul/layer, R1-R3 已经 fuse 到只剩 QKV+O+lmk_q）
+- 小 elementwise/cast/reduce ops: ~333us
+- HSA-specific fused kernels (selector R24, chunk_weight R18, internal SWA R21, blend R25): ~200us
+- sglang dispatch overhead: ~660us
+
+Dense 8K = 2.11ms。1.12ms 差距 = sglang dispatch 开销 + HSA 多出的 ~500us（selector + sparse-specific 操作）+ ~200us 小 op 长尾。
+
+进一步压缩需要：(a) 重写整个 HSA layer 成单个 mega-kernel（消除 sglang 内部 dispatch + 所有小 op），或 (b) 改 sglang 框架本身。两者都是大工程。
 
 **Decode 整条曲线几乎变 flat**（8K → 512K context × 64 但 decode 仅 1.6×），sparse attention 的 sub-linear 性质完全落地。Decode crossover 仍在 32K（不变），但**所有长度的 HSA/Dense 倍数都大幅放大**：
 
