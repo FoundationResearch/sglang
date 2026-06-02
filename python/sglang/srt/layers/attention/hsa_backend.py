@@ -983,7 +983,9 @@ class HSAAttnBackend(AttentionBackend):
             assert HQ_hsa % H_hsa == 0
             Gh = HQ_hsa // H_hsa
             TOPK = int(selected_page_ids.shape[2])
-            valid = selected_page_ids >= 0
+            # R31: `valid = selected_page_ids >= 0` was used only in the
+            # hsa_window <= 0 fallback branch — defer its compute to there
+            # (saves ~24µs/step at 16K, ~1.5µs × 16 layers).
 
             # Per-q-head fusion path: when the selector exposed per-q-head
             # scores AND the SWA branch exposed per-q-head LSE, do the entire
@@ -1029,6 +1031,7 @@ class HSAAttnBackend(AttentionBackend):
                 swa_w_kv = None  # use swa_w_q directly downstream
             else:
                 # No internal SWA: independent softmax over scores.
+                valid = selected_page_ids >= 0
                 scores = selected_scores.masked_fill(~valid, float("-inf"))
                 w_kv = torch.softmax(scores, dim=-1)
                 w_kv = torch.nan_to_num(w_kv, nan=0.0).to(q_hsa.dtype)
