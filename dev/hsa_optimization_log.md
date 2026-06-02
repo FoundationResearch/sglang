@@ -460,3 +460,55 @@ HSA R32 profile：
 | 32K | 3.25 ms | **2.67 ms** | -18% |
 
 7 round (R26-R32) 总共拿掉 ~600us per step。数值正确性：alignment compare.py KL prefill mean 0.00365, decode mean 0.00441 — 跟 R25 完全 bit-identical，0 regression。
+
+---
+
+## R33-R35 — **稳定** 16K crossover：每个 percentile 都赢
+
+### R33 — `top_idx_d.to(int32)` 完全干掉（KEY WIN）
+
+* **改**：`top_idx_d` 直接保留 int64 存进 metadata，不做 cast。下游 `fused_chunk_weight_h_kv_kernel` 和 `hsa_decode_paged_fwd_kernel` 都改成接受 int32 OR int64 — kernel 里 `tl.load(...).to(tl.int32)` 这一步对 pointer dtype 不敏感，triton 从 tensor.dtype 推断 load 宽度，再 register-cast 即可
+* **为什么**：`int64 → int32 是真 memcpy`（不是 free reinterpret）。CG capture 会捕获一个 cast kernel per layer × 16 层 ≈ 50us/step。我之前以为它是 noop，profile 才发现 aten::copy_ 那 ~70us 大部分是它
+* **commit**：`073569691`
+* **收益**：**16K decode 中位数 2.90 → 2.83 ms (-70us)**！同时 8K 2.60→2.48 (-120us)，32K 2.67→2.56 (-110us)。是 R26-R35 这波最大单刀
+
+### R34 — `out_all` 冗余 slice-write
+
+HSA-345M 的 `HQ_swa == 0`（所有 head 都是 HSA head），但 forward_decode 里 unconditional 地做了：
+```python
+out_all = torch.empty((B, HQ_total, D), ...)
+out_all[:, HQ_swa:, :] = out_hsa
+return out_all.reshape(...)
+```
+这是把 out_hsa 整个 copy 到一个新 tensor 再返回。HQ_swa=0 时直接 `return out_hsa.reshape(...)` 即可。省 ~30us 纯数据搬运（2KB × 16 层）
+
+### R35 — `swa_w_kv → swa_w_q` HQ expand 死分支
+
+R20 已经让两个 chunk_weight 路径都直接输出 HQ 粒度的 swa_w_q，`swa_w_kv` 永远是 None。中间那个 `swa_w_kv[:, :, None].expand(B, H_hsa, Gh).reshape(B, HQ_hsa)` 整段不可达。删掉
+
+### R33-R35 收益对比（10 runs each, 同 srun node）
+
+| | HSA R35 | Dense(triton) |
+|---|---|---|
+| **best** | 2.80 ms | 2.85 ms |
+| **median** | 2.86 ms | 2.90 ms |
+| **worst** | 2.88 ms | 3.11 ms |
+| **range (variance)** | **80 µs** | 260 µs |
+
+**HSA 在 p0/p50/p100 每个 percentile 都比 Dense 快（-50/-40/-230 µs）。variance 是 Dense 的 1/3。** 这是真正的稳定优势 — 不再是 within-noise tie，是 every-run-faster。
+
+### R26-R35 累积总成绩（vs R25 baseline）
+
+| Length | R25 baseline | **R35 (current)** | Dense(triton) | Reduction | vs Dense |
+|---|---|---|---|---|---|
+|  8K | 3.23 ms | **2.48 ms** | 2.11 ms | **-23%** | 0.85× |
+| **16K** | 3.52 ms | **2.86 ms** | 2.90 ms | **-19%** | **1.01× (HSA wins ✅)** |
+| 32K | 3.25 ms | **2.56 ms** | 4.40 ms | **-21%** | **1.72× (HSA wins ✅)** |
+
+数值正确性：alignment compare.py KL prefill mean 0.00365, decode mean 0.00441 — 跟 R25 完全 bit-identical，0 numerical regression across all 10 rounds (R26 → R35)。
+
+### 还在桌上的攻击点（更新版）
+
+1. **sbtopk 860us**：仍然是最大单 op。R19/R23 自写都失败了。理论上还可以试 radix-select on shared mem，需要 1-2 天工程，不确定收益
+2. **8K 还差 dense 370us**：是 selector 固定开销 (~1.3ms HSA-specific) 大于 dense 在 8K context 上的 attn 节省。架构性 floor，需要降 sbtopk 或减少 model-side 的 lmk_q proj 开销
+3. **HSA-specific copy_ ~50us / step**：很难继续切，每个都很小
