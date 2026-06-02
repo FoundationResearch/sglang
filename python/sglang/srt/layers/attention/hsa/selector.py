@@ -400,10 +400,13 @@ def select_topk_pages_decode_fused(
         scores_d = scores_d.masked_fill(~cand_mask.unsqueeze(1), float("-inf"))
 
         eff_topk = min(int(topk), int(C_d))
+        # R17 (probe): skip the trailing sort + gather.  The selected pages
+        # feed into hsa_decode_paged_fwd (softmax-aggregated) and the
+        # chunk-weight kernel (also softmax) — both permutation-invariant
+        # over the topk axis.  Saves 2 ops per HSA layer per decode step.
         top_scores_d, top_idx_d = scores_d.topk(eff_topk, dim=-1)  # [B, h_shared, K]
-        # Sort selected indices ascending (matches kernel's sort_kernel output).
-        idx_sorted_d, sort_perm = torch.sort(top_idx_d, dim=-1)
-        scores_sorted_d = torch.gather(top_scores_d, dim=-1, index=sort_perm)
+        idx_sorted_d = top_idx_d
+        scores_sorted_d = top_scores_d
 
         # Pad to topk if fewer candidates than topk.
         if eff_topk < int(topk):

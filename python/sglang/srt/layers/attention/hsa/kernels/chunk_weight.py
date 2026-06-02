@@ -95,6 +95,116 @@ def fused_chunk_weight_per_qhead_kernel(
     tl.store(swa_w_q_ptr + b * HQ + hq, swa_w_val)
 
 
+@triton.jit
+def fused_chunk_weight_h_kv_kernel(
+    scores_ptr,           # [B, H, K]  float32
+    lse_kv_ptr,           # [B, H]     float32
+    selected_pages_ptr,   # [B, H, K]  int32
+    w_q_ptr,              # [B, HQ, K] bf16  (output, broadcast across Gh)
+    swa_w_kv_ptr,         # [B, H]     float32 (output, broadcast write OK)
+    H: tl.constexpr,
+    HQ: tl.constexpr,
+    Gh: tl.constexpr,
+    K: tl.constexpr,
+    SOFTMAX1: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    """R18: fused legacy h_kv chunk-weight softmax + GQA broadcast.
+
+    Replaces masked_fill + cat + softmax + nan_to_num + slice + cast +
+    expand + reshape + contiguous (9 ops) with a single kernel.  Active
+    on the shared-K (legacy) path that HSA-345M takes when lmk_k_pool
+    isn't allocated.
+    """
+    pid = tl.program_id(axis=0)
+    b = pid // HQ
+    hq = pid % HQ
+    h_kv = hq // Gh
+
+    k_offs = tl.arange(0, BLOCK_K)
+    k_mask = k_offs < K
+
+    scores = tl.load(
+        scores_ptr + (b * H + h_kv) * K + k_offs,
+        mask=k_mask, other=float("-inf"),
+    )
+    sel_pages = tl.load(
+        selected_pages_ptr + (b * H + h_kv) * K + k_offs,
+        mask=k_mask, other=-1,
+    )
+    valid = sel_pages >= 0
+    scores = tl.where(valid & k_mask, scores, float("-inf"))
+
+    lse = tl.load(lse_kv_ptr + b * H + h_kv)
+
+    scores_max = tl.max(scores, axis=0)
+    max_val = tl.maximum(scores_max, lse)
+    if SOFTMAX1:
+        max_val = tl.maximum(max_val, 0.0)
+
+    exp_scores = tl.where(k_mask, tl.exp(scores - max_val), 0.0)
+    exp_lse = tl.exp(lse - max_val)
+    total = tl.sum(exp_scores, axis=0) + exp_lse
+    if SOFTMAX1:
+        total = total + tl.exp(-max_val)
+
+    inv_total = tl.where(total > 0.0, 1.0 / total, 0.0)
+    w_vals = exp_scores * inv_total
+    swa_w_val = exp_lse * inv_total
+
+    # Store w_q at (b, hq) — broadcast from h_kv (each of the Gh hq slots
+    # gets the same per-h_kv weight row).
+    tl.store(
+        w_q_ptr + (b * HQ + hq) * K + k_offs,
+        w_vals.to(tl.bfloat16),
+        mask=k_mask,
+    )
+    # Store swa_w_kv at (b, h_kv).  All Gh programs in the GQA group write
+    # the same value, so duplicate writes are idempotent — no race.
+    tl.store(swa_w_kv_ptr + b * H + h_kv, swa_w_val)
+
+
+def fused_chunk_weight_h_kv_decode(
+    selected_scores: torch.Tensor,   # [B, H_hsa, K] float32
+    lse_kv: torch.Tensor,            # [B, H_hsa]    float32
+    selected_page_ids: torch.Tensor, # [B, H_hsa, K] int32
+    Gh: int,
+    enable_softmax1: bool,
+    out_dtype: torch.dtype = torch.bfloat16,
+):
+    """Fused legacy h_kv chunk-weight + GQA broadcast.
+
+    Returns:
+      w_q     : [B, HQ_hsa, K] bf16 (chunk weights, GQA-broadcast)
+      swa_w_kv: [B, H_hsa]    float32 (SWA blend weight per h_kv)
+    """
+    assert selected_scores.dtype == torch.float32
+    assert lse_kv.dtype == torch.float32
+    assert selected_page_ids.dtype == torch.int32
+    B, H, K = selected_scores.shape
+    HQ = H * Gh
+    assert lse_kv.shape == (B, H)
+    assert selected_page_ids.shape == (B, H, K)
+
+    device = selected_scores.device
+    w_q = torch.empty((B, HQ, K), device=device, dtype=out_dtype)
+    swa_w_kv = torch.empty((B, H), device=device, dtype=torch.float32)
+
+    BLOCK_K = max(triton.next_power_of_2(K), 16)
+    fused_chunk_weight_h_kv_kernel[(B * HQ,)](
+        selected_scores.contiguous(),
+        lse_kv.contiguous(),
+        selected_page_ids.contiguous(),
+        w_q,
+        swa_w_kv,
+        H=H, HQ=HQ, Gh=Gh, K=K,
+        SOFTMAX1=bool(enable_softmax1),
+        BLOCK_K=BLOCK_K,
+        num_warps=4,
+    )
+    return w_q, swa_w_kv
+
+
 def fused_chunk_weight_per_qhead_decode(
     per_qhead_scores: torch.Tensor,
     per_qhead_lse: torch.Tensor,

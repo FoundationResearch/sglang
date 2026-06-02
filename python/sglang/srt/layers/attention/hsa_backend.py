@@ -11,6 +11,7 @@ from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.hsa.kernels import hsa_decode_paged_fwd
 from sglang.srt.layers.attention.hsa.kernels.chunk_weight import (
     fused_chunk_weight_per_qhead_decode,
+    fused_chunk_weight_h_kv_decode,
 )
 from sglang.srt.layers.attention.hsa.kernels.cuda_graph_buffers import (
     update_hsa_cg_buffers,
@@ -1000,32 +1001,17 @@ class HSAAttnBackend(AttentionBackend):
                 )
                 swa_w_kv = None  # signal: use swa_w_q downstream
             elif hsa_window > 0:
-                # Legacy h_kv fusion + broadcast (shared-K path).
-                scores = selected_scores.masked_fill(~valid, float("-inf"))
-                if not self.enable_softmax1:
-                    cat_scores = torch.cat(
-                        [scores, lse_kv.unsqueeze(-1)], dim=-1
-                    )  # [B, H_hsa, K+1]
-                    swa_weight_idx = -1
-                else:
-                    cat_scores = torch.cat(
-                        [
-                            scores,
-                            lse_kv.unsqueeze(-1),
-                            torch.zeros(B, H_hsa, 1, device=scores.device, dtype=scores.dtype),
-                        ],
-                        dim=-1,
-                    )  # [B, H_hsa, K+2]
-                    swa_weight_idx = -2
-                merged_w = torch.softmax(cat_scores, dim=-1)
-                merged_w = torch.nan_to_num(merged_w, nan=0.0)
-                w_kv = merged_w[:, :, :TOPK].to(q_hsa.dtype)
-                swa_w_kv = merged_w[:, :, swa_weight_idx]  # [B, H_hsa]
-                w_q = (
-                    w_kv[:, :, None, :]
-                    .expand(B, H_hsa, Gh, TOPK)
-                    .reshape(B, HQ_hsa, TOPK)
-                    .contiguous()
+                # R18: fused legacy h_kv chunk_weight + GQA broadcast
+                # (9 ops -> 1 triton kernel).
+                w_q, swa_w_kv = fused_chunk_weight_h_kv_decode(
+                    selected_scores=selected_scores,
+                    lse_kv=lse_kv,
+                    selected_page_ids=selected_page_ids.to(torch.int32).contiguous()
+                    if selected_page_ids.dtype != torch.int32 or not selected_page_ids.is_contiguous()
+                    else selected_page_ids,
+                    Gh=Gh,
+                    enable_softmax1=bool(self.enable_softmax1),
+                    out_dtype=q_hsa.dtype,
                 )
                 swa_w_q = None
             else:
