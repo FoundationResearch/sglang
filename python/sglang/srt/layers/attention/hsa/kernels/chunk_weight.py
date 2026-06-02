@@ -207,7 +207,10 @@ def fused_chunk_weight_h_kv_decode(
     """
     assert selected_scores.dtype in (torch.bfloat16, torch.float32), selected_scores.dtype
     assert lse_hq.dtype in (torch.bfloat16, torch.float32), lse_hq.dtype
-    assert selected_page_ids.dtype == torch.int32
+    # R33: accept int32 OR int64 page_ids — kernel's `sel_pages >= 0` works
+    # for either, and saving the host-side int64→int32 cast (~3 µs/layer)
+    # cumulates to ~50 µs/step across 16 layers.
+    assert selected_page_ids.dtype in (torch.int32, torch.int64)
     B, H, K = selected_scores.shape
     HQ = H * Gh
     assert lse_hq.shape == (B, HQ), f"lse_hq {tuple(lse_hq.shape)} != (B={B}, HQ={HQ})"

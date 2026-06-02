@@ -306,9 +306,10 @@ class HSAAttnBackend(AttentionBackend):
             # so selected_page_ids equals top_idx_d directly.  R31: drop the
             # `.masked_fill(top_scores == -inf, -1)` post-process — downstream
             # `fused_chunk_weight_h_kv_kernel` masks via the score's -inf (which
-            # is preserved by sbtopk), not via the page-id's -1 sentinel.  The
-            # `.to(int32)` cast is preserved (chunk_weight asserts int32).
-            md.hsa_selected_page_ids = top_idx_d.to(torch.int32)
+            # is preserved by sbtopk), not via the page-id's -1 sentinel.
+            # R33: keep page_ids as int64 — both chunk_weight and hsa_decode
+            # kernels now accept either dtype (load is in-register cast).
+            md.hsa_selected_page_ids = top_idx_d
             # R28: keep selected_scores in bf16 — chunk_weight kernel casts inline.
             md.hsa_selected_scores = top_scores_d
             self._per_qhead_G = None
@@ -1018,12 +1019,12 @@ class HSAAttnBackend(AttentionBackend):
             elif hsa_window > 0:
                 # R18+R20+R27: fused legacy h_kv chunk_weight + GQA broadcast +
                 # HQ-granular swa_w output + inline logsumexp(lse_hq → lse_kv).
+                # R33: kernel accepts int32 OR int64 page_ids; no host-side cast.
                 w_q, swa_w_q = fused_chunk_weight_h_kv_decode(
                     selected_scores=selected_scores,
                     lse_hq=lse_hq_bf16,
-                    selected_page_ids=selected_page_ids.to(torch.int32).contiguous()
-                    if selected_page_ids.dtype != torch.int32 or not selected_page_ids.is_contiguous()
-                    else selected_page_ids,
+                    selected_page_ids=selected_page_ids if selected_page_ids.is_contiguous()
+                    else selected_page_ids.contiguous(),
                     Gh=Gh,
                     enable_softmax1=bool(self.enable_softmax1),
                     out_dtype=q_hsa.dtype,

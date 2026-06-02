@@ -251,8 +251,14 @@ def hsa_decode_paged_fwd(
     q_ = q.contiguous()
     k_ = k_cache.contiguous()
     v_ = v_cache.contiguous()
-    pt_ = page_table_1.to(torch.int32).contiguous()
-    page_ids_ = selected_page_ids.to(torch.int32).contiguous()
+    pt_ = page_table_1 if page_table_1.dtype == torch.int32 and page_table_1.is_contiguous() \
+        else page_table_1.to(torch.int32).contiguous()
+    # R33: accept int32 OR int64 page_ids; kernel does `.to(tl.int32)` in-register
+    # after the load, so an int64 pointer-dtype just doubles a tiny amount of
+    # gmem traffic (32 ids × 8B = 256B/layer) and saves the explicit cast
+    # (which under CG capture isn't free — it's a fresh int32 buffer alloc).
+    page_ids_ = selected_page_ids if selected_page_ids.is_contiguous() \
+        else selected_page_ids.contiguous()
     w_ = hsa_weights.contiguous()
 
     # For the seq_id_map, use the real tensor or a dummy scalar placeholder.
