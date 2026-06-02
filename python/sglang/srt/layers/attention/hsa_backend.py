@@ -272,6 +272,70 @@ class HSAAttnBackend(AttentionBackend):
             and split_info is not None
             and int(split_info.get("hq_hsa", 0)) > int(split_info.get("h_hsa", 0))
         )
+
+        # R24: legacy h_kv fast path — skip cand_repr materialisation entirely
+        # and use a single triton kernel that gathers K from cache + does Q·K
+        # + applies cand_mask in one go.  Followed by torch.topk (R22).
+        unified = split_info is not None and split_info.get("unified_retrieval", False)
+        if not per_qhead_active and not unified:
+            from sglang.srt.layers.attention.hsa.kernels.fused_selector_score import (
+                fused_selector_score_decode,
+            )
+            import math as _m
+            k_cache_full = pool.get_key_buffer(layer.layer_id)
+            D_d = int(k_cache_full.shape[2])
+            HQ = int(q.shape[-1]) // D_d if q.dim() == 2 else int(q.shape[1])
+            # GQA reduction: H_sel == kv_head_count (or layer.tp_k_head_num)
+            H_sel_d = int(H_sel)
+            assert HQ % H_sel_d == 0, f"HQ={HQ} not divisible by H_sel={H_sel_d}"
+            G_grp = HQ // H_sel_d
+            q3 = q.view(B, HQ, D_d) if q.dim() == 2 else q
+            q_grouped = q3.view(B, H_sel_d, G_grp, D_d).sum(dim=2)  # [B, H_sel, D]
+
+            sm_scale_d = (
+                float(sm_scale_val) if (sm_scale_val := getattr(layer, "scaling", None)) is not None
+                else (1.0 / _m.sqrt(D_d))
+            )
+            H_offset = int(kv_head_offset) if kv_head_offset is not None else 0
+
+            scores_d = fused_selector_score_decode(
+                q=q_grouped,
+                cand_page_ids=cand_page_ids,
+                cand_mask=cand_mask,
+                page_table_1=page_table_1,
+                k_cache_full=k_cache_full,
+                H_offset=H_offset,
+                sm_scale=sm_scale_d,
+                page_size=int(self.page_size),
+            )
+
+            # Topk (R22 sorted=False)
+            eff_topk = min(int(self.hsa_topk), int(C_max))
+            top_scores_d, top_idx_d = scores_d.topk(eff_topk, dim=-1, sorted=False)
+
+            if eff_topk < int(self.hsa_topk):
+                pad_n = int(self.hsa_topk) - eff_topk
+                top_idx_d = torch.cat(
+                    [top_idx_d, top_idx_d.new_full((B, H_sel_d, pad_n), -1)], dim=-1,
+                )
+                top_scores_d = torch.cat(
+                    [top_scores_d, top_scores_d.new_full((B, H_sel_d, pad_n), float("-inf"))], dim=-1,
+                )
+
+            selected_page_ids = top_idx_d.to(torch.int32)
+            selected_page_ids = selected_page_ids.masked_fill(
+                top_scores_d == float("-inf"), -1
+            )
+
+            md.hsa_cand_page_ids = cand_page_ids
+            md.hsa_cand_mask = cand_mask
+            md.hsa_selected_page_ids = selected_page_ids
+            md.hsa_selected_scores = top_scores_d.to(torch.float32)
+            self._per_qhead_G = None
+            self._per_qhead_prior_b = None
+            self._last_per_qhead_scores_decode = None
+            return
+
         if per_qhead_active:
             # cand_page_ids[B, C_max] -> slot ids -> [B, C_max, h_q, D]
             slots = self.req_to_chunk_pool.gather_slots(
