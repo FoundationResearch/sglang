@@ -303,12 +303,12 @@ class HSAAttnBackend(AttentionBackend):
                 )
 
             # In the fast path cand_page_ids[b, c] == c (logical chunk index),
-            # so selected_page_ids equals top_idx_d directly.
-            selected_page_ids = top_idx_d.to(torch.int32).masked_fill(
-                top_scores_d == float("-inf"), -1
-            )
-
-            md.hsa_selected_page_ids = selected_page_ids
+            # so selected_page_ids equals top_idx_d directly.  R31: drop the
+            # `.masked_fill(top_scores == -inf, -1)` post-process — downstream
+            # `fused_chunk_weight_h_kv_kernel` masks via the score's -inf (which
+            # is preserved by sbtopk), not via the page-id's -1 sentinel.  The
+            # `.to(int32)` cast is preserved (chunk_weight asserts int32).
+            md.hsa_selected_page_ids = top_idx_d.to(torch.int32)
             # R28: keep selected_scores in bf16 — chunk_weight kernel casts inline.
             md.hsa_selected_scores = top_scores_d
             self._per_qhead_G = None

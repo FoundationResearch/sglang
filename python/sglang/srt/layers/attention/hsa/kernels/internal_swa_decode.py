@@ -161,11 +161,16 @@ def fused_internal_swa_decode(
 
     device = q_hsa.device
 
-    swa_o = torch.zeros((B, HQ_hsa, D), device=device, dtype=torch.float32)
-    lse_hq = torch.full((B, HQ_hsa), float("-inf"), device=device, dtype=torch.bfloat16)
-
+    # R31: kernel always writes every (b, hq) slot (lines 132-133), so torch.empty
+    # is correct here.  The early-exit below keeps the zeros/full path since the
+    # kernel isn't launched.
     if hsa_window <= 0:
+        swa_o = torch.zeros((B, HQ_hsa, D), device=device, dtype=torch.float32)
+        lse_hq = torch.full((B, HQ_hsa), float("-inf"), device=device, dtype=torch.bfloat16)
         return swa_o, lse_hq
+
+    swa_o = torch.empty((B, HQ_hsa, D), device=device, dtype=torch.float32)
+    lse_hq = torch.empty((B, HQ_hsa), device=device, dtype=torch.bfloat16)
 
     # Window upper bound = hsa_window + page_size (chunk-aligned slack).
     W_total = int(hsa_window) + int(page_size)

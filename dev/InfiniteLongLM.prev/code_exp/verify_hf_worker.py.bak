@@ -1,0 +1,243 @@
+"""
+HF Transformers 侧推理 Worker。
+在 veomni 虚拟环境下运行，完成 chunk prefill + greedy decode，结果序列化到 pickle 文件。
+
+用法（由 run_verify.sh 直接调用）：
+  /root/VeOmni/.venv/bin/python verify_hf_worker.py <config.json>
+"""
+
+import gc
+import json
+import os
+import pickle
+import sys
+import time
+from typing import Dict, List
+
+import torch
+import torch.nn.functional as F
+from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
+from transformers.cache_utils import DynamicCache
+
+# 确保能导入 InfiniteLongLM 的模块
+INFINITELONGLM_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if INFINITELONGLM_ROOT not in sys.path:
+    sys.path.insert(0, INFINITELONGLM_ROOT)
+
+from models.FlashHSA.configuration_hsa import HSAConfig
+from utils.landmark_utils import (
+    create_position_ids_with_landmarks,
+    insert_special_tokens,
+)
+
+
+def resolve_hsa_class(config_path=None):
+    """根据 config 中的 model_type 动态选择 HSAForCausalLM 实现"""
+    model_type = ""
+    if config_path:
+        with open(config_path, "r") as f:
+            model_type = json.load(f).get("model_type", "")
+    if "olmo" in model_type:
+        from models.FlashHSA.modeling_olmo_lhsa import HSAForCausalLM
+        print("[HF] Using OLMo LHSA implementation")
+    else:
+        from models.FlashHSA.modeling_qwen_lhsa import HSAForCausalLM
+        print("[HF] Using Qwen LHSA implementation")
+    return HSAForCausalLM
+
+
+def run_hf_inference(cfg: dict) -> Dict:
+    """HF Transformers 侧：chunk prefill + 手动 greedy decode。"""
+    checkpoint_path = cfg["checkpoint_path"]
+    device_str = cfg["device"]
+    prompt = cfg["prompt"]
+    max_new_tokens = cfg["max_new_tokens"]
+    segment_size = cfg["segment_size"]
+    insert_lmk = cfg["insert_lmk"]
+    adjust_lmk_pos = cfg["adjust_lmk_pos"]
+    vocab_dir = cfg.get("vocab_dir") or checkpoint_path
+
+    device = torch.device(device_str)
+
+    # 加载 tokenizer
+    tokenizer = AutoTokenizer.from_pretrained(vocab_dir)
+    vocab_size = tokenizer.vocab_size
+
+    # 注册模型
+    model_config_path = os.path.join(checkpoint_path, "config.json")
+    HSAForCausalLM = resolve_hsa_class(model_config_path)
+    AutoConfig.register("flash_hsa", HSAConfig)
+    HSAForCausalLM.config_class = HSAConfig
+    AutoModelForCausalLM.register(HSAConfig, HSAForCausalLM)
+
+    model_kwargs = {
+        "torch_dtype": torch.bfloat16,
+        "attn_implementation": "flash_attention_3",
+        "device_map": device,
+    }
+    print(f"[HF] Loading model from: {checkpoint_path}")
+    model = AutoModelForCausalLM.from_pretrained(checkpoint_path, **model_kwargs)
+    model.eval()
+
+    chunk_size = model.config.chunk_size
+    lmk_id = tokenizer.vocab_size
+
+    # Tokenize
+    input_ids = tokenizer.encode(prompt, return_tensors="pt").to(device)
+    orig_seq_len = input_ids.shape[1]
+    print(f"[HF] Prompt tokens: {orig_seq_len}")
+
+    # 插入 LMK
+    if insert_lmk:
+        pos_ids = create_position_ids_with_landmarks(orig_seq_len, chunk_size=chunk_size, device=device)
+        input_ids = insert_special_tokens(input_ids, fill_id=lmk_id, chunk_size=chunk_size)
+    else:
+        pos_ids = None
+
+    seq_len = input_ids.shape[1]
+    print(f"[HF] After LMK insertion: {seq_len} tokens (added {seq_len - orig_seq_len} LMK tokens)")
+
+    # ==================== Phase 1: Chunk Prefill ====================
+    past_key_values = DynamicCache()
+    num_segments = (seq_len + segment_size - 1) // segment_size
+
+    print(f"[HF] Chunk Prefill: {num_segments} segments, segment_size={segment_size}")
+    prefill_start = time.time()
+
+    prefill_all_logits_list = []
+
+    with torch.amp.autocast("cuda", dtype=torch.bfloat16), torch.no_grad():
+        for i in range(num_segments):
+            start_idx = i * segment_size
+            end_idx = min((i + 1) * segment_size, seq_len)
+
+            seg_input_ids = input_ids[:, start_idx:end_idx]
+            seg_cache_pos = torch.arange(start_idx, end_idx, device=device)
+            seg_pos_ids = pos_ids[:, start_idx:end_idx] if pos_ids is not None else None
+
+            out = model(
+                input_ids=seg_input_ids,
+                position_ids=seg_pos_ids,
+                cache_position=seg_cache_pos,
+                use_cache=True,
+                past_key_values=past_key_values,
+                logits_to_keep=end_idx - start_idx,
+            )
+            past_key_values = out.past_key_values
+            seg_logits = out.logits[0][:, :vocab_size].float().cpu()
+            prefill_all_logits_list.append(seg_logits)
+
+            if i == num_segments - 1:
+                last_prefill_logits = out.logits[:, -1, :]
+            del out
+
+    prefill_time = time.time() - prefill_start
+    print(f"[HF] Prefill done in {prefill_time:.2f}s")
+
+    prefill_all_logits = torch.cat(prefill_all_logits_list, dim=0)
+    del prefill_all_logits_list
+
+    # ==================== Phase 2: Greedy Decode ====================
+    generated_ids: List[int] = []
+    decode_logits_list: List[torch.Tensor] = []
+
+    current_logits = last_prefill_logits
+
+    decode_start = time.time()
+    with torch.amp.autocast("cuda", dtype=torch.bfloat16), torch.no_grad():
+        for step in range(max_new_tokens):
+            next_token_id = current_logits.argmax(dim=-1).item()
+            decode_logits_list.append(current_logits.squeeze(0)[:vocab_size].float().cpu())
+            generated_ids.append(next_token_id)
+
+            current_cache_len = past_key_values.get_seq_length()
+
+            if insert_lmk:
+                if (current_cache_len + 1) % chunk_size == 0:
+                    lmk_input = torch.tensor([[lmk_id]], device=device)
+                    lmk_cache_pos = torch.tensor([current_cache_len], device=device)
+                    lmk_pos_id = torch.tensor([[current_cache_len - 1]], device=device) if adjust_lmk_pos else None
+
+                    out_lmk = model(
+                        input_ids=lmk_input,
+                        position_ids=lmk_pos_id,
+                        cache_position=lmk_cache_pos,
+                        use_cache=True,
+                        past_key_values=past_key_values,
+                        logits_to_keep=1,
+                    )
+                    past_key_values = out_lmk.past_key_values
+                    current_cache_len = past_key_values.get_seq_length()
+                    del out_lmk
+
+            next_input = torch.tensor([[next_token_id]], device=device)
+            next_cache_pos = torch.tensor([current_cache_len], device=device)
+
+            if insert_lmk and adjust_lmk_pos:
+                num_lmk_so_far = current_cache_len // chunk_size
+                real_pos = current_cache_len - num_lmk_so_far
+                next_pos_id = torch.tensor([[real_pos]], device=device)
+            else:
+                next_pos_id = None
+
+            out = model(
+                input_ids=next_input,
+                position_ids=next_pos_id,
+                cache_position=next_cache_pos,
+                use_cache=True,
+                past_key_values=past_key_values,
+                logits_to_keep=1,
+            )
+            past_key_values = out.past_key_values
+            current_logits = out.logits[:, -1, :]
+            del out
+
+    decode_time = time.time() - decode_start
+    print(f"[HF] Decode done: {max_new_tokens} tokens in {decode_time:.2f}s "
+          f"({decode_time / max_new_tokens * 1000:.1f} ms/token)")
+
+    decode_text = tokenizer.decode(generated_ids)
+    print(f"[HF] Generated text: {decode_text}")
+    print(f"[HF] Token IDs: {generated_ids}")
+
+    # 释放模型
+    del model, past_key_values
+    gc.collect()
+    torch.cuda.empty_cache()
+    print("[HF] Model released, GPU memory freed.")
+
+    return {
+        "prefill_all_logits": prefill_all_logits,
+        "decode_token_ids": generated_ids,
+        "decode_logits": decode_logits_list,
+        "decode_text": decode_text,
+        "vocab_size": vocab_size,
+    }
+
+
+def main():
+    if len(sys.argv) < 2:
+        print("用法: python verify_hf_worker.py <config.json>")
+        sys.exit(1)
+
+    config_path = sys.argv[1]
+    with open(config_path, "r") as f:
+        cfg = json.load(f)
+
+    output_path = cfg["hf_output_path"]
+
+    print("=" * 60)
+    print("[HF Worker] 开始 HF Transformers 推理")
+    print("=" * 60)
+
+    results = run_hf_inference(cfg)
+
+    with open(output_path, "wb") as f:
+        pickle.dump(results, f)
+
+    print(f"[HF Worker] 结果已保存到: {output_path}")
+    print("[HF Worker] 完成！")
+
+
+if __name__ == "__main__":
+    main()

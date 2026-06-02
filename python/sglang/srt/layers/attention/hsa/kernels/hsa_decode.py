@@ -271,8 +271,12 @@ def hsa_decode_paged_fwd(
     if blend_swa:
         assert swa_o_inner.shape == (N, HQ, D), f"{swa_o_inner.shape} != ({N}, {HQ}, {D})"
         assert swa_w_q.shape == (N, HQ), f"{swa_w_q.shape} != ({N}, {HQ})"
-        swa_o_ = swa_o_inner.to(torch.float32).contiguous()
-        swa_w_ = swa_w_q.to(torch.float32).contiguous()
+        # R31: skip .to(fp32).contiguous() — both tensors are produced by
+        # triton kernels (internal_swa_decode / fused_chunk_weight) as fp32
+        # contiguous, so the calls were dispatch overhead only.  Caller is
+        # responsible for invariants.
+        swa_o_ = swa_o_inner
+        swa_w_ = swa_w_q
     else:
         # Pass dummy pointers (kernel won't read these when BLEND_SWA=False).
         swa_o_ = torch.zeros(1, dtype=torch.float32, device=q.device)
