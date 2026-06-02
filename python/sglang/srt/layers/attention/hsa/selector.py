@@ -400,11 +400,10 @@ def select_topk_pages_decode_fused(
         scores_d = scores_d.masked_fill(~cand_mask.unsqueeze(1), float("-inf"))
 
         eff_topk = min(int(topk), int(C_d))
-        # R17 (probe): skip the trailing sort + gather.  The selected pages
-        # feed into hsa_decode_paged_fwd (softmax-aggregated) and the
-        # chunk-weight kernel (also softmax) — both permutation-invariant
-        # over the topk axis.  Saves 2 ops per HSA layer per decode step.
-        top_scores_d, top_idx_d = scores_d.topk(eff_topk, dim=-1)  # [B, h_shared, K]
+        # R17: skip the trailing sort + gather (selected pages feed into
+        # softmax-aggregated downstream kernels — permutation-invariant).
+        # R22: sorted=False — sbtopk skips its internal bitonic value-sort.
+        top_scores_d, top_idx_d = scores_d.topk(eff_topk, dim=-1, sorted=False)
         idx_sorted_d = top_idx_d
         scores_sorted_d = top_scores_d
 
