@@ -159,9 +159,9 @@ def fused_chunk_weight_h_kv_kernel(
         w_vals.to(tl.bfloat16),
         mask=k_mask,
     )
-    # Store swa_w_kv at (b, h_kv).  All Gh programs in the GQA group write
-    # the same value, so duplicate writes are idempotent — no race.
-    tl.store(swa_w_kv_ptr + b * H + h_kv, swa_w_val)
+    # Store swa_w at (b, hq) directly at HQ granularity — saves the
+    # downstream broadcast op.  Each Gh in the group writes the same value.
+    tl.store(swa_w_kv_ptr + b * HQ + hq, swa_w_val)
 
 
 def fused_chunk_weight_h_kv_decode(
@@ -188,7 +188,8 @@ def fused_chunk_weight_h_kv_decode(
 
     device = selected_scores.device
     w_q = torch.empty((B, HQ, K), device=device, dtype=out_dtype)
-    swa_w_kv = torch.empty((B, H), device=device, dtype=torch.float32)
+    # R20: output swa_w at HQ granularity directly (saves broadcast op).
+    swa_w_kv = torch.empty((B, HQ), device=device, dtype=torch.float32)
 
     BLOCK_K = max(triton.next_power_of_2(K), 16)
     fused_chunk_weight_h_kv_kernel[(B * HQ,)](

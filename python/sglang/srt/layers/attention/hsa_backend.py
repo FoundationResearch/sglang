@@ -1001,9 +1001,9 @@ class HSAAttnBackend(AttentionBackend):
                 )
                 swa_w_kv = None  # signal: use swa_w_q downstream
             elif hsa_window > 0:
-                # R18: fused legacy h_kv chunk_weight + GQA broadcast
-                # (9 ops -> 1 triton kernel).
-                w_q, swa_w_kv = fused_chunk_weight_h_kv_decode(
+                # R18+R20: fused legacy h_kv chunk_weight + GQA broadcast +
+                # HQ-granular swa_w output (saves a downstream broadcast).
+                w_q, swa_w_q = fused_chunk_weight_h_kv_decode(
                     selected_scores=selected_scores,
                     lse_kv=lse_kv,
                     selected_page_ids=selected_page_ids.to(torch.int32).contiguous()
@@ -1013,7 +1013,7 @@ class HSAAttnBackend(AttentionBackend):
                     enable_softmax1=bool(self.enable_softmax1),
                     out_dtype=q_hsa.dtype,
                 )
-                swa_w_q = None
+                swa_w_kv = None  # use swa_w_q directly downstream
             else:
                 # No internal SWA: independent softmax over scores.
                 scores = selected_scores.masked_fill(~valid, float("-inf"))
