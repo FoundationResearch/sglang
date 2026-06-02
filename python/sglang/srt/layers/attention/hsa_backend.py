@@ -389,105 +389,61 @@ class HSAAttnBackend(AttentionBackend):
         B, _, D = q_hsa.shape
         device = q_hsa.device
 
-        swa_o = torch.zeros((B, HQ_hsa, D), device=device, dtype=torch.float32)
-        lse_kv = torch.full((B, H_hsa), float("-inf"), device=device, dtype=torch.float32)
-        # Per-q-head LSE for the per-q-head fusion path (matches official
-        # Qwen3-LHSA layer line 782).
-        lse_hq = torch.full((B, HQ_hsa), float("-inf"), device=device, dtype=torch.float32)
-
         if hsa_window <= 0:
-            self._last_swa_lse_hq_decode = lse_hq.to(q_hsa.dtype)
+            swa_o = torch.zeros((B, HQ_hsa, D), device=device, dtype=torch.float32)
+            lse_kv = torch.full((B, H_hsa), float("-inf"), device=device, dtype=torch.float32)
+            self._last_swa_lse_hq_decode = torch.full(
+                (B, HQ_hsa), float("-inf"), device=device, dtype=q_hsa.dtype
+            )
             return swa_o, lse_kv
 
         md = self.forward_metadata
         pool = getattr(forward_batch, "token_to_kv_pool", None)
         if md is None or pool is None:
-            self._last_swa_lse_hq_decode = lse_hq.to(q_hsa.dtype)
+            swa_o = torch.zeros((B, HQ_hsa, D), device=device, dtype=torch.float32)
+            lse_kv = torch.full((B, H_hsa), float("-inf"), device=device, dtype=torch.float32)
+            self._last_swa_lse_hq_decode = torch.full(
+                (B, HQ_hsa), float("-inf"), device=device, dtype=q_hsa.dtype
+            )
             return swa_o, lse_kv
-
-        k_cache_all = pool.get_key_buffer(layer.layer_id)
-        v_cache_all = pool.get_value_buffer(layer.layer_id)
-        seq_lens_i64 = md.cache_seqlens_int32.to(torch.int64)  # [B]
 
         assert HQ_hsa % H_hsa == 0
         Gh = HQ_hsa // H_hsa
         page_size = int(self.page_size)
         sm_scale = float(getattr(layer, "scaling", 1.0))
 
-        # ---- R11: batch-vectorised SWA on HSA heads (replaces nested Python
-        # for-b / for-kv_h loops + .item() syncs). ----
-        #
-        # Reference semantics (per batch b):
-        #   q_pos = seqlen - 1
-        #   raw_start = q_pos - hsa_window + 1
-        #   chunk_start = max(0, (raw_start // page_size) * page_size)  if raw_start >= 0 else 0
-        #   tok_pos ∈ [chunk_start, seqlen) where (pos % page_size) != (page_size - 1)
-        #
-        # Strategy: build a padded [B, W] tok_pos grid with W = hsa_window + page_size
-        # (safe upper bound on chunk-aligned window length), mask invalid entries,
-        # then run one batched einsum over [B, H_hsa, Gh, W].
-
-        q_pos = seq_lens_i64 - 1
-        raw_start = q_pos - hsa_window + 1
-        chunk_start = torch.where(
-            raw_start >= 0,
-            (raw_start // page_size) * page_size,
-            torch.zeros_like(raw_start),
-        ).clamp_(min=0)  # [B]
-
-        W = int(hsa_window) + int(page_size)
-        pos_offsets = torch.arange(W, device=device, dtype=torch.int64)  # [W]
-        tok_pos = chunk_start[:, None] + pos_offsets[None, :]  # [B, W]
-
-        valid_mask = (
-            (tok_pos < seq_lens_i64[:, None])
-            & ((tok_pos % page_size) != (page_size - 1))
-            & (seq_lens_i64[:, None] > 0)
-        )  # [B, W]
-
-        # Safe gather indices (out-of-range entries are masked out downstream).
-        cap = page_table_1.shape[1] - 1
-        tok_pos_safe = tok_pos.clamp(min=0, max=cap)
-        token_locs = torch.gather(page_table_1.to(torch.int64), 1, tok_pos_safe)  # [B, W]
-
-        # Slice HSA kv-heads from the cache *before* the gather to cut memory traffic.
-        # R16: keep K/V in their native bf16 dtype so the einsum picks tensor-core
-        # GEMM (nvjet_tst_*) instead of the float32 simt cutlass kernel.  We
-        # cast Q to bf16 too (it's already bf16 upstream) and only promote to
-        # fp32 right after the matmul for the softmax/logsumexp where precision
-        # actually matters.  At decode this turns the 10.7us cutlass3x_sm100_simt_sgemm
-        # call (per layer, fp32 simt) into a sub-2us nvjet_tst (bf16 tensor core).
-        k_hsa = k_cache_all[:, H_swa : H_swa + H_hsa, :]  # [num_locs, H_hsa, D]
-        v_hsa = v_cache_all[:, H_swa : H_swa + H_hsa, :]
-        flat_locs = token_locs.reshape(-1)  # [B*W]
-        k_win = k_hsa[flat_locs].view(B, W, H_hsa, D)  # [B, W, H_hsa, D] (bf16)
-        v_win = v_hsa[flat_locs].view(B, W, H_hsa, D)  # bf16
-
-        # Q: [B, HQ_hsa, D] -> [B, H_hsa, Gh, D]  (bf16)
-        q_hgd = q_hsa.view(B, H_hsa, Gh, D)
-
-        # Logits in fp32 (einsum auto-promotes); use tensor-core bf16 GEMM
-        # internally because both operands are bf16.
-        logits = torch.einsum("bhgd,bwhd->bhgw", q_hgd, k_win).to(torch.float32) * sm_scale
-        logits = logits.masked_fill(~valid_mask[:, None, None, :], float("-inf"))
-
-        lse_per_q = torch.logsumexp(logits, dim=-1)  # [B, H_hsa, Gh] fp32
-        p = torch.softmax(logits, dim=-1)            # [B, H_hsa, Gh, W] fp32
-        p = torch.nan_to_num(p, nan=0.0)
-        # Cast attention weights back to bf16 for the P @ V tensor-core GEMM.
-        o = torch.einsum("bhgw,bwhd->bhgd", p.to(v_win.dtype), v_win).to(torch.float32)
-        # ^ [B, H_hsa, Gh, D] fp32 to preserve precision in the final swa_o output
-        #   (which feeds back into the blend below).
-
-        swa_o = o.reshape(B, HQ_hsa, D)
-        lse_kv = torch.logsumexp(lse_per_q, dim=-1)  # [B, H_hsa]
-        lse_hq = lse_per_q.reshape(B, HQ_hsa)
+        # R21: fused streaming-flash-attention triton kernel.  Collapses ~15
+        # ops (R11+R16 chain: window construction, K/V gather, two einsums,
+        # softmax, nan_to_num, casts) into a single launch.  Each program
+        # handles one (b, hq) and walks the chunk-aligned window in BLOCK_W
+        # chunks with online-softmax running max/sum updates.  LMK exclusion
+        # happens inside the kernel via `(pos+1) % page_size != 0`.
+        from sglang.srt.layers.attention.hsa.kernels.internal_swa_decode import (
+            fused_internal_swa_decode,
+        )
+        k_cache_all = pool.get_key_buffer(layer.layer_id)
+        v_cache_all = pool.get_value_buffer(layer.layer_id)
+        swa_o, lse_hq_bf16 = fused_internal_swa_decode(
+            q_hsa=q_hsa,
+            k_cache_full=k_cache_all,
+            v_cache_full=v_cache_all,
+            page_table_1=page_table_1,
+            cache_seqlens=md.cache_seqlens_int32,
+            H_swa=int(H_swa),
+            H_hsa=int(H_hsa),
+            HQ_hsa=int(HQ_hsa),
+            page_size=page_size,
+            hsa_window=int(hsa_window),
+            sm_scale=sm_scale,
+        )
+        # h_kv-aggregated LSE (used by the legacy h_kv chunk-weight path).
+        lse_hq_f32 = lse_hq_bf16.view(B, H_hsa, Gh).to(torch.float32)
+        lse_kv = torch.logsumexp(lse_hq_f32, dim=-1)  # [B, H_hsa]
 
         # Match official lhsa_layer.py:625 — lse_sum.to(hidden_states.dtype)
         # casts the per-q-head LSE to bf16 before it feeds the chunk_weight
-        # softmax.  Keeping fp32 here would give us MORE precision than the
-        # reference and cause a small consistent drift in cat_scores.
-        self._last_swa_lse_hq_decode = lse_hq.to(q_hsa.dtype)
+        # softmax.  Our kernel already outputs bf16.
+        self._last_swa_lse_hq_decode = lse_hq_bf16
         return swa_o, lse_kv
 
     def _build_hsa_lmk_excluded_indices(self, forward_batch: ForwardBatch):
