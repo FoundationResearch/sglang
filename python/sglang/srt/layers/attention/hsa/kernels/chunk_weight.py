@@ -97,24 +97,31 @@ def fused_chunk_weight_per_qhead_kernel(
 
 @triton.jit
 def fused_chunk_weight_h_kv_kernel(
-    scores_ptr,           # [B, H, K]  float32
-    lse_kv_ptr,           # [B, H]     float32
+    scores_ptr,           # [B, H, K]  bf16 OR float32 (R28 accepts bf16)
+    lse_hq_ptr,           # [B, HQ]    bf16 OR float32 (per-q-head LSE, R27)
     selected_pages_ptr,   # [B, H, K]  int32
     w_q_ptr,              # [B, HQ, K] bf16  (output, broadcast across Gh)
-    swa_w_kv_ptr,         # [B, H]     float32 (output, broadcast write OK)
+    swa_w_kv_ptr,         # [B, HQ]    float32 (output, HQ granularity per R20)
     H: tl.constexpr,
     HQ: tl.constexpr,
     Gh: tl.constexpr,
     K: tl.constexpr,
     SOFTMAX1: tl.constexpr,
+    LSE_IS_BF16: tl.constexpr,
+    SCORES_IS_BF16: tl.constexpr,
     BLOCK_K: tl.constexpr,
 ):
-    """R18: fused legacy h_kv chunk-weight softmax + GQA broadcast.
+    """R18+R27: fused legacy h_kv chunk-weight softmax + GQA broadcast +
+    inlined per-q-head logsumexp aggregation.
+
+    R27: previously took `lse_kv [B, H]` (computed via torch.logsumexp
+    over Gh).  Now takes raw `lse_hq [B, HQ]` and does the logsumexp
+    reduction inline — saves ~17µs/layer × 16 layers = ~270µs/step.
 
     Replaces masked_fill + cat + softmax + nan_to_num + slice + cast +
-    expand + reshape + contiguous (9 ops) with a single kernel.  Active
-    on the shared-K (legacy) path that HSA-345M takes when lmk_k_pool
-    isn't allocated.
+    expand + reshape + contiguous + logsumexp (10 ops) with a single
+    kernel.  Active on the shared-K (legacy) path that HSA-345M takes
+    when lmk_k_pool isn't allocated.
     """
     pid = tl.program_id(axis=0)
     b = pid // HQ
@@ -124,10 +131,16 @@ def fused_chunk_weight_h_kv_kernel(
     k_offs = tl.arange(0, BLOCK_K)
     k_mask = k_offs < K
 
-    scores = tl.load(
-        scores_ptr + (b * H + h_kv) * K + k_offs,
-        mask=k_mask, other=float("-inf"),
-    )
+    if SCORES_IS_BF16:
+        scores = tl.load(
+            scores_ptr + (b * H + h_kv) * K + k_offs,
+            mask=k_mask, other=float("-inf"),
+        ).to(tl.float32)
+    else:
+        scores = tl.load(
+            scores_ptr + (b * H + h_kv) * K + k_offs,
+            mask=k_mask, other=float("-inf"),
+        )
     sel_pages = tl.load(
         selected_pages_ptr + (b * H + h_kv) * K + k_offs,
         mask=k_mask, other=-1,
@@ -135,7 +148,18 @@ def fused_chunk_weight_h_kv_kernel(
     valid = sel_pages >= 0
     scores = tl.where(valid & k_mask, scores, float("-inf"))
 
-    lse = tl.load(lse_kv_ptr + b * H + h_kv)
+    # R27: load per-q-head LSE for this h_kv group and reduce inline.
+    # Each program in the same (b, h_kv) does this redundantly, but the
+    # reduction is Gh ≈ 8 fp32 ops — cheaper than a separate logsumexp
+    # kernel launch (~17µs).
+    g_offs = h_kv * Gh + tl.arange(0, Gh)
+    if LSE_IS_BF16:
+        lse_hq_vec = tl.load(lse_hq_ptr + b * HQ + g_offs).to(tl.float32)
+    else:
+        lse_hq_vec = tl.load(lse_hq_ptr + b * HQ + g_offs)
+    lse_max = tl.max(lse_hq_vec, axis=0)
+    lse_sum_exp = tl.sum(tl.exp(lse_hq_vec - lse_max), axis=0)
+    lse = lse_max + tl.log(lse_sum_exp)
 
     scores_max = tl.max(scores, axis=0)
     max_val = tl.maximum(scores_max, lse)
@@ -166,44 +190,49 @@ def fused_chunk_weight_h_kv_kernel(
 
 def fused_chunk_weight_h_kv_decode(
     selected_scores: torch.Tensor,   # [B, H_hsa, K] float32
-    lse_kv: torch.Tensor,            # [B, H_hsa]    float32
+    lse_hq: torch.Tensor,            # [B, HQ_hsa]   bf16 OR float32 (R27)
     selected_page_ids: torch.Tensor, # [B, H_hsa, K] int32
     Gh: int,
     enable_softmax1: bool,
     out_dtype: torch.dtype = torch.bfloat16,
 ):
-    """Fused legacy h_kv chunk-weight + GQA broadcast.
+    """Fused legacy h_kv chunk-weight + GQA broadcast + inline logsumexp.
+
+    R27: now takes per-q-head LSE [B, HQ_hsa] (saves the upstream
+    torch.logsumexp call).  Kernel reduces over the Gh group inline.
 
     Returns:
       w_q     : [B, HQ_hsa, K] bf16 (chunk weights, GQA-broadcast)
-      swa_w_kv: [B, H_hsa]    float32 (SWA blend weight per h_kv)
+      swa_w_q : [B, HQ_hsa]    float32 (SWA blend weight at HQ granularity)
     """
-    assert selected_scores.dtype == torch.float32
-    assert lse_kv.dtype == torch.float32
+    assert selected_scores.dtype in (torch.bfloat16, torch.float32), selected_scores.dtype
+    assert lse_hq.dtype in (torch.bfloat16, torch.float32), lse_hq.dtype
     assert selected_page_ids.dtype == torch.int32
     B, H, K = selected_scores.shape
     HQ = H * Gh
-    assert lse_kv.shape == (B, H)
+    assert lse_hq.shape == (B, HQ), f"lse_hq {tuple(lse_hq.shape)} != (B={B}, HQ={HQ})"
     assert selected_page_ids.shape == (B, H, K)
 
     device = selected_scores.device
     w_q = torch.empty((B, HQ, K), device=device, dtype=out_dtype)
     # R20: output swa_w at HQ granularity directly (saves broadcast op).
-    swa_w_kv = torch.empty((B, HQ), device=device, dtype=torch.float32)
+    swa_w_q = torch.empty((B, HQ), device=device, dtype=torch.float32)
 
     BLOCK_K = max(triton.next_power_of_2(K), 16)
     fused_chunk_weight_h_kv_kernel[(B * HQ,)](
         selected_scores.contiguous(),
-        lse_kv.contiguous(),
+        lse_hq.contiguous(),
         selected_page_ids.contiguous(),
         w_q,
-        swa_w_kv,
+        swa_w_q,
         H=H, HQ=HQ, Gh=Gh, K=K,
         SOFTMAX1=bool(enable_softmax1),
+        LSE_IS_BF16=bool(lse_hq.dtype == torch.bfloat16),
+        SCORES_IS_BF16=bool(selected_scores.dtype == torch.bfloat16),
         BLOCK_K=BLOCK_K,
         num_warps=4,
     )
-    return w_q, swa_w_kv
+    return w_q, swa_w_q
 
 
 def fused_chunk_weight_per_qhead_decode(

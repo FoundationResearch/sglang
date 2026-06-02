@@ -217,24 +217,10 @@ class HSAAttnBackend(AttentionBackend):
         # step in init_forward_metadata (R12).  No per-layer clone needed.
         page_table_1 = md.page_table_1
 
-        seq_lens_i64 = md.cache_seqlens_int32.to(torch.int64)
-
-        # Compute per-request candidate pages using logical positions.
-        # completed_pages = seq_len // page_size
-        # limit_chunk = (query_pos - window_size + 1) // page_size
-        #   where query_pos = seq_len - 1
-        # Valid candidates: page_id in [0, min(completed_pages, limit_chunk))
-        completed_pages = seq_lens_i64 // page_size  # [B]
-
-        if hsa_window > 0:
-            query_pos = seq_lens_i64 - 1  # [B]
-            limit_chunk = (query_pos - hsa_window + 1) // page_size  # [B]
-            limit_chunk = limit_chunk.clamp(min=0)
-            effective_cands = torch.min(completed_pages, limit_chunk)  # [B]
-        else:
-            effective_cands = completed_pages  # [B]
-
-        effective_cands = effective_cands.clamp(min=0)
+        # R29: effective_cands (= clamp(min(seq_lens // ps, (seq_lens - hsa_window) // ps)))
+        # is now computed inline inside the selector kernel from cache_seqlens.
+        # Per-layer host-side compute (4 small ops × 16 layers ≈ 200µs) is gone.
+        # Slow paths below still need it materialised (rare; fp32 fallback OK).
 
         # R10: avoid `effective_cands.max().item()` sync.  Use the metadata-known
         # upper bound (max_seqlen_k // page_size); cand_mask handles unused entries
@@ -255,12 +241,6 @@ class HSAAttnBackend(AttentionBackend):
             )
             return
 
-        # Build padded candidate page_ids [B, C_max] using logical page indices.
-        cand_range = torch.arange(C_max, device=device, dtype=torch.int32)
-        cand_page_ids = cand_range.unsqueeze(0).expand(B, C_max).contiguous()
-        cand_mask = cand_page_ids < effective_cands.unsqueeze(1).to(torch.int32)
-        cand_page_ids = cand_page_ids.masked_fill(~cand_mask, -1)
-
         # Per-q-head lmk_k path: when the HSA layer pre-computed chunk-aggregated
         # h_q-headed lmk_k into the LandmarkLmkKPool (mirrors the official
         # chunk_attn_pool default MHA mode), gather from there instead of
@@ -273,9 +253,9 @@ class HSAAttnBackend(AttentionBackend):
             and int(split_info.get("hq_hsa", 0)) > int(split_info.get("h_hsa", 0))
         )
 
-        # R24: legacy h_kv fast path — skip cand_repr materialisation entirely
-        # and use a single triton kernel that gathers K from cache + does Q·K
-        # + applies cand_mask in one go.  Followed by torch.topk (R22).
+        # R24+R26: legacy h_kv fast path — fused_selector_score_kernel internalises
+        # the whole arange/expand/lt/masked_fill/sum chain plus gather+Q·K+mask
+        # in one launch.  Followed by torch.topk (R22, sorted=False).
         unified = split_info is not None and split_info.get("unified_retrieval", False)
         if not per_qhead_active and not unified:
             from sglang.srt.layers.attention.hsa.kernels.fused_selector_score import (
@@ -285,12 +265,9 @@ class HSAAttnBackend(AttentionBackend):
             k_cache_full = pool.get_key_buffer(layer.layer_id)
             D_d = int(k_cache_full.shape[2])
             HQ = int(q.shape[-1]) // D_d if q.dim() == 2 else int(q.shape[1])
-            # GQA reduction: H_sel == kv_head_count (or layer.tp_k_head_num)
             H_sel_d = int(H_sel)
             assert HQ % H_sel_d == 0, f"HQ={HQ} not divisible by H_sel={H_sel_d}"
-            G_grp = HQ // H_sel_d
             q3 = q.view(B, HQ, D_d) if q.dim() == 2 else q
-            q_grouped = q3.view(B, H_sel_d, G_grp, D_d).sum(dim=2)  # [B, H_sel, D]
 
             sm_scale_d = (
                 float(sm_scale_val) if (sm_scale_val := getattr(layer, "scaling", None)) is not None
@@ -298,18 +275,21 @@ class HSAAttnBackend(AttentionBackend):
             )
             H_offset = int(kv_head_offset) if kv_head_offset is not None else 0
 
+            # R30: pass raw q (not GQA-summed) — kernel does the sum over G inline.
             scores_d = fused_selector_score_decode(
-                q=q_grouped,
-                cand_page_ids=cand_page_ids,
-                cand_mask=cand_mask,
+                q=q3,
+                H_sel=H_sel_d,
+                cache_seqlens=md.cache_seqlens_int32,
+                C_max=int(C_max),
                 page_table_1=page_table_1,
                 k_cache_full=k_cache_full,
                 H_offset=H_offset,
                 sm_scale=sm_scale_d,
                 page_size=int(self.page_size),
+                hsa_window=int(hsa_window),
             )
 
-            # Topk (R22 sorted=False)
+            # Topk (R22 sorted=False).
             eff_topk = min(int(self.hsa_topk), int(C_max))
             top_scores_d, top_idx_d = scores_d.topk(eff_topk, dim=-1, sorted=False)
 
@@ -322,19 +302,34 @@ class HSAAttnBackend(AttentionBackend):
                     [top_scores_d, top_scores_d.new_full((B, H_sel_d, pad_n), float("-inf"))], dim=-1,
                 )
 
-            selected_page_ids = top_idx_d.to(torch.int32)
-            selected_page_ids = selected_page_ids.masked_fill(
+            # In the fast path cand_page_ids[b, c] == c (logical chunk index),
+            # so selected_page_ids equals top_idx_d directly.
+            selected_page_ids = top_idx_d.to(torch.int32).masked_fill(
                 top_scores_d == float("-inf"), -1
             )
 
-            md.hsa_cand_page_ids = cand_page_ids
-            md.hsa_cand_mask = cand_mask
             md.hsa_selected_page_ids = selected_page_ids
-            md.hsa_selected_scores = top_scores_d.to(torch.float32)
+            # R28: keep selected_scores in bf16 — chunk_weight kernel casts inline.
+            md.hsa_selected_scores = top_scores_d
             self._per_qhead_G = None
             self._per_qhead_prior_b = None
             self._last_per_qhead_scores_decode = None
             return
+
+        # Slow path still needs the materialised cand_page_ids/cand_mask + the
+        # effective_cands [B] tensor.  Compute them here (only hits per-qhead/unified
+        # paths, both inactive for HSA-345M legacy h_kv mode).
+        seq_lens_i64 = md.cache_seqlens_int32.to(torch.int64)
+        completed_pages = seq_lens_i64 // page_size
+        if hsa_window > 0:
+            limit_chunk = (seq_lens_i64 - hsa_window).clamp(min=0) // page_size
+            effective_cands = torch.min(completed_pages, limit_chunk).clamp(min=0)
+        else:
+            effective_cands = completed_pages.clamp(min=0)
+        cand_range = torch.arange(C_max, device=device, dtype=torch.int32)
+        cand_page_ids = cand_range.unsqueeze(0).expand(B, C_max).contiguous()
+        cand_mask = cand_page_ids < effective_cands.unsqueeze(1).to(torch.int32)
+        cand_page_ids = cand_page_ids.masked_fill(~cand_mask, -1)
 
         if per_qhead_active:
             # cand_page_ids[B, C_max] -> slot ids -> [B, C_max, h_q, D]
@@ -448,28 +443,29 @@ class HSAAttnBackend(AttentionBackend):
         Returns
         -------
         swa_o : [B, HQ_hsa, D] float32
-        lse_kv : [B, H_hsa] float32  (GQA-aggregated logsumexp)
+        lse_hq : [B, HQ_hsa] bf16  (per-q-head logsumexp; reduce to lse_kv
+                                    in the consuming chunk_weight kernel via R27)
         """
         B, _, D = q_hsa.shape
         device = q_hsa.device
 
         if hsa_window <= 0:
             swa_o = torch.zeros((B, HQ_hsa, D), device=device, dtype=torch.float32)
-            lse_kv = torch.full((B, H_hsa), float("-inf"), device=device, dtype=torch.float32)
-            self._last_swa_lse_hq_decode = torch.full(
+            lse_hq_neg = torch.full(
                 (B, HQ_hsa), float("-inf"), device=device, dtype=q_hsa.dtype
             )
-            return swa_o, lse_kv
+            self._last_swa_lse_hq_decode = lse_hq_neg
+            return swa_o, lse_hq_neg
 
         md = self.forward_metadata
         pool = getattr(forward_batch, "token_to_kv_pool", None)
         if md is None or pool is None:
             swa_o = torch.zeros((B, HQ_hsa, D), device=device, dtype=torch.float32)
-            lse_kv = torch.full((B, H_hsa), float("-inf"), device=device, dtype=torch.float32)
-            self._last_swa_lse_hq_decode = torch.full(
+            lse_hq_neg = torch.full(
                 (B, HQ_hsa), float("-inf"), device=device, dtype=q_hsa.dtype
             )
-            return swa_o, lse_kv
+            self._last_swa_lse_hq_decode = lse_hq_neg
+            return swa_o, lse_hq_neg
 
         assert HQ_hsa % H_hsa == 0
         Gh = HQ_hsa // H_hsa
@@ -500,15 +496,11 @@ class HSAAttnBackend(AttentionBackend):
             hsa_window=int(hsa_window),
             sm_scale=sm_scale,
         )
-        # h_kv-aggregated LSE (used by the legacy h_kv chunk-weight path).
-        lse_hq_f32 = lse_hq_bf16.view(B, H_hsa, Gh).to(torch.float32)
-        lse_kv = torch.logsumexp(lse_hq_f32, dim=-1)  # [B, H_hsa]
-
-        # Match official lhsa_layer.py:625 — lse_sum.to(hidden_states.dtype)
-        # casts the per-q-head LSE to bf16 before it feeds the chunk_weight
-        # softmax.  Our kernel already outputs bf16.
+        # R27: drop the torch.logsumexp(lse_hq → lse_kv) — the legacy h_kv
+        # chunk_weight kernel now reduces over Gh inline.  Just return
+        # lse_hq directly; the per-q-head path already used lse_hq.
         self._last_swa_lse_hq_decode = lse_hq_bf16
-        return swa_o, lse_kv
+        return swa_o, lse_hq_bf16
 
     def _build_hsa_lmk_excluded_indices(self, forward_batch: ForwardBatch):
         """Build KV indices with LMK positions excluded (for HSA layers only).
@@ -975,7 +967,8 @@ class HSAAttnBackend(AttentionBackend):
                     out_swa[b] = o.squeeze(1)
 
             # Internal SWA on HSA heads (LHSA semantics).
-            swa_o_inner, lse_kv = self._compute_internal_swa_decode(
+            # R27: returns per-q-head lse_hq directly (kernel reduces over Gh inline).
+            swa_o_inner, lse_hq_bf16 = self._compute_internal_swa_decode(
                 q_hsa=q_hsa,
                 layer=layer,
                 forward_batch=forward_batch,
@@ -1021,11 +1014,11 @@ class HSAAttnBackend(AttentionBackend):
                 )
                 swa_w_kv = None  # signal: use swa_w_q downstream
             elif hsa_window > 0:
-                # R18+R20: fused legacy h_kv chunk_weight + GQA broadcast +
-                # HQ-granular swa_w output (saves a downstream broadcast).
+                # R18+R20+R27: fused legacy h_kv chunk_weight + GQA broadcast +
+                # HQ-granular swa_w output + inline logsumexp(lse_hq → lse_kv).
                 w_q, swa_w_q = fused_chunk_weight_h_kv_decode(
                     selected_scores=selected_scores,
-                    lse_kv=lse_kv,
+                    lse_hq=lse_hq_bf16,
                     selected_page_ids=selected_page_ids.to(torch.int32).contiguous()
                     if selected_page_ids.dtype != torch.int32 or not selected_page_ids.is_contiguous()
                     else selected_page_ids,

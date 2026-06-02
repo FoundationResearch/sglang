@@ -51,6 +51,10 @@ class HSAMetadata:
     hsa_selected_page_ids: Optional[torch.Tensor] = None  # [B, H, K] int32 padded -1
     hsa_selected_scores: Optional[torch.Tensor] = None  # [B, H, K] float32
 
+    # R29: per-step (not per-layer) precomputed effective_cands[B] int32 —
+    # depends only on cache_seqlens + hsa_window, identical across HSA layers.
+    hsa_effective_cands: Optional[torch.Tensor] = None
+
     # ---- Extend-specific fields ----
     token_positions: Optional[torch.Tensor] = None  # [total_extend_tokens] global pos
     token_to_seq_id: Optional[torch.Tensor] = None  # [total_extend_tokens] -> batch idx
