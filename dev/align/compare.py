@@ -150,6 +150,7 @@ def sglang_prefill_and_decode(sg_model, cfg, real_base, decode_tokens, device, d
             triton_attention_num_kv_splits=8, triton_attention_split_tile_size=None,
             enable_deterministic_inference=False, hsa_topk=None, hsa_selection_strategy=None,
             hsa_layers=None, hsa_window_size=None, hsa_enable_swa_merging=None, hsa_lmk_id=lmk_id,
+            hsa_headwise_topk_softmax=None,
         ),
     )
     mr.req_to_token_pool = types.SimpleNamespace(size=1, req_to_token=r2t)

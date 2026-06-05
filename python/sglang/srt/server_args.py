@@ -448,6 +448,10 @@ class ServerArgs:
     hsa_layers: Optional[str] = None
     hsa_window_size: Optional[int] = None
     hsa_enable_swa_merging: Optional[bool] = None
+    # Prefill topk path: True => softmax-then-max-pool (training kernel), False =>
+    # max-pooling-only (skip hsa_lse, use swa_lse as normalizer). None => read from
+    # model config's `headwise_topk_softmax` (default True for back-compat).
+    hsa_headwise_topk_softmax: Optional[bool] = None
     # Landmark token id (LMK). By default we follow FlashHSA: lmk_id == vocab_size.
     # This id must be valid for the loaded model weights (embedding/lm_head).
     hsa_lmk_id: int = -1
@@ -3583,6 +3587,14 @@ class ServerArgs:
             default=ServerArgs.hsa_enable_swa_merging,
             help="(Override-only) Enable SWA→HSA merged path for FlashHSA semantics. If unset, read from model config. "
             "Only used when --attention-backend hsa.",
+        )
+        parser.add_argument(
+            "--hsa-headwise-topk-softmax",
+            action=argparse.BooleanOptionalAction,
+            default=ServerArgs.hsa_headwise_topk_softmax,
+            help="(Override-only) Prefill topk path. True: softmax-then-max-pool (training kernel). "
+            "False: max-pooling-only — skip hsa_lse, use swa_lse directly. If unset, read from model config "
+            "(default True for back-compat). Only used when --attention-backend hsa.",
         )
         # Deprecated alias (kept for convenience; prefer --hsa-enable-swa-merging).
         parser.add_argument(

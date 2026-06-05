@@ -12,6 +12,7 @@ logger = logging.getLogger(__name__)
 
 # 尝试导入 fused online topk kernel（优先路径），失败则 fallback 到 torch topk
 _online_topk_group = None
+_online_topk_head_maxpool = None
 try:
     _hsa_kernel_ops_dir = os.path.normpath(
         os.path.join(os.path.dirname(__file__), "..", "..", "..", "..", "..", "..", "dev", "hsa-kernel-main", "ops")
@@ -23,6 +24,18 @@ try:
 except Exception as _e:
     _online_topk_group = None
     print(f"[HSA] Failed to import fused online_topk_group, will fallback to torch topk: {_e}")
+
+# Max-pooling top-k (no hsa_lse, uses swa_lse directly as per-query offset).
+# Used by the prefill path when headwise_topk_softmax=False — ~2x faster than the
+# softmax-then-max-pool training kernel, with negligible quality impact upstream.
+try:
+    if _hsa_kernel_ops_dir not in sys.path:
+        sys.path.insert(0, _hsa_kernel_ops_dir)
+    from topk_head_maxpool import online_topk_head as _online_topk_head_maxpool
+    print("[HSA] Fused online_topk_head (max-pooling) kernel loaded successfully.")
+except Exception as _e:
+    _online_topk_head_maxpool = None
+    print(f"[HSA] Failed to import fused online_topk_head_maxpool: {_e}")
 
 
 @dataclass

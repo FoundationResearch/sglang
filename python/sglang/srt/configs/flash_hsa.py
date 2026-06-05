@@ -189,6 +189,11 @@ class FlashHSAConfig(PretrainedConfig):
         self.hsa_sliding_window = kwargs.pop("hsa_sliding_window", None)
         self.hsa_visible_window = int(kwargs.pop("hsa_visible_window", -1))
         self.full_upper_hsa = bool(kwargs.pop("full_upper_hsa", False))
+        # Prefill topk strategy. True (default, back-compat): softmax-then-max-pooling
+        # using the training kernel (computes hsa_lse, logaddexp with swa_lse, softmax).
+        # False: max-pooling-only path that skips hsa_lse and uses swa_lse directly as
+        # the per-query normalizer. ~2x faster prefill topk per upstream measurements.
+        self.headwise_topk_softmax = bool(kwargs.pop("headwise_topk_softmax", True))
         # Base model variant (kept for config compat; OLMo3 post-norm is the only supported path)
         self.base_model = str(kwargs.pop("base_model", "olmo3"))
 

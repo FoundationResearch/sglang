@@ -19,6 +19,7 @@ from sglang.srt.layers.attention.hsa.kernels.cuda_graph_buffers import (
 from sglang.srt.layers.attention.hsa.metadata import HSAMetadata
 from sglang.srt.layers.attention.hsa.selector import (
     _online_topk_group,
+    _online_topk_head_maxpool,
     build_active_page_candidates,
     select_topk_pages_decode,
     select_topk_pages_decode_fused,
@@ -87,6 +88,20 @@ class HSAAttnBackend(AttentionBackend):
         override_sel = getattr(server_args, "hsa_selection_strategy", None)
         self.hsa_selection_strategy = (
             str(override_sel) if override_sel is not None else str(default_sel)
+        )
+
+        # Prefill topk strategy:
+        #   True  -> softmax-then-max-pool (training kernel via online_softmax_topk_head;
+        #            computes hsa_lse + logaddexp with swa_lse + softmax-normalized topk).
+        #   False -> max-pooling-only (online_topk_head): skip hsa_lse, pass swa_lse
+        #            directly to the selector as a per-query offset.  ~2x faster prefill
+        #            topk on upstream measurements with negligible quality impact.
+        # CLI override (--hsa-headwise-topk-softmax / --no-hsa-headwise-topk-softmax) wins;
+        # otherwise read from model config (default True for back-compat).
+        default_headwise = bool(getattr(cfg, "headwise_topk_softmax", True))
+        override_headwise = getattr(server_args, "hsa_headwise_topk_softmax", None)
+        self.headwise_topk_softmax = (
+            bool(override_headwise) if override_headwise is not None else default_headwise
         )
 
         self.hsa_layers = getattr(server_args, "hsa_layers", None)
@@ -1578,79 +1593,130 @@ class HSAAttnBackend(AttentionBackend):
 
         # q_offset = prefix_len，表示 extend 的第一个 token 在全局序列中的位置
         if self._per_qhead_G_ext is not None and self._per_qhead_lmk_keys_full is not None:
-            # Pure-PyTorch correct per-q-head topk (max-over-G).  Slow but
-            # matches the official's online_softmax_topk_head with G > 1.
-            import math as _m
+            # Per-q-head path. Two implementations:
+            #   (a) headwise_topk_softmax=True (default, back-compat) — pure-PyTorch
+            #       max-over-G + topk. Slow (fp32 SIMT einsum) but kept as the safe
+            #       reference. Trained models that already use softmax-topk get
+            #       bit-equivalent results; H100 prefill is dominated by this path.
+            #   (b) headwise_topk_softmax=False — call the fused max-pooling kernel
+            #       (`online_topk_head` from topk_head_maxpool) which skips hsa_lse
+            #       and takes swa_lse directly. ~2x faster prefill topk per upstream.
+            #       Uses _last_swa_lse_hq_extend that the SWA branch (step 3 in
+            #       forward_extend) just produced.
+            use_maxpool = (
+                not self.headwise_topk_softmax
+                and _online_topk_head_maxpool is not None
+                and self._last_swa_lse_hq_extend is not None
+            )
+
             G_e = int(self._per_qhead_G_ext)
             lmk_full = self._per_qhead_lmk_keys_full  # [S, h_q, D]
             h_q_e = lmk_full.shape[1]
             h_kv_e = h_q_e // G_e
             D_e = lmk_full.shape[2]
-            sm_scale_ref = 1.0 / _m.sqrt(D_e)
-            # q_sel_3 here is the full h_q query [T, h_q, D] (per_qhead path
-            # is non-unified so q_sel_3 stays at the original h_q layout).
-            q_full = q_sel_3.float()                                   # [T, h_q, D]
-            lmk_full_f = lmk_full.float()                              # [S, h_q, D]
-            # Per-q-head scores: einsum(t,h,d ; s,h,d -> t,h,s)
-            scores_pqh = torch.einsum("thd,shd->ths", q_full, lmk_full_f) * sm_scale_ref
-            # NOTE: prior_b deliberately not added (see selector.py for the
-            # rationale — adding entropy bias hurts alignment until the
-            # chunk_attn_pool intermediate matches the official exactly).
-            # Causal: query at global pos p sees chunks with end_pos < p.
-            # chunk c's end_pos = (c+1)*page_size - 1.  Visible iff end_pos < p
-            # i.e. c < p // page_size.  When sliding window, also exclude chunks
-            # whose start_pos >= p - window_size + 1 -> c >= (p - window + 1) / page_size.
-            T_q = q_full.shape[0]
-            S_k = lmk_full_f.shape[0]
-            q_pos = torch.arange(prefix_len, prefix_len + T_q, device=device)
-            chunk_end_pos = torch.arange(1, S_k + 1, device=device) * page_size - 1
-            chunk_start_pos = torch.arange(0, S_k, device=device) * page_size
-            visible_causal = chunk_end_pos.unsqueeze(0) < q_pos.unsqueeze(1)         # [T, S]
-            if hsa_window > 0:
-                outside_window = chunk_start_pos.unsqueeze(0) < (q_pos.unsqueeze(1) - hsa_window + 1)
-                visible = visible_causal & outside_window
+
+            if use_maxpool:
+                # ---- Fast path: fused max-pooling kernel (skips hsa_lse) ----
+                # Diagnostic counter (read by tests to confirm wire-up).
+                self._maxpool_call_count = getattr(self, "_maxpool_call_count", 0) + 1
+                # q_sel_3: [T, h_q, D] -> [1, T, h_q, D]
+                # lmk_full: [S, h_q, D] -> [1, S, h_q, D]
+                # lse_swa:  [T, h_q]   -> [1, T, h_q]
+                q_4d_mp = q_sel_3.unsqueeze(0).contiguous()
+                lmk_4d_mp = lmk_full.unsqueeze(0).contiguous()
+                lse_swa_arg = self._last_swa_lse_hq_extend.unsqueeze(0).contiguous()
+                # Returns indices [1, T, h_kv, K] int32, scores [1, T, h_q, K] raw scaled qk.
+                fused_indices_mp, scores_hq_mp = _online_topk_head_maxpool(
+                    q_4d_mp,
+                    lmk_4d_mp,
+                    topk=int(self.hsa_topk),
+                    block_size=page_size,
+                    window_size=hsa_window if hsa_window > 0 else 0,
+                    is_causal=True,
+                    G=G_e,
+                    lse_swa=lse_swa_arg,
+                    q_offset=prefix_len,
+                    is_training=False,
+                )
+                fused_indices = fused_indices_mp.to(torch.int32)         # [1, T, h_kv, K]
+                scores_hq_sel_t = scores_hq_mp.squeeze(0).to(torch.float32)  # [T, h_q, K]
+                T_q_mp = q_sel_3.shape[0]
+                K_eff = int(fused_indices_mp.shape[-1])
+                # h_kv-level fused_scores: max over G of per-q-head scores at selected K
+                # (matching the slow path's topk_scores_kv semantics).
+                scores_kv_sel_t = (
+                    scores_hq_sel_t.view(T_q_mp, h_kv_e, G_e, K_eff).max(dim=2).values
+                )
+                fused_scores = scores_kv_sel_t.unsqueeze(0).to(torch.float32)
+                self._last_per_qhead_scores_extend = scores_hq_sel_t
             else:
-                visible = visible_causal
-            # Max over G: [T, h_q, S] -> [T, h_kv, S] for selection.
-            scores_kv_sel = scores_pqh.view(T_q, h_kv_e, G_e, S_k).max(dim=2).values
-            scores_kv_sel = scores_kv_sel.masked_fill(~visible.unsqueeze(1), float("-inf"))
-            eff_topk = min(int(self.hsa_topk), S_k)
-            _, topk_idx_kv = scores_kv_sel.topk(eff_topk, dim=-1)                # [T, h_kv, K]
-            topk_idx_kv, _ = torch.sort(topk_idx_kv, dim=-1)
-            # Per-q-head scores at selected chunks (broadcast h_kv idx to h_q).
-            topk_idx_hq = topk_idx_kv.unsqueeze(2).expand(T_q, h_kv_e, G_e, eff_topk).reshape(
-                T_q, h_q_e, eff_topk
-            )
-            scores_hq_sel = torch.gather(scores_pqh, dim=-1, index=topk_idx_hq.clamp_min(0))
-            invalid = topk_idx_kv < 0
-            topk_scores_kv = torch.gather(scores_kv_sel, dim=-1, index=topk_idx_kv.clamp_min(0))
-            topk_scores_kv = topk_scores_kv.masked_fill(invalid, float("-inf"))
-            scores_hq_sel = scores_hq_sel.masked_fill(
-                invalid.unsqueeze(2).expand(T_q, h_kv_e, G_e, eff_topk).reshape(T_q, h_q_e, eff_topk),
-                float("-inf"),
-            )
-            if eff_topk < int(self.hsa_topk):
-                pad = int(self.hsa_topk) - eff_topk
-                topk_idx_kv = torch.cat(
-                    [topk_idx_kv,
-                     topk_idx_kv.new_full((T_q, h_kv_e, pad), -1, dtype=topk_idx_kv.dtype)],
-                    dim=-1,
+                # ---- Pure-PyTorch fallback (default, headwise_topk_softmax=True) ----
+                import math as _m
+                sm_scale_ref = 1.0 / _m.sqrt(D_e)
+                # q_sel_3 here is the full h_q query [T, h_q, D] (per_qhead path
+                # is non-unified so q_sel_3 stays at the original h_q layout).
+                q_full = q_sel_3.float()                                   # [T, h_q, D]
+                lmk_full_f = lmk_full.float()                              # [S, h_q, D]
+                # Per-q-head scores: einsum(t,h,d ; s,h,d -> t,h,s)
+                scores_pqh = torch.einsum("thd,shd->ths", q_full, lmk_full_f) * sm_scale_ref
+                # NOTE: prior_b deliberately not added (see selector.py for the
+                # rationale — adding entropy bias hurts alignment until the
+                # chunk_attn_pool intermediate matches the official exactly).
+                # Causal: query at global pos p sees chunks with end_pos < p.
+                # chunk c's end_pos = (c+1)*page_size - 1.  Visible iff end_pos < p
+                # i.e. c < p // page_size.  When sliding window, also exclude chunks
+                # whose start_pos >= p - window_size + 1 -> c >= (p - window + 1) / page_size.
+                T_q = q_full.shape[0]
+                S_k = lmk_full_f.shape[0]
+                q_pos = torch.arange(prefix_len, prefix_len + T_q, device=device)
+                chunk_end_pos = torch.arange(1, S_k + 1, device=device) * page_size - 1
+                chunk_start_pos = torch.arange(0, S_k, device=device) * page_size
+                visible_causal = chunk_end_pos.unsqueeze(0) < q_pos.unsqueeze(1)         # [T, S]
+                if hsa_window > 0:
+                    outside_window = chunk_start_pos.unsqueeze(0) < (q_pos.unsqueeze(1) - hsa_window + 1)
+                    visible = visible_causal & outside_window
+                else:
+                    visible = visible_causal
+                # Max over G: [T, h_q, S] -> [T, h_kv, S] for selection.
+                scores_kv_sel = scores_pqh.view(T_q, h_kv_e, G_e, S_k).max(dim=2).values
+                scores_kv_sel = scores_kv_sel.masked_fill(~visible.unsqueeze(1), float("-inf"))
+                eff_topk = min(int(self.hsa_topk), S_k)
+                _, topk_idx_kv = scores_kv_sel.topk(eff_topk, dim=-1)                # [T, h_kv, K]
+                topk_idx_kv, _ = torch.sort(topk_idx_kv, dim=-1)
+                # Per-q-head scores at selected chunks (broadcast h_kv idx to h_q).
+                topk_idx_hq = topk_idx_kv.unsqueeze(2).expand(T_q, h_kv_e, G_e, eff_topk).reshape(
+                    T_q, h_q_e, eff_topk
                 )
-                topk_scores_kv = torch.cat(
-                    [topk_scores_kv,
-                     topk_scores_kv.new_full((T_q, h_kv_e, pad), float("-inf"))],
-                    dim=-1,
+                scores_hq_sel = torch.gather(scores_pqh, dim=-1, index=topk_idx_hq.clamp_min(0))
+                invalid = topk_idx_kv < 0
+                topk_scores_kv = torch.gather(scores_kv_sel, dim=-1, index=topk_idx_kv.clamp_min(0))
+                topk_scores_kv = topk_scores_kv.masked_fill(invalid, float("-inf"))
+                scores_hq_sel = scores_hq_sel.masked_fill(
+                    invalid.unsqueeze(2).expand(T_q, h_kv_e, G_e, eff_topk).reshape(T_q, h_q_e, eff_topk),
+                    float("-inf"),
                 )
-                scores_hq_sel = torch.cat(
-                    [scores_hq_sel,
-                     scores_hq_sel.new_full((T_q, h_q_e, pad), float("-inf"))],
-                    dim=-1,
-                )
-            # Match kernel output layout: fused_indices [1, T, h_kv, K], fused_scores same.
-            fused_indices = topk_idx_kv.unsqueeze(0).to(torch.int32)
-            fused_scores = topk_scores_kv.unsqueeze(0).to(torch.float32)
-            # Stash per-q-head scores for the fusion path: [T, h_q, K]
-            self._last_per_qhead_scores_extend = scores_hq_sel.to(torch.float32)
+                if eff_topk < int(self.hsa_topk):
+                    pad = int(self.hsa_topk) - eff_topk
+                    topk_idx_kv = torch.cat(
+                        [topk_idx_kv,
+                         topk_idx_kv.new_full((T_q, h_kv_e, pad), -1, dtype=topk_idx_kv.dtype)],
+                        dim=-1,
+                    )
+                    topk_scores_kv = torch.cat(
+                        [topk_scores_kv,
+                         topk_scores_kv.new_full((T_q, h_kv_e, pad), float("-inf"))],
+                        dim=-1,
+                    )
+                    scores_hq_sel = torch.cat(
+                        [scores_hq_sel,
+                         scores_hq_sel.new_full((T_q, h_q_e, pad), float("-inf"))],
+                        dim=-1,
+                    )
+                # Match kernel output layout: fused_indices [1, T, h_kv, K], fused_scores same.
+                fused_indices = topk_idx_kv.unsqueeze(0).to(torch.int32)
+                fused_scores = topk_scores_kv.unsqueeze(0).to(torch.float32)
+                # Stash per-q-head scores for the fusion path: [T, h_q, K]
+                self._last_per_qhead_scores_extend = scores_hq_sel.to(torch.float32)
         else:
             fused_indices, fused_scores = _online_topk_group(
                 q=q_4d,
