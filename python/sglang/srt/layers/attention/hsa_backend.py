@@ -8,7 +8,10 @@ from typing import TYPE_CHECKING, Optional, Set
 import torch
 
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
-from sglang.srt.layers.attention.hsa.kernels import hsa_decode_paged_fwd
+from sglang.srt.layers.attention.hsa.kernels import (
+    hsa_decode_paged_fwd,
+    hsa_extend_paged_fwd,
+)
 from sglang.srt.layers.attention.hsa.kernels.chunk_weight import (
     fused_chunk_weight_per_qhead_decode,
     fused_chunk_weight_h_kv_decode,
@@ -1838,9 +1841,9 @@ class HSAAttnBackend(AttentionBackend):
                 hsa_weights=hsa_weights, H_hsa=H_hsa, HQ_hsa=HQ_hsa,
                 sm_scale=sm_scale,
             )
-        # Production path: reuse the decode Triton kernel with token_to_seq_id.
+        # R37: Q-batched extend kernel (collapses (T, HQ) grid to (T/BLOCK_M, HQ)).
         md = self.forward_metadata
-        return hsa_decode_paged_fwd(
+        return hsa_extend_paged_fwd(
             q=q_hsa,                              # [T, HQ_hsa, D]
             k_cache=k_cache,                       # [Nloc, H_hsa, D]
             v_cache=v_cache,                       # [Nloc, H_hsa, D]
