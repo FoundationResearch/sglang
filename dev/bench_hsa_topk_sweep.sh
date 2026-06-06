@@ -35,6 +35,7 @@ for L in $LENGTHS; do
                 --context-length "$CTX" \
                 --attention-backend hsa \
                 --hsa-topk "$topk" \
+                --page-size 64 \
                 --disable-cuda-graph \
                 --mem-fraction-static 0.50 \
                 --cuda-graph-max-bs 1 \

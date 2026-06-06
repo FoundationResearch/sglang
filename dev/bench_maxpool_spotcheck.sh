@@ -16,6 +16,7 @@ HSA_MODEL="/home/hal-alex/workspace/sglang/dev/bench_models/hsa345m_real"
 
 bench_one() {
     local L=$1 maxpool_flag=$2
+    # --page-size 64 — HSA requires page_size == chunk_size, default 1 degenerates.
     timeout 600 /home/hal-alex/miniconda3/envs/alexsg/bin/python -m sglang.bench_one_batch \
         --model-path "$HSA_MODEL" \
         --load-format dummy \
@@ -23,6 +24,7 @@ bench_one() {
         --input-len "$L" --output-len "$DECODE_LEN" \
         --context-length $((L + 200)) \
         --attention-backend hsa \
+        --page-size 64 \
         --cuda-graph-max-bs 1 \
         --mem-fraction-static 0.50 \
         --trust-remote-code \

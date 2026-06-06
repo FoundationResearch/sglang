@@ -20,6 +20,7 @@ sys.argv = [
     "--output-len", "8",
     "--context-length", str(int(os.environ.get("LEN", 16384)) + 200),
     "--attention-backend", "triton",
+    "--page-size", "64",
     "--disable-cuda-graph",
     "--mem-fraction-static", "0.50",
     "--trust-remote-code",

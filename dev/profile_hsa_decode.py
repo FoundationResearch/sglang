@@ -26,6 +26,7 @@ _argv = [
     "--output-len", "8",
     "--context-length", str(int(os.environ.get("LEN", 32768)) + 200),
     "--attention-backend", "hsa",
+    "--page-size", "64",
     "--disable-cuda-graph",
     "--mem-fraction-static", "0.50",
     "--trust-remote-code",

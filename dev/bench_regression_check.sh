@@ -21,6 +21,8 @@ DENSE_MODEL="/home/hal-alex/workspace/sglang/dev/bench_models/dense345m_fair"
 
 bench_one() {
     local L=$1 backend=$2 model=$3
+    # --page-size 64 is REQUIRED for HSA (page_size must equal chunk_size); see
+    # bench_regression_check_cg.sh for the full explanation.
     timeout 900 /home/hal-alex/miniconda3/envs/alexsg/bin/python -m sglang.bench_one_batch \
         --model-path "$model" \
         --load-format dummy \
@@ -28,6 +30,7 @@ bench_one() {
         --input-len "$L" --output-len "$DECODE_LEN" \
         --context-length $((L + 200)) \
         --attention-backend "$backend" \
+        --page-size 64 \
         --disable-cuda-graph \
         --cuda-graph-max-bs 1 \
         --mem-fraction-static 0.50 \
