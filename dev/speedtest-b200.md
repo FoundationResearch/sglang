@@ -27,12 +27,23 @@ Both are 345M-class fair architectures (same `hidden=1024`, `layers=16`, `heads=
 
 | Model | Path | Weights | Notes |
 |---|---|---|---|
-| HSA-345M | `/home/hal-alex/workspace/hsa345m_real` | Real (trained) | `model_type: qwen_lhsa`, `hsa_topk=32`, `chunk_size=64`, `hsa_sliding_window=512`, `enable_lmk_q_proj=true`, `enable_prior_query=true` |
-| Dense-Fair-345M | `/home/hal-alex/workspace/dense345m_fair` | Dummy (perf only) | `model_type: qwen3`, no sliding window |
+| HSA-345M | `/home/hal-alex/workspace/sglang/dev/bench_models/hsa345m_real` | Real (trained) | `model_type: qwen_lhsa`, `hsa_topk=32`, `chunk_size=64`, `hsa_sliding_window=512`, `enable_lmk_q_proj=true`, `enable_prior_query=true` |
+| Dense-Fair-345M | `/home/hal-alex/workspace/sglang/dev/bench_models/dense345m_fair` | Dummy (perf only) | `model_type: qwen3`, no sliding window |
 
 **Note**: HSA safetensors on disk is 446 MB (stores `lm_head` separately even though `tie_word_embeddings=true`). sglang ties at load time → effective 344M params on GPU, same as Dense.
 
 For perf bench, both use `--load-format dummy` so weight values don't matter.
+
+### 1.1 Repo layout & weights
+
+Configs and tokenizer files for both models live in `dev/bench_models/` and are tracked by git. **Weight files are gitignored** (`*.safetensors`, `*.bin`, `*.pth`, `*.pt` under `dev/bench_models/`) so the 853 MB HSA checkpoint doesn't bloat the repo.
+
+When cloning fresh on a new host:
+
+* `dev/bench_models/dense345m_fair/` — no weights needed; bench uses `--load-format dummy`. Ready to use as-is.
+* `dev/bench_models/hsa345m_real/` — bench also runs `--load-format dummy` (random weights), so for perf bench alone you don't need the real checkpoint either. Numerical correctness work (alignment KL via `dev/align/compare.py`) uses a separate harness at `dev/align/weights_345m/`, not this dir.
+
+So for **perf bench on a new host**, no weight fetching needed.
 
 ---
 

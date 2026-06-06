@@ -12,7 +12,7 @@ def run_bench(cg_on: bool) -> str:
     """Return stdout of bench_one_batch with deterministic seed."""
     cmd = [
         sys.executable, "-m", "sglang.bench_one_batch",
-        "--model-path", "/home/hal-alex/workspace/hsa345m_real",
+        "--model-path", "/home/hal-alex/workspace/sglang/dev/bench_models/hsa345m_real",
         "--load-format", "dummy",
         "--tp", "1", "--batch-size", "1",
         "--input-len", "8192", "--output-len", "8",

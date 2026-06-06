@@ -29,8 +29,8 @@ run() {
 for L in 8192 32768 131072 262144 524288; do
     CTX=$((L + 200))
     echo "==================== L=$L ===================="
-    run /home/hal-alex/workspace/hsa345m_real    $L "HSA-no-CG"   $CTX hsa    nocg
-    run /home/hal-alex/workspace/hsa345m_real    $L "HSA-R15-CG"  $CTX hsa    cg
-    run /home/hal-alex/workspace/dense345m_fair  $L "Dense-no-CG" $CTX triton nocg dummy
-    run /home/hal-alex/workspace/dense345m_fair  $L "Dense-CG"    $CTX triton cg   dummy
+    run /home/hal-alex/workspace/sglang/dev/bench_models/hsa345m_real    $L "HSA-no-CG"   $CTX hsa    nocg
+    run /home/hal-alex/workspace/sglang/dev/bench_models/hsa345m_real    $L "HSA-R15-CG"  $CTX hsa    cg
+    run /home/hal-alex/workspace/sglang/dev/bench_models/dense345m_fair  $L "Dense-no-CG" $CTX triton nocg dummy
+    run /home/hal-alex/workspace/sglang/dev/bench_models/dense345m_fair  $L "Dense-CG"    $CTX triton cg   dummy
 done

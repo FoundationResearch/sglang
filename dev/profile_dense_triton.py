@@ -13,7 +13,7 @@ import argparse
 
 sys.argv = [
     "profile_dense",
-    "--model-path", "/home/hal-alex/workspace/dense345m_fair",
+    "--model-path", "/home/hal-alex/workspace/sglang/dev/bench_models/dense345m_fair",
     "--load-format", "dummy",
     "--tp", "1", "--batch-size", "1",
     "--input-len", str(int(os.environ.get("LEN", 16384))),

@@ -10,8 +10,8 @@ N_RUNS="${N_RUNS:-5}"
 DECODE_LEN="${DECODE_LEN:-32}"
 
 export SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1
-HSA_MODEL="/home/hal-alex/workspace/hsa345m_real"
-DENSE_MODEL="/home/hal-alex/workspace/dense345m_fair"
+HSA_MODEL="/home/hal-alex/workspace/sglang/dev/bench_models/hsa345m_real"
+DENSE_MODEL="/home/hal-alex/workspace/sglang/dev/bench_models/dense345m_fair"
 
 bench_one() {
     local L=$1 backend=$2 model=$3

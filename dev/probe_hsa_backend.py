@@ -5,7 +5,7 @@ import sys
 os.environ["SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN"] = "1"
 sys.argv = [
     "bench",
-    "--model-path", "/home/hal-alex/workspace/hsa345m_real",
+    "--model-path", "/home/hal-alex/workspace/sglang/dev/bench_models/hsa345m_real",
     "--load-format", "dummy",
     "--tp", "1",
     "--batch-size", "1",

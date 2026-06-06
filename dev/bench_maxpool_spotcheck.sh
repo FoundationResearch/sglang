@@ -12,7 +12,7 @@ N_RUNS="${N_RUNS:-3}"
 DECODE_LEN="${DECODE_LEN:-32}"
 
 export SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1
-HSA_MODEL="/home/hal-alex/workspace/hsa345m_real"
+HSA_MODEL="/home/hal-alex/workspace/sglang/dev/bench_models/hsa345m_real"
 
 bench_one() {
     local L=$1 maxpool_flag=$2

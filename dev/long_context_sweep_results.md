@@ -115,7 +115,7 @@ Scripts: `dev/bench_long_context_345m_sweep.sh` (345M) and
 Both models: 16 hidden layers, hidden_size=1024, head_dim=64, num_q_heads=16,
 num_kv_heads=2 (8:1 GQA).  Only the attention path differs — HSA uses sparse
 chunk selection (`qwen_lhsa`), Dense uses full attention (`qwen3`).  Built
-`/home/hal-alex/workspace/dense345m_fair` by stripping HSA-specific fields
+`/home/hal-alex/workspace/sglang/dev/bench_models/dense345m_fair` by stripping HSA-specific fields
 from the HSA config.
 
 ```

@@ -32,7 +32,7 @@ OUTPUT_LEN = int(os.environ.get("OUTPUT_LEN", 4))
 
 sys.argv = [
     "bench",
-    "--model-path", "/home/hal-alex/workspace/hsa345m_real",
+    "--model-path", "/home/hal-alex/workspace/sglang/dev/bench_models/hsa345m_real",
     "--tp", "1", "--batch-size", "1",
     "--input-len", str(INPUT_LEN),
     "--output-len", str(OUTPUT_LEN),

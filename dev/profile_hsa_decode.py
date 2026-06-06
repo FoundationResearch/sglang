@@ -19,7 +19,7 @@ import argparse
 # Parse args.
 _argv = [
     "profile",
-    "--model-path", "/home/hal-alex/workspace/hsa345m_real",
+    "--model-path", "/home/hal-alex/workspace/sglang/dev/bench_models/hsa345m_real",
     "--load-format", "dummy",
     "--tp", "1", "--batch-size", "1",
     "--input-len", str(int(os.environ.get("LEN", 32768))),

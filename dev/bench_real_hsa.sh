@@ -40,7 +40,7 @@ for L in "${LENGTHS[@]}"; do
     echo "===================================================="
     echo "CONTEXT BUCKET: $L"
     echo "===================================================="
-    run_one "/home/hal-alex/workspace/hsa345m_real"    "$L" "HSA-345M-real"      "$CTX" "hsa"
-    run_one "/home/hal-alex/workspace/dense345m_fair"  "$L" "Dense-Fair-345M"    "$CTX" "triton"
+    run_one "/home/hal-alex/workspace/sglang/dev/bench_models/hsa345m_real"    "$L" "HSA-345M-real"      "$CTX" "hsa"
+    run_one "/home/hal-alex/workspace/sglang/dev/bench_models/dense345m_fair"  "$L" "Dense-Fair-345M"    "$CTX" "triton"
 done
 echo "=== Real-HSA sweep done ==="
