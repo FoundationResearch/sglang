@@ -1,23 +1,20 @@
 """
 Q-batched paged-KV sparse-attention kernel for HSA *extend* (prefill).
 
-The decode kernel `hsa_decode_paged_fwd_kernel` was designed for B=1 query per
-program (decode = 1 token). Reusing it for prefill at T=16K issues T*HQ=64K
-thread blocks per layer, each doing TOPK small sequential page-attentions on
-CUDA cores (no tensor cores possible at 1xD QK).
+R37: BLOCK_M=4 with block-diagonal masking — packs adjacent Q tokens for one
+TC matmul per page, wastes 3/4 of the QK FLOPs but TC throughput beats CUDA
+cores by enough to win net 1.3x at L=16K.
 
-This kernel packs BLOCK_M adjacent Q tokens into one program and uses the
-block-diagonal-masking trick to recover tensor cores: concatenate the BLOCK_M
-per-Q K-page loads into a single [BLOCK_M*PAGE_SIZE, D] matrix, do one
-TC `tl.dot(Q, K.T) -> [BLOCK_M, BLOCK_M*PAGE_SIZE]`, then mask off the
-(BLOCK_M-1)/BLOCK_M off-diagonal-block entries to -inf before the per-row
-softmax. Same for `tl.dot(P, V)` on the V side.
+R38: Also pack all G q-heads of a kv-head into the same program. Since
+`selected_page_ids` is [T, H_kv, K] (shared across q-heads within a GQA group),
+the page-id loads, K-page loads, and the block-diagonal column structure can
+be reused across G q-heads — only the per-q-head `hsa_weights` and the per-
+row softmax differ. The QK and PV tl.dot's now run on a Q tile of shape
+[BLOCK_M*G, D] = [16, 64] at BLOCK_M=4 G=4, hitting TC's natural 16x16x16
+sweet spot, and the grid drops to (T/BLOCK_M, H_kv) — 4x fewer programs
+than (T/BLOCK_M, HQ) at G=4.
 
-The waste is (BLOCK_M-1)/BLOCK_M of the QK and PV FLOPs, but tensor cores are
-~16x faster than CUDA-core elementwise, so the net is still ~5x at BLOCK_M=4
-and improves further with BLOCK_M=8 (waste 7/8, but TC throughput dominates).
-
-Output: bf16 [T, HQ, D]. Decode keeps the original kernel.
+Output: bf16 [T, HQ, D]. Decode still uses `hsa_decode_paged_fwd_kernel`.
 """
 
 from __future__ import annotations
@@ -85,42 +82,59 @@ def hsa_extend_paged_fwd_kernel(
     BLOCK_M: tl.constexpr,
 ):
     pid_m = tl.program_id(0)
-    pid_hq = tl.program_id(1)
+    pid_h = tl.program_id(1)  # kv-head index now (not q-head)
 
     G: tl.constexpr = HQ // H
-    kv_h = pid_hq // G
+    kv_h = pid_h
+    hq_start = kv_h * G  # first q-head index for this kv group
 
     offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)  # [BLOCK_M]
     mask_m = offs_m < T
 
     offs_d = tl.arange(0, D)  # [D]
     offs_c = tl.arange(0, BLOCK_M * PAGE_SIZE)  # [BLOCK_M*PAGE_SIZE]
-    col_to_row = offs_c // PAGE_SIZE  # [BLOCK_M*PAGE_SIZE] — which Q-row owns this col
+    col_to_row_m = offs_c // PAGE_SIZE  # [BLOCK_M*PAGE_SIZE] — which Q m-row owns this col
     s_in_page = offs_c % PAGE_SIZE  # [BLOCK_M*PAGE_SIZE]
 
-    # Block-diagonal column-row association mask
-    row_ids = tl.arange(0, BLOCK_M)  # [BLOCK_M]
-    bd_mask = col_to_row[None, :] == row_ids[:, None]  # [BLOCK_M, BLOCK_M*PAGE_SIZE]
+    # Row index in the packed Q tile: r in [0, BLOCK_M*G).
+    # r = m * G + g where m in [0, BLOCK_M), g in [0, G).
+    # Page selection is per (m, kv_h), shared across g — so block-diagonal mask
+    # is defined by `m` only: row r is valid for col c iff (c // PAGE_SIZE) == (r // G).
+    offs_r = tl.arange(0, BLOCK_M * G)  # [BLOCK_M*G]
+    row_to_m = offs_r // G  # [BLOCK_M*G]
+    row_to_g = offs_r % G  # [BLOCK_M*G]
+    bd_mask = col_to_row_m[None, :] == row_to_m[:, None]  # [BLOCK_M*G, BLOCK_M*PAGE_SIZE]
 
-    # Load Q [BLOCK_M, D] (keep bf16 for tl.dot)
+    # Row-validity from mask_m: row r is valid iff offs_m[row_to_m[r]] < T.
+    # We'll fold this into the final softmax mask via broadcasting.
+
+    # Load Q [BLOCK_M*G, D]: row r = m*G + g maps to (token offs_m[m], head hq_start+g).
+    # Gather offs_m[row_to_m] via broadcast-and-sum on a one-hot identity:
+    #   row_tok_flat[r] = sum_m (row_to_m[r] == m) * offs_m[m]
+    row_eq_m = (row_to_m[:, None] == tl.arange(0, BLOCK_M)[None, :])  # [BLOCK_M*G, BLOCK_M]
+    row_eq_m_i = row_eq_m.to(tl.int64)
+    row_tok_flat = tl.sum(row_eq_m_i * offs_m[None, :].to(tl.int64), axis=1)  # [BLOCK_M*G]
+    row_mask_flat = tl.sum(row_eq_m_i * mask_m[None, :].to(tl.int64), axis=1) > 0  # [BLOCK_M*G]
+    row_hq_flat = hq_start.to(tl.int64) + row_to_g.to(tl.int64)  # [BLOCK_M*G]
+
     q_offsets = (
-        offs_m[:, None].to(tl.int64) * stride_qb
-        + pid_hq * stride_qh
+        row_tok_flat[:, None] * stride_qb
+        + row_hq_flat[:, None] * stride_qh
         + offs_d[None, :].to(tl.int64) * stride_qd
-    )
-    q = tl.load(Q_ptr + q_offsets, mask=mask_m[:, None], other=0.0)  # bf16 [BLOCK_M, D]
+    )  # [BLOCK_M*G, D]
+    q = tl.load(Q_ptr + q_offsets, mask=row_mask_flat[:, None], other=0.0)  # bf16 [BLOCK_M*G, D]
 
     seq_b = tl.load(SEQ_ID_MAP_ptr + offs_m, mask=mask_m, other=0).to(tl.int64)  # [BLOCK_M]
 
-    # For broadcasting per-row scalars to [BLOCK_M*PAGE_SIZE] via the bd_mask:
-    # value_per_col[c] = sum_m (mask[m, c] * per_row_value[m])
-    # since mask is one-hot in m for each c, this picks the right value.
-    bd_mask_i = bd_mask.to(tl.int64)
+    # bd_mask_i used to broadcast per-m scalars to [BLOCK_M*PAGE_SIZE]
+    col_eq_m = (col_to_row_m[:, None] == tl.arange(0, BLOCK_M)[None, :])  # [BLOCK_M*PAGE_SIZE, BLOCK_M]
+    col_eq_m_i = col_eq_m.to(tl.int64)
 
-    acc = tl.zeros((BLOCK_M, D), dtype=tl.float32)
+    acc = tl.zeros((BLOCK_M * G, D), dtype=tl.float32)
     ln2_inv = 1.4426950408889634
 
     for k_i in range(0, TOPK):
+        # Per-m page id (shared across G q-heads)
         page_ids = tl.load(
             PAGE_IDS_ptr
             + offs_m.to(tl.int64) * stride_p_b
@@ -129,39 +143,36 @@ def hsa_extend_paged_fwd_kernel(
             mask=mask_m,
             other=-1,
         ).to(tl.int32)  # [BLOCK_M]
+        # Per-(m, g) weight: weights[t, hq, k_i] for hq = hq_start..hq_start+G-1
         weights = tl.load(
             W_ptr
-            + offs_m.to(tl.int64) * stride_w_b
-            + pid_hq * stride_w_hq
+            + row_tok_flat * stride_w_b
+            + row_hq_flat * stride_w_hq
             + k_i * stride_w_k,
-            mask=mask_m,
+            mask=row_mask_flat,
             other=0.0,
-        ).to(tl.float32)  # [BLOCK_M]
+        ).to(tl.float32)  # [BLOCK_M*G]
 
         is_valid = page_ids >= 0  # [BLOCK_M]
         page_ids_safe = tl.maximum(page_ids, 0).to(tl.int64)  # [BLOCK_M]
-        weights_eff = tl.where(is_valid, weights, 0.0)  # [BLOCK_M]
 
-        # Build per-col page_id and seq_b via bd_mask broadcast-and-sum
-        page_id_per_col = tl.sum(bd_mask_i * page_ids_safe[:, None], axis=0)  # [BLOCK_M*PAGE_SIZE]
-        seq_per_col = tl.sum(bd_mask_i * seq_b[:, None], axis=0)  # [BLOCK_M*PAGE_SIZE]
-        valid_per_col = tl.sum(bd_mask_i * is_valid[:, None].to(tl.int64), axis=0) > 0  # [BLOCK_M*PAGE_SIZE]
-        row_valid_per_col = tl.sum(bd_mask_i * mask_m[:, None].to(tl.int64), axis=0) > 0
+        # Build per-col scalars
+        page_id_per_col = tl.sum(col_eq_m_i * page_ids_safe[None, :], axis=1)  # [BLOCK_M*PAGE_SIZE]
+        seq_per_col = tl.sum(col_eq_m_i * seq_b[None, :], axis=1)
+        valid_per_col = tl.sum(col_eq_m_i * is_valid[None, :].to(tl.int64), axis=1) > 0
+        m_valid_per_col = tl.sum(col_eq_m_i * mask_m[None, :].to(tl.int64), axis=1) > 0
 
-        # tok positions per col, with LMK exclusion mask
-        tok = page_id_per_col * PAGE_SIZE + s_in_page.to(tl.int64)  # [BLOCK_M*PAGE_SIZE]
+        tok = page_id_per_col * PAGE_SIZE + s_in_page.to(tl.int64)
         tok_in_range = tok < MAX_T
-        col_load_mask = tok_in_range & valid_per_col & row_valid_per_col
+        col_load_mask = tok_in_range & valid_per_col & m_valid_per_col
 
-        # token_loc via page_table
         pt_offsets = seq_per_col * stride_pt_b + tok * stride_pt_t
         token_loc = tl.load(
             PAGE_TABLE_ptr + pt_offsets,
             mask=col_load_mask,
             other=0,
-        ).to(tl.int64)  # [BLOCK_M*PAGE_SIZE]
+        ).to(tl.int64)
 
-        # K [BLOCK_M*PAGE_SIZE, D] — single gather, becomes one tensor for tl.dot
         k_offsets = (
             token_loc[:, None] * stride_k_loc
             + kv_h.to(tl.int64) * stride_kh
@@ -173,31 +184,28 @@ def hsa_extend_paged_fwd_kernel(
             other=0.0,
         )  # bf16 [BLOCK_M*PAGE_SIZE, D]
 
-        # Q @ K.T via tl.dot (tensor cores).
-        # logits[m, c] = sum_d q[m, d] * k[c, d]
-        # For m == col_to_row[c]: valid; otherwise off-diagonal block, must mask.
-        logits = tl.dot(q, k.trans()) * sm_scale  # [BLOCK_M, BLOCK_M*PAGE_SIZE]
+        # Q @ K.T — Q is [BLOCK_M*G, D], K is [BLOCK_M*PAGE_SIZE, D]
+        # M=16 (BLOCK_M=4, G=4) hits TC sweet spot.
+        logits = tl.dot(q, k.trans()) * sm_scale  # [BLOCK_M*G, BLOCK_M*PAGE_SIZE]
 
-        # Mask: only block-diagonal entries are real; off-diagonal -> -inf
-        # Also kill LMK column and out-of-range / invalid-page columns.
+        # Mask: block-diagonal in (row_to_m, col_to_row_m); also kill LMK / OOB / invalid pages.
         col_valid_for_softmax = col_load_mask
         if mask_last_token:
             col_valid_for_softmax = col_valid_for_softmax & (s_in_page != (PAGE_SIZE - 1))
 
-        valid_mask = bd_mask & col_valid_for_softmax[None, :]  # [BLOCK_M, BLOCK_M*PAGE_SIZE]
-        valid_mask = valid_mask & mask_m[:, None]
+        valid_mask = bd_mask & col_valid_for_softmax[None, :]  # [BLOCK_M*G, BLOCK_M*PAGE_SIZE]
+        valid_mask = valid_mask & row_mask_flat[:, None]
         logits = tl.where(valid_mask, logits, -float("inf"))
 
         # Per-row stable softmax
-        m_row = tl.max(logits, axis=1)  # [BLOCK_M]
+        m_row = tl.max(logits, axis=1)  # [BLOCK_M*G]
         m_row_safe = tl.where(m_row == -float("inf"), 0.0, m_row)
         p = tl.exp2((logits - m_row_safe[:, None]) * ln2_inv)
         p = tl.where(valid_mask, p, 0.0)
         denom = tl.sum(p, axis=1)
         denom_safe = tl.where(denom == 0.0, 1.0, denom)
-        p = p / denom_safe[:, None]  # [BLOCK_M, BLOCK_M*PAGE_SIZE]
+        p = p / denom_safe[:, None]  # [BLOCK_M*G, BLOCK_M*PAGE_SIZE]
 
-        # V [BLOCK_M*PAGE_SIZE, D]
         v_offsets = (
             token_loc[:, None] * stride_v_loc
             + kv_h.to(tl.int64) * stride_vh
@@ -209,21 +217,19 @@ def hsa_extend_paged_fwd_kernel(
             other=0.0,
         )  # bf16 [BLOCK_M*PAGE_SIZE, D]
 
-        # P @ V via tl.dot (tensor cores)
-        out_page = tl.dot(p.to(v.dtype), v)  # [BLOCK_M, D]
+        out_page = tl.dot(p.to(v.dtype), v)  # [BLOCK_M*G, D]
+        acc = acc + weights[:, None] * out_page.to(tl.float32)
 
-        # Per-row weighted accumulate
-        acc = acc + weights_eff[:, None] * out_page.to(tl.float32)
-
+    # Store [BLOCK_M*G, D] -> Out[offs_m, hq_start..hq_start+G-1, :]
     out_offsets = (
-        offs_m[:, None].to(tl.int64) * stride_out_b
-        + pid_hq * stride_out_hq
+        row_tok_flat[:, None] * stride_out_b
+        + row_hq_flat[:, None] * stride_out_hq
         + offs_d[None, :].to(tl.int64) * stride_out_d
     )
     tl.store(
         OUT_ptr + out_offsets,
         acc.to(tl.bfloat16),
-        mask=mask_m[:, None],
+        mask=row_mask_flat[:, None],
     )
 
 
@@ -242,7 +248,7 @@ def hsa_extend_paged_fwd(
     out: Optional[torch.Tensor] = None,
     block_m: int = 4,
 ) -> torch.Tensor:
-    """Q-batched paged sparse-attention for extend (block-diagonal TC trick).
+    """Q-batched paged sparse-attention for extend (G-fused, block-diagonal TC).
 
     Shapes:
         q                  [T, HQ, D]
@@ -304,7 +310,8 @@ def hsa_extend_paged_fwd(
     if out is None:
         out = torch.empty((T, HQ, D), device=q.device, dtype=torch.bfloat16)
 
-    grid = (triton.cdiv(T, block_m), HQ)
+    # Grid: (T/BLOCK_M, H_kv) — each program handles BLOCK_M tokens, all G q-heads
+    grid = (triton.cdiv(T, block_m), H)
     hsa_extend_paged_fwd_kernel[grid](
         q_,
         k_,
