@@ -1214,46 +1214,28 @@ class HSAAttnBackend(AttentionBackend):
 
         # --- Build single-sequence kv_indices over [0, total_kv) ---
         # Each linear position i in kv_indices maps to cache slot for engine pos i.
-        # The kernel's chunk-aligned SW + LMK + causal masks (set via constexpr)
-        # together select exactly the same KV set as the old per-token kv_indices.
-        # `kv_indices` must be int64 to match the kernel's K_Buffer indexing path.
         kv_indices = page_table_1[0, :total_kv].to(torch.int64).contiguous()
-
-        qo_indptr = torch.tensor([0, extend_len], device=device, dtype=torch.int32)
-        kv_indptr = torch.tensor([0, total_kv], device=device, dtype=torch.int32)
-        prefix_lens_tensor = torch.tensor([prefix_len], device=device, dtype=torch.int32)
-        window_start_pos = torch.zeros(1, device=device, dtype=torch.int32)
 
         # HSA heads slice of KV cache.
         pool_k = pool.get_key_buffer(layer.layer_id)[:, H_swa:H_swa + H_hsa, :]
         pool_v = pool.get_value_buffer(layer.layer_id)[:, H_swa:H_swa + H_hsa, :]
 
-        swa_o_3 = torch.zeros((T, HQ_hsa, D), device=device, dtype=q_hsa.dtype)
-        lse_raw = torch.full((T, HQ_hsa), float("-inf"), device=device, dtype=torch.float32)
-
-        from sglang.srt.layers.attention.triton_ops.extend_attention import (
-            extend_attention_fwd_unified,
-        )
-        extend_attention_fwd_unified(
-            q_hsa,
-            swa_o_3,
-            pool_k,
-            pool_v,
-            qo_indptr,                       # [0, T] — single sequence
-            kv_indptr,                       # [0, total_kv] — full KV span
-            kv_indices,                      # [total_kv] — cache slots by engine pos
-            prefix_lens_tensor,              # [prefix_len]
-            max_len_extend=extend_len,       # full Q span — BLOCK_M now fully used
+        # R39: dedicated G-fused HSA-SWA kernel — packs all GQA q-heads per
+        # program (M=BLOCK_M*G=128 at G=4, hitting TC sweet spot) instead of
+        # the generic _fwd_kernel_unified which reloaded K once per q-head.
+        from sglang.srt.layers.attention.hsa.kernels import hsa_swa_extend_fwd
+        swa_o_bf16, lse_raw = hsa_swa_extend_fwd(
+            q_hsa=q_hsa,
+            k_cache_hsa=pool_k,
+            v_cache_hsa=pool_v,
+            kv_indices=kv_indices,
+            prefix_len=prefix_len,
+            extend_len=extend_len,
+            hsa_window=hsa_window,
+            page_size=page_size,
             sm_scale=sm_scale,
-            is_causal=True,                  # kernel handles q_abs >= k_abs for extend K
-            sliding_window_size=hsa_window,
-            window_start_pos=window_start_pos,
-            lse_output=lse_raw,
-            lmk_period=page_size,
-            chunk_aligned_sw_page_size=page_size,
         )
-
-        swa_o = swa_o_3.to(torch.float32)
+        swa_o = swa_o_bf16.to(torch.float32)
 
         # --- Aggregate per-q-head LSE to per-kv-head ---
         lse_per_group = lse_raw.view(T, H_hsa, Gh)

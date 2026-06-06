@@ -997,6 +997,10 @@ def extend_attention_fwd_unified(
     lse_output=None,
     lmk_period=0,
     chunk_aligned_sw_page_size=0,
+    num_warps_override=None,
+    num_stages_override=None,
+    block_m_override=None,
+    block_n_override=None,
 ):
     """
     Unified 1-stage extend attention for deterministic inference.
@@ -1028,6 +1032,12 @@ def extend_attention_fwd_unified(
     BLOCK_DMODEL, BLOCK_DPE, BLOCK_DV, BLOCK_M, BLOCK_N, num_warps = (
         _get_block_sizes_for_extend_attention(Lq, Lv)
     )
+    if block_m_override is not None:
+        BLOCK_M = int(block_m_override)
+    if block_n_override is not None:
+        BLOCK_N = int(block_n_override)
+    if num_warps_override is not None:
+        num_warps = int(num_warps_override)
 
     sm_scale = sm_scale or 1.0 / (Lq**0.5)
     batch_size, head_num = qo_indptr.shape[0] - 1, q.shape[1]
@@ -1043,7 +1053,7 @@ def extend_attention_fwd_unified(
         window_start_pos = torch.zeros(batch_size, dtype=torch.int32, device=q.device)
 
     grid = (batch_size, head_num, triton.cdiv(max_len_extend, BLOCK_M))
-    num_stages = 1
+    num_stages = 1 if num_stages_override is None else int(num_stages_override)
 
     extra_kargs = {}
     if _is_hip:
