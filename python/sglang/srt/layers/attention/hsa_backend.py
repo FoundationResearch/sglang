@@ -1146,11 +1146,26 @@ class HSAAttnBackend(AttentionBackend):
     ) -> tuple:
         """Internal SWA on HSA heads for extend via triton extend kernel.
 
-        Uses the triton extend_attention_fwd_unified kernel with custom
-        kv_indices that implement chunk-aligned sliding window + LMK exclusion,
-        matching the training block_causal_mask semantics exactly.
+        R36: single-batch fused mask path. The triton extend kernel now natively
+        supports BOTH chunk-aligned sliding window AND LMK exclusion via two new
+        constexpr params (CHUNK_ALIGNED_SW_PAGE_SIZE, LMK_PERIOD).  We collapse the
+        previous "T sequences of 1 query each" structure into "1 sequence of T
+        queries", letting the kernel use its full BLOCK_M Q-tile and amortize KV
+        loads across consecutive Q tokens — eliminates the per-token launch-and-Q-
+        tile-waste that made prefill ~8× slower than dense at L=16K.
 
-        Memory: O(max_kv_per_token) for indices, no element-level mask needed.
+        Mask equivalence to old per-token kv_indices construction:
+          * Chunk-aligned SW lower bound:
+                raw_start  = q_abs - hsa_window + 1
+                chunk_start = max(0, floor(raw_start / page_size) * page_size)
+                K visible iff k_abs >= chunk_start
+            (kernel: window_mask when CHUNK_ALIGNED_SW_PAGE_SIZE > 0)
+          * LMK exclusion:
+                K visible iff (k_abs + 1) % page_size != 0
+            (kernel: lmk_mask when LMK_PERIOD > 0)
+          * Causal between extend Q and extend K (q_abs >= k_abs):
+            (kernel: IS_CAUSAL with prefix_lens passed through)
+
         Only supports batch=1 (SGLang continuous batching guarantee).
 
         Returns
@@ -1172,7 +1187,7 @@ class HSAAttnBackend(AttentionBackend):
         if md is None or pool is None or md.token_positions is None or md.token_to_seq_id is None:
             return swa_o, lse_kv
 
-        # --- 只支持 batch=1 ---
+        # --- batch=1 only ---
         extend_seq_lens = md.extend_seq_lens
         extend_prefix_lens = md.extend_prefix_lens
         assert extend_seq_lens is not None and extend_prefix_lens is not None
@@ -1189,131 +1204,59 @@ class HSAAttnBackend(AttentionBackend):
 
         prefix_len = int(extend_prefix_lens[0].item())
         extend_len = int(extend_seq_lens[0].item())
+        total_kv = prefix_len + extend_len  # full sequence length in cache
 
-        # --- 构建 chunk-aligned window + LMK-excluded 的 kv_indices ---
-        # 对于每个 Q token t (engine_idx = prefix_len + t):
-        #   chunk_start = max(0, ((engine_idx - hsa_window + 1) // page_size) * page_size)
-        #   valid KV: positions in [chunk_start, engine_idx] where (pos+1) % page_size != 0
-        # 由于 batch=1，我们构建一个统一的 kv_indptr/kv_indices
-
-        # 计算所有 Q token 的 engine indices
-        engine_indices = torch.arange(prefix_len, prefix_len + extend_len,
-                                      device=device, dtype=torch.int64)  # [T]
-
-        # 计算每个 Q token 的 chunk-aligned window start
-        raw_starts = engine_indices - hsa_window + 1  # [T]
-        chunk_starts = (raw_starts // page_size) * page_size  # [T], chunk-aligned
-        chunk_starts = chunk_starts.clamp(min=0)
-
-        # 每个 Q token 的 KV 范围: [chunk_start, engine_idx]
-        # 排除 LMK: (pos + 1) % page_size != 0
-        # 最大 KV 长度 per token: hsa_window + page_size (chunk alignment 可能多一个 page)
-        # 减去 LMK tokens: 每 page_size 个 token 有 1 个 LMK
-        max_kv_per_token = hsa_window + page_size  # 上界
-
-        # 构建 kv_indptr 和 kv_indices
-        # 为了效率，使用向量化操作
-        kv_counts = torch.zeros(T, device=device, dtype=torch.int32)
-        # 实际 KV 数 = (engine_idx - chunk_start + 1) - num_lmk_in_range
-        range_lens = engine_indices - chunk_starts + 1  # [T]
-        # LMK 数量: 在 [chunk_start, engine_idx] 范围内 (pos+1) % page_size == 0 的数量
-        # = (engine_idx // page_size) - (chunk_start // page_size) + (1 if (engine_idx+1)%page_size==0 else 0)
-        # 简化: floor(engine_idx / page_size) - floor((chunk_start-1) / page_size)
-        # 但更准确的是: 在 [chunk_start, engine_idx] 中，page_size-1, 2*page_size-1, ... 的数量
-        first_lmk = (chunk_starts // page_size) * page_size + (page_size - 1)  # 第一个可能的 LMK 位置
-        # 如果 first_lmk < chunk_start，则从下一个 LMK 开始
-        first_lmk = torch.where(first_lmk >= chunk_starts, first_lmk,
-                                first_lmk + page_size)
-        # LMK 数量 = max(0, (engine_idx - first_lmk) // page_size + 1) if first_lmk <= engine_idx
-        num_lmk = torch.where(
-            first_lmk <= engine_indices,
-            (engine_indices - first_lmk) // page_size + 1,
-            torch.zeros_like(engine_indices),
-        )
-        kv_counts = (range_lens - num_lmk).to(torch.int32).clamp(min=0)
-
-        kv_indptr = torch.zeros(T + 1, device=device, dtype=torch.int32)
-        kv_indptr[1:] = torch.cumsum(kv_counts, dim=0)
-        total_kv = int(kv_indptr[-1].item())
-
-        if total_kv == 0:
+        if total_kv == 0 or extend_len == 0:
             return swa_o, lse_kv
 
-        # 构建 kv_indices: 对于每个 Q token，列出其 KV slot indices
-        # 使用 page_table_1 将 engine position → KV cache slot
-        kv_indices = torch.empty(total_kv, device=device, dtype=torch.int64)
+        # --- Build single-sequence kv_indices over [0, total_kv) ---
+        # Each linear position i in kv_indices maps to cache slot for engine pos i.
+        # The kernel's chunk-aligned SW + LMK + causal masks (set via constexpr)
+        # together select exactly the same KV set as the old per-token kv_indices.
+        # `kv_indices` must be int64 to match the kernel's K_Buffer indexing path.
+        kv_indices = page_table_1[0, :total_kv].to(torch.int64).contiguous()
 
-        # 向量化构建: 展开所有 Q token 的 KV 范围
-        # 方法: 对每个 Q token t，生成 [chunk_start[t], engine_idx[t]] 中非 LMK 的位置
-        # 然后通过 page_table_1 映射到 KV cache slot
-        #
-        # 为了避免 Python 循环，使用 padded 矩阵 + mask 的方式
-        max_range = int(range_lens.max().item())
-        if max_range <= 0:
-            return swa_o, lse_kv
+        qo_indptr = torch.tensor([0, extend_len], device=device, dtype=torch.int32)
+        kv_indptr = torch.tensor([0, total_kv], device=device, dtype=torch.int32)
+        prefix_lens_tensor = torch.tensor([prefix_len], device=device, dtype=torch.int32)
+        window_start_pos = torch.zeros(1, device=device, dtype=torch.int32)
 
-        # offsets: [T, max_range], 每行是 [0, 1, ..., max_range-1]
-        offsets = torch.arange(max_range, device=device, dtype=torch.int64).unsqueeze(0)  # [1, max_range]
-        # positions: [T, max_range], 每行是 [chunk_start[t], chunk_start[t]+1, ...]
-        positions = chunk_starts.unsqueeze(1) + offsets  # [T, max_range]
-
-        # valid mask: position <= engine_idx AND (position+1) % page_size != 0
-        valid = (positions <= engine_indices.unsqueeze(1)) & \
-                ((positions + 1) % page_size != 0)
-
-        # 通过 page_table_1 映射到 KV cache slot
-        positions_safe = positions.clamp(min=0, max=page_table_1.shape[1] - 1)
-        kv_slots = page_table_1[0, positions_safe].to(torch.int64)  # [T, max_range]
-
-        # 使用 valid mask 提取有效的 kv_slots
-        kv_indices = kv_slots[valid]  # [total_kv]
-
-        # --- 调用 triton extend kernel ---
-        # 把每个 Q token 当作一个独立的 "sequence"，这样每个 Q token
-        # 有自己的 KV indices（chunk-aligned window + LMK excluded）
-        # batch_size = T, 每个 "sequence" 有 1 个 Q token
-        qo_indptr = torch.arange(T + 1, device=device, dtype=torch.int32)  # [0, 1, 2, ..., T]
-        prefix_lens_tensor = kv_counts  # 每个 "sequence" 的所有 KV 都是 "prefix"
-
-        # 获取 HSA heads 的 KV cache buffer
+        # HSA heads slice of KV cache.
         pool_k = pool.get_key_buffer(layer.layer_id)[:, H_swa:H_swa + H_hsa, :]
         pool_v = pool.get_value_buffer(layer.layer_id)[:, H_swa:H_swa + H_hsa, :]
 
-        # 输出 tensor
         swa_o_3 = torch.zeros((T, HQ_hsa, D), device=device, dtype=q_hsa.dtype)
-
-        # LSE 输出 tensor: [T, HQ_hsa]，由 triton kernel 直接写入
         lse_raw = torch.full((T, HQ_hsa), float("-inf"), device=device, dtype=torch.float32)
 
-        # 使用 unified kernel（1-stage），因为所有 KV 都在 cache 中（没有 extend KV）
         from sglang.srt.layers.attention.triton_ops.extend_attention import (
             extend_attention_fwd_unified,
         )
         extend_attention_fwd_unified(
-            q_hsa,           # [T, HQ_hsa, D]
-            swa_o_3,         # [T, HQ_hsa, D] output
-            pool_k,          # KV cache key buffer (HSA heads only)
-            pool_v,          # KV cache value buffer (HSA heads only)
-            qo_indptr,       # [T+1]: [0, 1, 2, ..., T]
-            kv_indptr,       # [T+1]: per-token KV offsets
-            kv_indices,      # [total_kv]: KV cache slot indices
-            prefix_lens_tensor,  # [T]: 每个 "sequence" 的所有 KV 都是 prefix
-            max_len_extend=1,    # 每个 "sequence" 只有 1 个 extend token
+            q_hsa,
+            swa_o_3,
+            pool_k,
+            pool_v,
+            qo_indptr,                       # [0, T] — single sequence
+            kv_indptr,                       # [0, total_kv] — full KV span
+            kv_indices,                      # [total_kv] — cache slots by engine pos
+            prefix_lens_tensor,              # [prefix_len]
+            max_len_extend=extend_len,       # full Q span — BLOCK_M now fully used
             sm_scale=sm_scale,
-            is_causal=False,  # causal mask 已通过 kv_indices 实现
-            lse_output=lse_raw,  # [T, HQ_hsa] kernel 直接写入 LSE
+            is_causal=True,                  # kernel handles q_abs >= k_abs for extend K
+            sliding_window_size=hsa_window,
+            window_start_pos=window_start_pos,
+            lse_output=lse_raw,
+            lmk_period=page_size,
+            chunk_aligned_sw_page_size=page_size,
         )
 
         swa_o = swa_o_3.to(torch.float32)
 
-        # --- 从 kernel 返回的 per-query-head LSE 聚合到 per-kv-head ---
-        # lse_raw: [T, HQ_hsa] → [T, H_hsa, Gh] → logsumexp over Gh → [T, H_hsa]
-        lse_per_group = lse_raw.view(T, H_hsa, Gh)  # [T, H_hsa, Gh]
-        lse_kv = torch.logsumexp(lse_per_group, dim=-1)  # [T, H_hsa]
+        # --- Aggregate per-q-head LSE to per-kv-head ---
+        lse_per_group = lse_raw.view(T, H_hsa, Gh)
+        lse_kv = torch.logsumexp(lse_per_group, dim=-1)
 
         # Stash per-q-head LSE for the per-q-head fusion path (qwen-LHSA).
-        # lse_raw is already shape [T, HQ_hsa] which is what the fusion needs.
-        # Cast to q dtype to match the official lhsa_layer.py:625 behaviour.
         self._last_swa_lse_hq_extend = lse_raw.to(q_hsa.dtype)
 
         return swa_o, lse_kv

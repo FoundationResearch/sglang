@@ -721,10 +721,23 @@ def _fwd_kernel_unified(
     RETURN_LSE: tl.constexpr = False,
     stride_lse_bs: tl.constexpr = 0,
     stride_lse_h: tl.constexpr = 0,
+    LMK_PERIOD: tl.constexpr = 0,
+    CHUNK_ALIGNED_SW_PAGE_SIZE: tl.constexpr = 0,
 ):
     """
     Unified 1-stage kernel for deterministic extend attention.
     Both prefix and extend KV are accessed through the unified kv_indices.
+
+    Optional masks for HSA prefill (default 0 = disabled, preserving existing behavior):
+
+    - LMK_PERIOD > 0: exclude keys at positions where (k_abs_pos + 1) % LMK_PERIOD == 0.
+      HSA's "Last token of each chunk" lives in cache as a real token (used by the
+      selector / sparse branch) but must be excluded from the internal SWA pass.
+
+    - CHUNK_ALIGNED_SW_PAGE_SIZE > 0: round the sliding-window lower bound DOWN to
+      a multiple of this page size, matching HSA's chunk-aligned window definition
+      (raw_start = q_pos - SW + 1; window_start = floor(raw_start / ps) * ps, then
+      clamped to 0). Replaces the standard k_abs_pos >= q_abs_pos - SW lower bound.
     """
     cur_seq = tl.program_id(0)
     cur_head = tl.program_id(1)
@@ -839,13 +852,30 @@ def _fwd_kernel_unified(
             # K absolute position: window_start + k_index_in_unified_array
             k_abs_pos = cur_window_start + start_n + offs_n[None, :]
 
-            # Sliding window: query can attend to keys within window_size
-            window_mask = q_abs_pos <= (k_abs_pos + SLIDING_WINDOW_SIZE)
+            if CHUNK_ALIGNED_SW_PAGE_SIZE > 0:
+                # HSA chunk-aligned window: raw_start = q_abs_pos - SW + 1, then
+                # round DOWN to page boundary and clamp to 0.
+                raw_starts = q_abs_pos - SLIDING_WINDOW_SIZE + 1
+                chunk_starts = (raw_starts // CHUNK_ALIGNED_SW_PAGE_SIZE) * CHUNK_ALIGNED_SW_PAGE_SIZE
+                chunk_starts = tl.maximum(chunk_starts, 0)
+                window_mask = k_abs_pos >= chunk_starts
+            else:
+                # Standard sliding window: query can attend to keys within window_size
+                window_mask = q_abs_pos <= (k_abs_pos + SLIDING_WINDOW_SIZE)
             final_mask &= window_mask
+
+        if LMK_PERIOD > 0:
+            # Exclude HSA "last-token-of-chunk" positions from the SWA pass.
+            # k_abs_pos was computed above when SW>0; recompute if SW is off
+            # (Triton will fold the duplicate computation).
+            if SLIDING_WINDOW_SIZE <= 0:
+                k_abs_pos = cur_window_start + start_n + offs_n[None, :]
+            lmk_mask = ((k_abs_pos + 1) % LMK_PERIOD) != 0
+            final_mask &= lmk_mask
 
         # Check if we can skip this tile
         SKIP_TILE = False
-        if USE_CUSTOM_MASK or SLIDING_WINDOW_SIZE > 0:
+        if USE_CUSTOM_MASK or SLIDING_WINDOW_SIZE > 0 or LMK_PERIOD > 0:
             SKIP_TILE = tl.max(tl.max(final_mask.to(tl.int32), axis=1), axis=0) == 0
 
         if not SKIP_TILE:
@@ -965,6 +995,8 @@ def extend_attention_fwd_unified(
     window_start_pos=None,
     xai_temperature_len=-1,
     lse_output=None,
+    lmk_period=0,
+    chunk_aligned_sw_page_size=0,
 ):
     """
     Unified 1-stage extend attention for deterministic inference.
@@ -1057,6 +1089,8 @@ def extend_attention_fwd_unified(
         RETURN_LSE=lse_output is not None,
         stride_lse_bs=lse_output.stride(0) if lse_output is not None else 0,
         stride_lse_h=lse_output.stride(1) if lse_output is not None else 0,
+        LMK_PERIOD=int(lmk_period),
+        CHUNK_ALIGNED_SW_PAGE_SIZE=int(chunk_aligned_sw_page_size),
         num_warps=num_warps,
         num_stages=num_stages,
         **extra_kargs,
