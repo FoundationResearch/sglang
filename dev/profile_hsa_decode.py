@@ -17,7 +17,7 @@ from sglang.srt.server_args import ServerArgs
 import argparse
 
 # Parse args.
-sys.argv = [
+_argv = [
     "profile",
     "--model-path", "/home/hal-alex/workspace/hsa345m_real",
     "--load-format", "dummy",
@@ -30,6 +30,9 @@ sys.argv = [
     "--mem-fraction-static", "0.50",
     "--trust-remote-code",
 ]
+if "HSA_TOPK_OVERRIDE" in os.environ:
+    _argv.extend(["--hsa-topk", os.environ["HSA_TOPK_OVERRIDE"]])
+sys.argv = _argv
 
 parser = argparse.ArgumentParser()
 ServerArgs.add_cli_args(parser)
