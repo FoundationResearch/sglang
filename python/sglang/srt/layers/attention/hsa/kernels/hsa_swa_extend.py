@@ -122,12 +122,20 @@ def hsa_swa_extend_kernel(
     e_max = tl.full((BLOCK_M * G,), -float("inf"), dtype=tl.float32)
     deno = tl.zeros((BLOCK_M * G,), dtype=tl.float32)
 
-    # Window upper bound across the block = max q_abs in block (so loop bound aligns)
-    max_q_abs = pid_m * BLOCK_M + BLOCK_M - 1 + PREFIX_LEN
-    # K iteration: from min chunk_start in block to min(max_q_abs+1, TOTAL_KV)
-    # Use tile-aligned bounds so the kernel sees constexpr-friendly ranges.
-    # We iterate the full [0, TOTAL_KV) and rely on the SKIP_TILE check to prune.
-    for start_n in range(0, TOTAL_KV, BLOCK_N):
+    # Per-block bounds:
+    # - K lower bound: smallest chunk_start across the block (q_abs is monotone in m,
+    #   so chunk_starts is non-decreasing; min = chunk_starts at smallest q_abs).
+    # - K upper bound: largest q_abs + 1 (causal), capped to TOTAL_KV.
+    # Aligning lower bound DOWN to BLOCK_N keeps the loop sees the same range
+    # across all programs that share the tile boundary.
+    block_q_min = pid_m * BLOCK_M + PREFIX_LEN
+    block_q_max = block_q_min + BLOCK_M - 1
+    block_k_lo_raw = block_q_min - SW + 1
+    block_k_lo = (block_k_lo_raw // PAGE_SIZE) * PAGE_SIZE
+    block_k_lo = tl.maximum(block_k_lo, 0)
+    block_k_lo = (block_k_lo // BLOCK_N) * BLOCK_N
+    block_k_hi = tl.minimum(block_q_max + 1, TOTAL_KV)
+    for start_n in range(block_k_lo, block_k_hi, BLOCK_N):
         start_n = tl.multiple_of(start_n, BLOCK_N)
         k_abs = start_n + offs_n  # [BLOCK_N] engine positions
         mask_n = k_abs < TOTAL_KV
