@@ -313,12 +313,11 @@ def select_topk_pages_decode_fused(
         q_3 = q_4d.view(B_c, h_q_c, D_c).float()                              # [B, h_q, D]
         cand_f = cand_repr.float()                                            # [B, C, h_q, D]
         scores_pqh = torch.einsum("bhd,bchd->bhc", q_3, cand_f) * sm_scale_ref  # [B, h_q, C]
-        # R48 (Item #6): add entropy bias to per-q-head scores, matching the
-        # official online_softmax_topk_head-with-G path.  An earlier comment
-        # noted KL was WORSE with prior_b on the 345M checkpoint — that test
-        # was before R47's slot-reuse fix, which means the bias was sometimes
-        # being read from the wrong slot. With R47 + R45 + R43 in place the
-        # bias should now be consistent with TRM.
+        # R48 (Item #6): add entropy bias to per-q-head scores. Historical
+        # comment about "WORSE KL with prior_b" predates R47's slot-reuse fix —
+        # the bias was being read from the wrong slot, so adding it amplified
+        # noise. With R47 (proper multi-layer slot reuse) the bias is now
+        # consistent with the official's chunk_attn_pool output.
         if per_qhead_prior_b is not None:
             scores_pqh = scores_pqh + per_qhead_prior_b.permute(0, 2, 1).to(scores_pqh.dtype)
         # Selection scores: max over G  → [B, h_kv, C]
