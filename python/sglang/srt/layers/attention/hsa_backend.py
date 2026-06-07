@@ -1825,6 +1825,7 @@ class HSAAttnBackend(AttentionBackend):
             )
         # R37: Q-batched extend kernel (collapses (T, HQ) grid to (T/BLOCK_M, HQ)).
         md = self.forward_metadata
+        import os as _os
         return hsa_extend_paged_fwd(
             q=q_hsa,                              # [T, HQ_hsa, D]
             k_cache=k_cache,                       # [Nloc, H_hsa, D]
@@ -1836,6 +1837,9 @@ class HSAAttnBackend(AttentionBackend):
             sm_scale=sm_scale,
             mask_last_token=True,
             token_to_seq_id=md.token_to_seq_id,    # [T] int32
+            block_m=int(_os.environ.get("HSA_SPARSE_BM", 1)),
+            num_warps=int(_os.environ.get("HSA_SPARSE_NW", 2)),
+            num_stages=int(_os.environ.get("HSA_SPARSE_NS", 2)),
         )
 
     def _hsa_sparse_attn_extend_reference(

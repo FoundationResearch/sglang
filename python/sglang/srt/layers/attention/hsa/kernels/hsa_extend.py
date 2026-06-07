@@ -246,7 +246,9 @@ def hsa_extend_paged_fwd(
     sm_scale: Optional[float] = None,
     mask_last_token: bool = True,
     out: Optional[torch.Tensor] = None,
-    block_m: int = 4,
+    block_m: int = 1,
+    num_warps: int = 2,
+    num_stages: int = 2,
 ) -> torch.Tensor:
     """Q-batched paged sparse-attention for extend (G-fused, block-diagonal TC).
 
@@ -351,7 +353,7 @@ def hsa_extend_paged_fwd(
         MAX_T=MAX_T,
         mask_last_token=bool(mask_last_token),
         BLOCK_M=int(block_m),
-        num_warps=8,
-        num_stages=2,
+        num_warps=int(num_warps),
+        num_stages=int(num_stages),
     )
     return out
