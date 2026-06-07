@@ -805,16 +805,23 @@ class Req:
         self.hsa_page_size = int(page_size)
         self.hsa_lmk_id = int(lmk_id)
 
-    def hsa_should_insert_lmk_next(self) -> bool:
-        """Whether the next engine-visible position is the LMK slot."""
+    def hsa_should_insert_lmk_next(self, current_seq_len: int | None = None) -> bool:
+        """Whether the next decode step should run an internal LMK token.
+
+        Decision is based on the actual engine-visible KV length passed via
+        ``current_seq_len`` (the scheduler's ``batch.seq_lens[i]``). Without it
+        we fall back to ``len(self.fill_ids)``, which can be off-by-one against
+        the scheduler's view in decode and breaks LMK insertion timing.
+        """
         if not self.hsa_lmk_enabled:
             return False
         assert self.hsa_page_size is not None and self.hsa_lmk_id is not None
         page_size = int(self.hsa_page_size)
-        return (len(self.fill_ids) % page_size) == (page_size - 1)
+        seq_len = int(current_seq_len) if current_seq_len is not None else len(self.fill_ids)
+        return (seq_len % page_size) == (page_size - 1)
 
     def hsa_decode_postprocess_sampled_token(
-        self, sampled_next_token_id: int
+        self, sampled_next_token_id: int, current_seq_len: int | None = None
     ) -> tuple[bool, int | None, bool]:
         """Post-process a sampled next token under HSA-LMK decode semantics.
 
@@ -841,7 +848,7 @@ class Req:
         self.output_ids.append(sampled_next_token_id)
 
         # If next engine-visible position is LMK slot, schedule LMK as next input and stash this token.
-        if self.hsa_should_insert_lmk_next():
+        if self.hsa_should_insert_lmk_next(current_seq_len):
             self.hsa_pending_visible_token_id = int(sampled_next_token_id)
             self.hsa_waiting_for_lmk_step = True
             # Append LMK into engine-visible sequence, but do NOT append the sampled token yet.

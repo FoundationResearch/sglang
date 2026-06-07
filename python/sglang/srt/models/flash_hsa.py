@@ -84,9 +84,9 @@ def _try_fused_per_head_rmsnorm_3d_inplace(
     # rows because the heads stride is `head_dim` for a contiguous 3D tensor.
     _fused_qknorm(x[:, :half, :], x[:, half:, :], weight, weight, eps=eps, head_dim=head_dim)
     return True
-from sglang.srt.layers.linear import ColumnParallelLinear, MergedColumnParallelLinear, RowParallelLinear
+from sglang.srt.layers.linear import ColumnParallelLinear, MergedColumnParallelLinear, ReplicatedLinear, RowParallelLinear
 from sglang.srt.layers.radix_attention import RadixAttention
-from sglang.srt.layers.rotary_embedding import get_rope
+from sglang.srt.layers.rotary_embedding import RotaryEmbedding, get_rope
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
@@ -109,6 +109,169 @@ def next_of_y(x: int, y: int) -> int:
     return (x + y - 1) // y * y
 
 
+class _HoPERotaryEmbedding(RotaryEmbedding):
+    """High-frequency-only partial RoPE used by FlashHSA when ``use_hope=True``.
+
+    Mirrors ``InfiniteLongLM/models/FlashHSA/HoPE.py``: keep only the top
+    ``hope_partial_ratio * (rotary_dim // 2)`` highest-frequency pairs; the
+    remaining low-frequency pairs are zeroed (NoPE). theta is chosen so the
+    longest kept period equals ``hope_context_length``.
+    """
+
+    def __init__(
+        self,
+        head_size: int,
+        rotary_dim: int,
+        max_position_embeddings: int,
+        base: int,
+        is_neox_style: bool,
+        dtype: torch.dtype,
+        *,
+        hope_partial_ratio: float = 0.5,
+        hope_context_length: Optional[int] = None,
+        hope_theta: Optional[float] = None,
+    ) -> None:
+        import math as _math
+
+        head_dim_half = rotary_dim // 2
+        if not (0.0 < hope_partial_ratio <= 1.0):
+            raise ValueError(
+                f"hope_partial_ratio must be in (0, 1], got {hope_partial_ratio}"
+            )
+        n_keep = max(1, int(round(hope_partial_ratio * head_dim_half)))
+        n_keep = min(n_keep, head_dim_half)
+        L = int(
+            hope_context_length
+            if hope_context_length is not None
+            else max_position_embeddings
+        )
+        if L <= 0:
+            raise ValueError(f"hope_context_length must be positive, got {L}")
+        if hope_theta is not None:
+            eff_theta = float(hope_theta)
+        elif n_keep <= 1:
+            eff_theta = max(L / (2.0 * _math.pi), 1.0)
+        else:
+            eff_theta = (L / (2.0 * _math.pi)) ** (n_keep / (n_keep - 1))
+        # hope-specific attrs MUST be set before super().__init__() because the
+        # parent ctor calls self._compute_cos_sin_cache() -> _compute_inv_freq().
+        self._hope_head_dim_half = head_dim_half
+        self._hope_n_keep = n_keep
+        self._hope_context_length = L
+        self._hope_eff_theta = eff_theta
+
+        super().__init__(
+            head_size, rotary_dim, max_position_embeddings, base, is_neox_style, dtype
+        )
+
+    def _compute_inv_freq(self, base):  # noqa: ARG002 - base unused for HoPE
+        n_total = self._hope_head_dim_half
+        n_keep = self._hope_n_keep
+        inv_freq = torch.zeros(n_total, dtype=torch.float)
+        if n_keep == 1:
+            inv_freq[0] = 1.0
+            return inv_freq
+        theta = self._hope_eff_theta
+        j = torch.arange(n_keep, dtype=torch.float)
+        inv_freq[:n_keep] = theta ** (-j / float(n_keep))
+        return inv_freq
+
+
+class _InRangeRotaryEmbedding(RotaryEmbedding):
+    """Standard RoPE plus wavelength-based frequency masking.
+
+    Mirrors trm ``Olmo3RotaryEmbedding`` with ``enable_inrange_rope=True``: build
+    vanilla RoPE inv_freq from ``rope_theta``, then zero any freq-pair whose
+    period is longer than ``rope_context_length / rope_period_multiplier``.
+    """
+
+    def __init__(
+        self,
+        head_size: int,
+        rotary_dim: int,
+        max_position_embeddings: int,
+        base: int,
+        is_neox_style: bool,
+        dtype: torch.dtype,
+        *,
+        rope_context_length: int,
+        rope_period_multiplier: float,
+    ) -> None:
+        self._inrange_head_dim_half = rotary_dim // 2
+        self._inrange_context_length = int(rope_context_length)
+        self._inrange_period_multiplier = float(rope_period_multiplier)
+        super().__init__(
+            head_size, rotary_dim, max_position_embeddings, base, is_neox_style, dtype
+        )
+
+    def _compute_inv_freq(self, base):
+        import math as _math
+
+        inv_freq = super()._compute_inv_freq(base).clone()
+        threshold = (2.0 * _math.pi * self._inrange_period_multiplier) / max(
+            self._inrange_context_length, 1
+        )
+        keep = inv_freq >= threshold
+        keep[0] = True
+        inv_freq[~keep] = 0.0
+        return inv_freq
+
+
+def _make_rope_for_hsa(
+    config,
+    head_size,
+    rotary_dim,
+    max_position,
+    base,
+    rope_scaling,
+    *,
+    for_hsa_layer: bool = False,
+):
+    """Build rotary embedding honoring trm FlashHSA RoPE knobs."""
+    if config is None:
+        return get_rope(
+            head_size, rotary_dim=rotary_dim, max_position=max_position,
+            base=base, rope_scaling=rope_scaling,
+        )
+    use_hope = bool(getattr(config, "use_hope", False))
+    enable_inrange = bool(getattr(config, "enable_inrange_rope", False))
+    # Compatibility: SWA/base layers keep standard RoPE; only HSA layers use
+    # HoPE's inrange path when both flags are enabled.
+    if use_hope and enable_inrange and not for_hsa_layer:
+        return get_rope(
+            head_size, rotary_dim=rotary_dim, max_position=max_position,
+            base=base, rope_scaling=rope_scaling,
+        )
+    if enable_inrange:
+        return _InRangeRotaryEmbedding(
+            head_size=head_size, rotary_dim=rotary_dim,
+            max_position_embeddings=max_position, base=base,
+            is_neox_style=True, dtype=torch.get_default_dtype(),
+            rope_context_length=int(getattr(config, "rope_context_length", max_position)),
+            rope_period_multiplier=float(getattr(config, "rope_period_multiplier", 1.0)),
+        )
+    if use_hope:
+        hope_partial_ratio = float(getattr(config, "hope_partial_ratio", 0.5))
+        hope_context_length = getattr(config, "hope_context_length", None)
+        if hope_context_length is not None:
+            hope_context_length = int(hope_context_length)
+        hope_theta = getattr(config, "hope_theta", None)
+        if hope_theta is not None:
+            hope_theta = float(hope_theta)
+        return _HoPERotaryEmbedding(
+            head_size=head_size, rotary_dim=rotary_dim,
+            max_position_embeddings=max_position, base=int(base),
+            is_neox_style=True, dtype=torch.get_default_dtype(),
+            hope_partial_ratio=hope_partial_ratio,
+            hope_context_length=hope_context_length,
+            hope_theta=hope_theta,
+        )
+    return get_rope(
+        head_size, rotary_dim=rotary_dim, max_position=max_position,
+        base=base, rope_scaling=rope_scaling,
+    )
+
+
 def _get_sliding_window_merging_size(config) -> Optional[int]:
     if hasattr(config, "sliding_window_merging_size") and getattr(
         config, "sliding_window_merging_size"
@@ -127,7 +290,14 @@ def _get_sliding_window_attention_size(config) -> Optional[int]:
 
 def _get_flashhsa_padded_vocab_size(config) -> int:
     base_vocab_size = int(getattr(config, "vocab_size"))
-    # FlashHSA: lmk_id == base_vocab_size, so embeddings must have >= base_vocab_size + 1 rows.
+    # R46 (Item #1): when `enable_external_lmk_embed=True` the LMK token
+    # embedding lives in a standalone Parameter (`model.lmk_embed`) — the main
+    # embed_tokens / lm_head only need exactly `vocab_size` rows. Mirrors
+    # trm's get_model_vocab_size in modeling_olmo_lhsa.py.
+    if bool(getattr(config, "enable_external_lmk_embed", False)):
+        return base_vocab_size
+    # Legacy: lmk_id == base_vocab_size, so embeddings must have >=
+    # base_vocab_size + 1 rows, padded to a multiple of 32.
     return int(next_of_y(base_vocab_size + 1, 32))
 
 
@@ -268,12 +438,14 @@ class FlashHSAInnerXAttention(nn.Module):
             prefix=add_prefix("o_proj", prefix),
         )
 
-        self.rotary_emb = get_rope(
+        self.rotary_emb = _make_rope_for_hsa(
+            config,
             self.head_dim,
             rotary_dim=self.head_dim,
             max_position=max_position_embeddings,
             base=rope_theta,
             rope_scaling=rope_scaling,
+            for_hsa_layer=False,
         )
         self.attn = RadixAttention(
             self.num_heads,
@@ -533,6 +705,8 @@ class FlashHSAInnerXHierarchicalSparseAttention(nn.Module):
         self.lmk_q_norm_dim = self.retrieval_dim // retrieval_head_num_total
         self.lmk_q_norm_dim_local = (self.retrieval_dim // attn_tp_size) // retrieval_head_num_local
 
+        # R45: lmk_q LoRA-style 2-layer projection (Item #3).
+        self.lmk_q_lora_dim = int(getattr(config, "lmk_q_lora_dim", -1))
         if self.enable_lmk_q_proj:
             if self.lmk_q_full_dim:
                 # New-arch lmk_q_proj: one head_dim per q-head, no GQA broadcast in forward.
@@ -541,15 +715,38 @@ class FlashHSAInnerXHierarchicalSparseAttention(nn.Module):
             else:
                 _lmk_q_out_dim_total = self.retrieval_dim
                 self.lmk_q_norm = RMSNorm(self.lmk_q_norm_dim, eps=rms_norm_eps, **norm_kwargs)
-            self.lmk_q_proj = ColumnParallelLinear(
-                self.hidden_size,
-                _lmk_q_out_dim_total,
-                bias=attention_bias,
-                quant_config=quant_config,
-                tp_rank=attn_tp_rank,
-                tp_size=attn_tp_size,
-                prefix=add_prefix("lmk_q_proj", prefix),
-            )
+            if self.lmk_q_lora_dim > 0 and self.lmk_q_full_dim:
+                # TRM lmk_q_proj is `Sequential(Linear(d, lora_dim), Linear(lora_dim, out))`.
+                # Forward also adds `+ hsa_q` residual (see _maybe_write_chunk_lmk_k path
+                # and forward()).  Param names `lmk_q_proj.0.weight` / `lmk_q_proj.1.weight`.
+                self.lmk_q_proj = nn.ModuleList([
+                    ReplicatedLinear(
+                        self.hidden_size,
+                        self.lmk_q_lora_dim,
+                        bias=attention_bias,
+                        quant_config=quant_config,
+                        prefix=add_prefix("lmk_q_proj.0", prefix),
+                    ),
+                    ColumnParallelLinear(
+                        self.lmk_q_lora_dim,
+                        _lmk_q_out_dim_total,
+                        bias=attention_bias,
+                        quant_config=quant_config,
+                        tp_rank=attn_tp_rank,
+                        tp_size=attn_tp_size,
+                        prefix=add_prefix("lmk_q_proj.1", prefix),
+                    ),
+                ])
+            else:
+                self.lmk_q_proj = ColumnParallelLinear(
+                    self.hidden_size,
+                    _lmk_q_out_dim_total,
+                    bias=attention_bias,
+                    quant_config=quant_config,
+                    tp_rank=attn_tp_rank,
+                    tp_size=attn_tp_size,
+                    prefix=add_prefix("lmk_q_proj", prefix),
+                )
         else:
             self.lmk_q_proj = None
 
@@ -579,12 +776,14 @@ class FlashHSAInnerXHierarchicalSparseAttention(nn.Module):
 
         # RoPE is applied ONLY to the SWA branch in the ultra reference.
         # When apply_hsa_rope=True (e.g. OLMo3), RoPE is also applied to the HSA branch.
-        self.rotary_emb = get_rope(
+        self.rotary_emb = _make_rope_for_hsa(
+            config,
             self.head_dim,
             rotary_dim=self.head_dim,
             max_position=max_position_embeddings,
             base=rope_theta,
             rope_scaling=rope_scaling,
+            for_hsa_layer=True,
         )
         self.apply_hsa_rope = bool(getattr(config, "apply_hsa_rope", False))
 
@@ -743,6 +942,9 @@ class FlashHSAInnerXHierarchicalSparseAttention(nn.Module):
         hsa_q = hsa_k = hsa_v = None
         q_full = k_full = v_full = None
         lmk_q_fused = None
+        # R45: raw HSA q (pre-norm, pre-RoPE) reserved for the lmk_q LoRA
+        # residual when lmk_q_lora_dim > 0.
+        hsa_q_raw_for_lmk = None
 
         if self._fused_qkv_w is not None:
             fused = torch.nn.functional.linear(
@@ -758,6 +960,12 @@ class FlashHSAInnerXHierarchicalSparseAttention(nn.Module):
             q_full, k_full, v_full = chunks[0], chunks[1], chunks[2]
             if self.enable_lmk_q_proj and self.lmk_q_proj is not None:
                 lmk_q_fused = chunks[3]
+            if self.lmk_q_lora_dim > 0:
+                hsa_q_raw_for_lmk = (
+                    q_full[..., self._fused_q_swa_dim:].contiguous()
+                    if self.has_swa_branch
+                    else q_full
+                )
             if not unified_path:
                 # Re-split q_full/k_full/v_full into swa/hsa halves so the
                 # rare branches (_layerwise_qk, !apply_hsa_rope) match the
@@ -788,6 +996,7 @@ class FlashHSAInnerXHierarchicalSparseAttention(nn.Module):
             hsa_q, _ = self.hsa_q_proj(hidden_states)
             hsa_k, _ = self.hsa_k_proj(hidden_states)
             hsa_v, _ = self.hsa_v_proj(hidden_states)
+            hsa_q_raw_for_lmk = hsa_q
 
             # --- SWA branch projections ---
             if self.has_swa_branch:
@@ -842,9 +1051,16 @@ class FlashHSAInnerXHierarchicalSparseAttention(nn.Module):
 
         # --- Selection query ---
         if self.enable_lmk_q_proj and self.lmk_q_proj is not None:
-            # Separate lmk_q_proj for page selection (NO RoPE).
+            # Separate lmk_q_proj for page selection. RoPE is applied below
+            # (R43) when apply_hsa_rope=True and nope_retrieval=False.
             if lmk_q_fused is not None:
                 lmk_q = lmk_q_fused  # already projected as part of fused GEMM
+            elif isinstance(self.lmk_q_proj, nn.ModuleList):
+                # R45 LoRA path: 2-layer projection + hsa_q residual.
+                lmk_q_mid, _ = self.lmk_q_proj[0](hidden_states)
+                lmk_q, _ = self.lmk_q_proj[1](lmk_q_mid)
+                if hsa_q_raw_for_lmk is not None:
+                    lmk_q = lmk_q + hsa_q_raw_for_lmk
             else:
                 lmk_q, _ = self.lmk_q_proj(hidden_states)  # [T, out_dim // tp_size]
             attn_tp_size = get_attention_tp_size()
@@ -920,6 +1136,20 @@ class FlashHSAInnerXHierarchicalSparseAttention(nn.Module):
             elif unified_path:
                 hsa_q = q_full
             sel_q = hsa_q.view(-1, self.hq_hsa, self.head_dim)
+
+        # R43: When apply_hsa_rope=True and enable_lmk_q_proj=True (and
+        # nope_retrieval is False), the official applies RoPE to the
+        # landmark/selection query before top-k page selection. Previously
+        # sglang skipped this, producing a different top-k chunk set.
+        if (
+            self.enable_lmk_q_proj
+            and self.apply_hsa_rope
+            and not bool(getattr(self.config, "nope_retrieval", False))
+            and sel_q.shape[-1] == self.head_dim
+        ):
+            sel_q, _ = self.rotary_emb(
+                positions, sel_q.contiguous(), torch.empty_like(sel_q)
+            )
 
         # Concatenate heads into the single KV cache layout: [SWA | HSA].
         if unified_path:
@@ -1109,17 +1339,25 @@ class FlashHSAInnerXHierarchicalSparseAttention(nn.Module):
         log_p_safe = torch.where(torch.isfinite(log_p), log_p, log_p.new_zeros(()))
         prior_b = -(p * log_p_safe).sum(dim=1)  # (N, h_q) fp32
 
-        # Allocate + write + register.
-        slots = lmk_k_pool.alloc(N)
-        if slots is None:
-            # Pool exhausted — skip silently.  Selector will fall back to the
-            # h_kv path for these chunks (their req_to_chunk row stays 0).
-            return
+        # R47 (Item #8): allocate slots once per logical (req, chunk) and reuse
+        # them across layers. Previously every layer called alloc() and assigned
+        # a fresh slot, overwriting earlier layers' (req, chunk)->slot mapping.
+        # Subsequent reads on layer-0 saw layer-N's slot, reading stale data.
+        chunk_ids_t = torch.tensor([c for c, _, _ in kept], dtype=torch.int32, device=lmk_k_pool.device)
+        req_idx_t = torch.full((N,), req_idx, dtype=torch.int32, device=lmk_k_pool.device)
+        existing_slots = req_to_chunk.gather_slots(
+            torch.tensor([req_idx], dtype=torch.int32, device=lmk_k_pool.device),
+            chunk_ids_t.unsqueeze(0),
+        )[0]
+        slots = existing_slots.clone()
+        missing = slots == 0
+        if bool(missing.any().item()):
+            new_slots = lmk_k_pool.alloc(int(missing.sum().item()))
+            if new_slots is None:
+                return  # pool exhausted — selector falls back to h_kv path
+            slots[missing] = new_slots
+            req_to_chunk.assign(req_idx_t[missing], chunk_ids_t[missing], new_slots)
         lmk_k_pool.set(self.layer_id, slots, lmk_k, prior_b=prior_b)
-
-        chunk_ids_t = torch.tensor([c for c, _, _ in kept], dtype=torch.int32, device=slots.device)
-        req_idx_t = torch.full((N,), req_idx, dtype=torch.int32, device=slots.device)
-        req_to_chunk.assign(req_idx_t, chunk_ids_t, slots)
 
 
 class FlashHSAInnerXDecoderLayer(nn.Module):
@@ -1297,6 +1535,24 @@ class FlashHSAInnerXModel(nn.Module):
             padding_size=32,
             prefix=add_prefix("embed_tokens", prefix),
         )
+
+        # R46 (Item #1): standalone landmark embedding when
+        # `enable_external_lmk_embed=True`. In that case `embed_tokens` /
+        # `lm_head` only have `vocab_size` rows and `lmk_id == vocab_size`
+        # would index out of range. Use `self.lmk_embed` as the LMK row.
+        self._enable_external_lmk_embed = bool(
+            getattr(config, "enable_external_lmk_embed", False)
+        )
+        self._lmk_id = (
+            int(getattr(config, "vocab_size"))
+            if self._enable_external_lmk_embed
+            else -1
+        )
+        if self._enable_external_lmk_embed:
+            self.lmk_embed = nn.Parameter(torch.zeros(config.hidden_size))
+        else:
+            self.lmk_embed = None
+
         result = make_layers(
             config.num_hidden_layers,
             lambda idx, prefix: FlashHSAInnerXDecoderLayer(
@@ -1324,7 +1580,19 @@ class FlashHSAInnerXModel(nn.Module):
         input_embeds: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         if input_embeds is None:
-            hidden_states = self.embed_tokens(input_ids)
+            if self.lmk_embed is not None:
+                # R46: replace LMK rows with self.lmk_embed; index-safe by
+                # masking lmk positions to 0 before embed_tokens.
+                lmk_mask = input_ids == self._lmk_id
+                safe_ids = input_ids.masked_fill(lmk_mask, 0)
+                hidden_states = self.embed_tokens(safe_ids)
+                hidden_states = torch.where(
+                    lmk_mask.unsqueeze(-1),
+                    self.lmk_embed.to(hidden_states.dtype),
+                    hidden_states,
+                )
+            else:
+                hidden_states = self.embed_tokens(input_ids)
         else:
             hidden_states = input_embeds
 

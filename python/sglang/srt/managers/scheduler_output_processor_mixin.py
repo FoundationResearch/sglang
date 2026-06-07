@@ -408,7 +408,9 @@ class SchedulerOutputProcessorMixin:
                     if not req.fill_ids:
                         req.fill_ids = req.origin_input_ids + req.output_ids
                     produced_visible, next_input_override, skip_checks = (
-                        req.hsa_decode_postprocess_sampled_token(next_token_id)
+                        req.hsa_decode_postprocess_sampled_token(
+                            next_token_id, int(batch.seq_lens[i].item())
+                        )
                     )
                     if produced_visible:
                         self.num_generated_tokens += 1
