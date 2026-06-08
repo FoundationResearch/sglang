@@ -1,0 +1,22 @@
+\begin{table}[t]
+\centering
+\small
+\setlength{\tabcolsep}{5pt}
+\caption{Inference latency of HiLS-Attention vs.\ full attention at the 345M scale on a single NVIDIA H200 (batch size 1, bf16, chunk size 64, top-$k=32$, 512-token sliding window). Prefill is the warm-run latency for the full input; decode is the median per-token latency over 32 steps with CUDA graphs. Speedup is full attention $/$ HiLS-Attention ($>1$ means HiLS-Attention is faster). HiLS-Attention reaches parity at $\sim$16K and is $25.7\times$/$15.0\times$ faster (prefill/decode) at 512K.}
+\label{tab:efficiency}
+\begin{tabular}{r rrr rrr}
+\toprule
+& \multicolumn{3}{c}{Prefill (ms)} & \multicolumn{3}{c}{Decode (ms / token)} \\
+\cmidrule(lr){2-4}\cmidrule(lr){5-7}
+Context & HiLS-Attn & Full & Speedup & HiLS-Attn & Full & Speedup \\
+\midrule
+8K   & 60    & 29     & 0.48$\times$ & 2.29 & 2.09  & 0.91$\times$ \\
+16K  & 91    & 86     & 0.94$\times$ & 2.34 & 2.84  & 1.21$\times$ \\
+32K  & 153   & 293    & 1.92$\times$ & 2.34 & 4.32  & 1.85$\times$ \\
+64K  & 288   & 1{,}058  & 3.67$\times$ & 2.41 & 7.30  & 3.03$\times$ \\
+128K & 574   & 4{,}187  & 7.30$\times$ & 2.46 & 13.39 & 5.44$\times$ \\
+256K & 1{,}186 & 16{,}515 & 13.9$\times$ & 2.74 & 25.24 & 9.21$\times$ \\
+512K & 2{,}576 & 66{,}165 & 25.7$\times$ & 3.28 & 49.07 & 15.0$\times$ \\
+\bottomrule
+\end{tabular}
+\end{table}
