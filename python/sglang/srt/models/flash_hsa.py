@@ -189,20 +189,37 @@ class _InRangeRotaryEmbedding(RotaryEmbedding):
 
 
 def _make_rope_for_hsa(config, head_size, rotary_dim, max_position, base, rope_scaling, *, for_hsa_layer: bool = False):
+    # HSA inserts an LMK token after every (page_size-1) real tokens, so the
+    # engine-visible position can exceed `max_position` by ~1/(page_size-1).
+    # Bump the cos/sin cache up front with a small safety margin. Production
+    # sglang Engine handles this via reserve_rope_cache_recursive at startup,
+    # but the alignment test entrypoints bypass that. Use the env knob if set.
+    import os as _os
+    _rope_cache_pos = int(_os.environ.get("SGLANG_HSA_ROPE_CACHE_MAX", 0))
+    _effective_max = max(int(max_position) + int(max_position) // 32 + 256, _rope_cache_pos)
+
+    def _ensure(emb):
+        try:
+            if hasattr(emb, "_ensure_cos_sin_cache_length"):
+                emb._ensure_cos_sin_cache_length(_effective_max - 1)
+        except Exception:
+            pass
+        return emb
+
     if config is None:
-        return get_rope(head_size, rotary_dim=rotary_dim, max_position=max_position, base=base, rope_scaling=rope_scaling)
+        return _ensure(get_rope(head_size, rotary_dim=rotary_dim, max_position=max_position, base=base, rope_scaling=rope_scaling))
     use_hope = bool(getattr(config, "use_hope", False))
     enable_inrange = bool(getattr(config, "enable_inrange_rope", False))
     if use_hope and enable_inrange and not for_hsa_layer:
-        return get_rope(head_size, rotary_dim=rotary_dim, max_position=max_position, base=base, rope_scaling=rope_scaling)
+        return _ensure(get_rope(head_size, rotary_dim=rotary_dim, max_position=max_position, base=base, rope_scaling=rope_scaling))
     if enable_inrange:
-        return _InRangeRotaryEmbedding(
+        return _ensure(_InRangeRotaryEmbedding(
             head_size=head_size, rotary_dim=rotary_dim,
             max_position_embeddings=max_position, base=base,
             is_neox_style=True, dtype=torch.get_default_dtype(),
             rope_context_length=int(getattr(config, "rope_context_length", max_position)),
             rope_period_multiplier=float(getattr(config, "rope_period_multiplier", 1.0)),
-        )
+        ))
     if use_hope:
         hope_partial_ratio = float(getattr(config, "hope_partial_ratio", 0.5))
         hope_context_length = getattr(config, "hope_context_length", None)
@@ -211,15 +228,15 @@ def _make_rope_for_hsa(config, head_size, rotary_dim, max_position, base, rope_s
         hope_theta = getattr(config, "hope_theta", None)
         if hope_theta is not None:
             hope_theta = float(hope_theta)
-        return _HoPERotaryEmbedding(
+        return _ensure(_HoPERotaryEmbedding(
             head_size=head_size, rotary_dim=rotary_dim,
             max_position_embeddings=max_position, base=int(base),
             is_neox_style=True, dtype=torch.get_default_dtype(),
             hope_partial_ratio=hope_partial_ratio,
             hope_context_length=hope_context_length,
             hope_theta=hope_theta,
-        )
-    return get_rope(head_size, rotary_dim=rotary_dim, max_position=max_position, base=base, rope_scaling=rope_scaling)
+        ))
+    return _ensure(get_rope(head_size, rotary_dim=rotary_dim, max_position=max_position, base=base, rope_scaling=rope_scaling))
 
 
 def _get_sliding_window_merging_size(config) -> Optional[int]:
