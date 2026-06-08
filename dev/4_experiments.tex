@@ -1,0 +1,130 @@
+\section{Experiments}
+We evaluate HiLS-Attention across different model scales. We first run small-scale ablations to study how key variables affect perplexity and extrapolation, then adopt the best setting for 1.4B training from scratch to track perplexity, extrapolation, and downstream performance over training tokens. Finally, we continue training an 8B model to validate scalability. Hyperparameters for different scales can be found in Appendix~\ref{appdx:hyper-params}. % 特别的，为了随时评估模型的in-context retrieval 能力，我们有5%的概率将一条样本改造成RULER NIAH任务，即在上下文中买入部分针，并在最后通过拼接prompt及正确answer.
+Specifically, to continuously evaluate models' in-context retrieval ability, we randomly convert a sample into a RULER-style needle in haystack (NIAH) task with a probability of 5\%, by inserting several needles into the context and appending the prompt together with the correct answer at the end.
+
+\subsection{Small scale experiments}\label{sec:small_scale_exp}
+\paragraph{Setup.} % 模型超参
+% Training recipe.
+
+For small-scale experiments, we train decoder-only Transformer models from scratch at the 345M scale, following the width and parameter scale of GPT-2 Medium~\citep{radford2019language}. All small-scale models are trained with the same recipe, whose details can be found in Appendix~\ref{apdx:training_recipe}. 
+For all models, we use an 8K training context length. For sparse-attention variants, we keep at most 2K tokens active, with a sliding window of length 512.
+% 我们在8K上下文训练的ckpt基础上进行continue pretrain，
+
+\paragraph{Baselines.} We compare HiLS-Attn with a diverse set of attention baselines, including full attention, sliding-window attention (SWA), and several sparse attention methods. 
+The full-attention baseline uses dense full attention in all layers, serving as the standard dense-attention reference. The HoPE full-attention baseline differs only in replacing the positional encoding with HoPE~\citep{chen-etal-2025-hope}. The Sliding-Window Attention baseline applies a window size of 512 consistently across all layers. For sparse attention baselines, including Native Sparse Attention~\citep{yuan-etal-2025-native}, DashAttention~\citep{huang2026dashattentiondifferentiableadaptivesparse}, InfLLM-V2~\citep{zhao2025infllmv2densesparseswitchableattention}, and HSA-UltraLong~\citep{hu2026everytoken}, we align hyperparameters that have the same semantic meaning as those in HiLS-Attn, such as the sliding-window size, chunk size, and top-\(k\), whenever possible, to ensure a fair comparison.
+
+\paragraph{Ablations.}
+We conduct ablation studies to evaluate the contribution of each design choice.
+\textbf{w/ LoRA $(r)$} uses the LoRA query projection in Eq.~\ref{eq:hils-attn-weights} with rank $r$.
+\textbf{w/ full-rank} replaces it with a full-rank projection:
+$\hat{\mathbf{q}}_i=\mathbf{W}^{\hat{Q}}\mathbf{h}_i$,
+where $\mathbf{W}^{\hat{Q}}\in\mathbb{R}^{\mathrm{d\_model}\times\mathrm{d\_model}}$.
+\textbf{w/o LoRA} removes the extra $\Delta\mathbf{q}$ term.
+\textbf{w/o Prop.~3.1} uses the landmark token key as $\mathbf{k}'_c$, following landmark attention~\cite{mohtashami2023random}.
+\textbf{w/ mean pooling} sets $\mathbf{k}'_c$ to the mean-pooled keys within each chunk, as in MoBA and NSA.
+\textbf{w/o lmk, shared $\mathbf{q}_c$} removes landmark tokens and replaces $\mathbf{q}'_c$ in Eq.~\ref{eq:prop_q_c} with a shared learnable query $\mathbf{q}_c$. 
+\textbf{HiLS-Attn-compressed} mitigates $\mathbf{k}'_c$ memory overhead in GQA. Since $\mathbf{k}'_c$ in Eq.~\ref{eq:prop_q_c} matches the query shape ($H \times d$, where $H = G \times h$), it consumes more memory than standard keys ($h \times d$). We thus apply a compression scheme to resolve this, with details explained in Appendix~\ref{apdx:compressed_k}.
+
+\paragraph{Evaluation metrics.}
+Small models are not capable enough for reliable evaluation on standard LLM benchmarks. We therefore mainly report PPL and accuracy on RULER~\cite{hsieh2024ruler} NIAH tasks. We use NIAH because, for small models, its accuracy directly reflects the retrieval ability of sparse attention.
+We evaluate three tasks: single needle in haystack (S-N), multi-key multi-query needle in haystack (MK-MQ), and variable tracking (VT). MK-MQ inserts six key-value pairs into the context and asks the model to retrieve the values of two specified keys in order. VT includes six assignments and up to two hops.
+
+\input{table/345M_ppl}
+\input{table/345M_ruler}
+
+\paragraph{Results.}
+From Tables~\ref{tb:345M_ppl} and \ref{tb:345M_ruler}, HiLS-attention achieves overall performance comparable to, even better than, full attention in terms of both PPL and RULER accuracy. Meanwhile, we make several observations. \textbf{On RULER tasks, most sparse-attention baselines fail to match full attention at in-domain lengths.} Only HiLS-attention and naive BSA achieve results comparable to full attention, which supports our claim that chunk importance should be estimated based on normalized attention weights rather than unnormalized attention logits.
+\textbf{Naive BSA significantly outperforms other block-wise sparse attention on NIAH tasks.}
+This strongly supports our argument that selecting chunk based on attention mass, rather than logits, is more accurate. Unnormalized logits have no real physical meaning, which essentially is heuristic.
+\textbf{HiLS-Attention improves over naive BSA in perplexity, RULER, and length extrapolation.}
+We attribute this to the compression-and-retrieval inductive bias of HiLS-Attention, which benefits in-context retrieval and length extrapolation. We hypothesize that while token-wise retrieval is inherently noisy, local compression in HiLS-Attention acts as a semantic filter where individual token noise cancels out, preserving core semantic features for more robust retrieval. This noise-reduction mechanism may also explain its superior performance on variable tracking (VT) tasks.
+
+
+
+\subsection{Medium scale experiments}
+We follow the same setting in \S~\ref{sec:small_scale_exp} but with different model parameters and training tokens. 
+We choose full-attention with RoPE as our primary baseline because, as shown in Table~\ref{tb:345M_ppl}, RoPE performs better within the 512-token range, making it a stronger baseline for benchmarks where the average length is mostly under 64. We evaluate PPL and NIAH tasks every 20K steps to track extrapolation stability and their performance discrepancy during training. Details about the model hyperparameters and training recipe can be found in Appendix~\ref{appdx:hyper-params}. Benchmark details are listed in Appendix~\ref{apdx:benchmarks}
+
+
+\paragraph{Results.}
+Table~\ref{tb:1B_ppl_steps} shows that the results consistent with our small-scale findings, with both models exhibiting nearly identical PPL at 8K. Table~\ref{tb:1B_ruler_steps} confirms that extrapolation remains stable without decaying over training. Furthermore, Table~\ref{tb:1B_downstream} reveals that despite native sparse training—where HiLS-attention attends to less than half the tokens of full-attention—it still achieves comparable or better performance, thanks to its accurate retrieval.
+
+% \input{table/1B_ruler}
+\input{table/1B_perstep}
+\input{table/1B_downstream}
+
+
+\subsection{Large scale continue training}
+% 留意到大部分benchmark的prompt长度都不超过1000，Table~\ref{tb:1B_downstream}甚至平均长度不足64，因此无法有效评估HiLS-attention稀疏的部分，因此我们需要基于更大的参数，在longbench等长程实际任务进行评估.
+Since prompt lengths in most benchmarks rarely exceed 1,000 tokens—with Table~\ref{tb:1B_downstream} averaging under 64 tokens—they fail to effectively evaluate the sparse part of HiLS-Attention. Therefore, we scale up the model size and evaluate on practical long-context tasks like LongBench~\cite{bai2024longbench} to validate its efficacy in real-world, long-range scenarios.
+\paragraph{Setup} % Base模型超参
+For large-scale continue pretraining, we start from the OLMo3-1025-7B base checkpoint~\citep{allenai_olmo3_1025_7b_checkpoint}. The base model has 32 Transformer layers, hidden size 4096, FFN intermediate size 11008, and standard MHA with 32 attention heads. OLMo3~\citep{olmo2025olmo} is pretrained at 8K sequence length with a repeating pattern of three 4K sliding-window attention layers followed by one full-attention layer.
+
+
+We convert this attention layout by replacing the original full-attention layers with HiLS-Attn layers and reducing the sliding-window attention window from 4K to 512 tokens. This keeps the original 3:1 layer pattern while forcing long-range dependency modeling to rely on the HiLS retrieval branch rather than a large local window.
+
+
+Following the small- and medium-scale settings, we set the chunk size to 64 and the HiLS top-$k$ to 32, which retrieves $32 \times 64 = 2048$ tokens under the 8K continue-pretraining length. Detailed training recipe can be found in Appendix~\ref{apdx:training_recipe}.
+
+
+% For continue pretraining, we use the OLMo3 pretraining corpus distribution. Specifically, we train from the tokenized OLMo3 500B-token~\citep{allenai_dolma3_mix_6t} pretraining pool and sample approximately 50B tokens for adaptation by drawing 8K sequences from this pool. We set the maximum sequence length to 8192, the global batch size to 512, and train for 13K optimizer steps. The learning rate warms up for 1K steps to $2\times10^{-4}$ and then follows a cosine decay to $2\times10^{-5}$.
+% The original OLMo3-Base checkpoint is not instruction-tuned and therefore lacks the instruction-following ability needed to answer RULER-style retrieval queries at test time.
+% To make long-context retrieval comparisons meaningful after CPT, we mix on-the-fly synthesized RULER examples into the training stream at a 5\% rate: with this probability, each sampled 8K pretraining sequence is converted into one of the three evaluation tasks---single needle-in-a-haystack, multi-query, and variable tracking---while the remaining 95\% of samples stay as plain corpus text.
+% All continued-pretraining models in Table~\ref{tab:olmo3_indomain}, including Olmo3-512swa-CPT and the HiLS-Attn variants, follow this recipe; the \textbf{Olmo3-Base} row reports the original checkpoint without RULER-augmented CPT.
+
+
+We compare HiLS-Attn variants against two baselines in Table~\ref{tab:olmo3_indomain}.
+\textbf{LDM token tuning} follows the training-free recipe in Section~\ref{sec:continue-training}: all base parameters are frozen, and only the inserted landmark-token embeddings and the $\mathbf{W}^{\mathrm{up}}, \mathbf{W}^{\mathrm{down}}$ projections in Equation~\ref{eq:lora_q} are updated.
+We train on 5B tokens and use the same learning-rate schedule as above.
+\textbf{Olmo3-512swa-CPT} is a full-parameter continued-pretraining baseline that keeps the original full-attention layers but reduces the sliding-window size in every SWA layer from 4K to 512 tokens, matching the local window used by our HiLS-Attn models.
+This baseline isolates the effect of shrinking the local attention window without introducing HiLS retrieval; it uses the same 50B-token continued-pretraining recipe and optimizer schedule as the HiLS models.
+\paragraph{Results.} % 8B模型结果基本和小规模及中等规模一致，在General task
+
+\input{table/7B_downstream}
+
+\input{table/7B_ppl}
+
+% \paragraph{Long-context tasks}
+% Long-bench v1
+% RULER
+\input{table/7B_longbench}
+
+\subsection{Analysis}
+\paragraph{Complexity}
+\paragraph{Efficiency}
+%训练吞吐，prefill/decode效率
+
+% \input{table/Efficiency}
+
+
+\paragraph{Chunk overlapping}
+We further validate the empirical assumption behind the HiLS-Attention kernel design: adjacent autoregressive query tokens tend to retrieve highly overlapping chunks. This property is crucial for MHA models, where we cannot rely on GQA-style head grouping, as in NSA, to expose a sufficiently large matrix dimension for Tensor Cores. Instead, HiLS-Attention groups $M$ adjacent query tokens and computes attention over the union of their retrieved chunk ids.
+
+For a block of $M$ adjacent queries, let $\mathcal{I}_m$ denote the top-$K$ retrieved chunks of the $m$-th query. We measure the normalized overlap ratio as
+\begin{equation}
+    \mathrm{Overlap}
+    =
+    \frac{M K - \left|\bigcup_{m=1}^{M}\mathcal{I}_m\right|}
+    {(M-1)K},
+\end{equation}
+where 1 indicates perfect overlap and 0 indicates no overlap. We evaluate the OLMo3-7B continued-pretraining checkpoint on pretraining sequences, using chunk size 64 and top-$k=32$. We use $M=16$ for the tail-block loading analysis at context lengths from 4K to 64K, and sweep $M\in\{1,2,4,8,16,32,64\}$ for the overlap analysis.
+
+\begin{figure}[t]
+    \centering
+    \includegraphics[width=0.95\linewidth]{data/chunk_overlap-new.pdf}
+    \caption{Chunk-id overlap among adjacent query tokens. Left: for the final $M=16$ query tokens at each context length, the average number of chunks actually loaded by the union of adjacent queries, compared with the total visible historical chunks. Percentages denote the loaded fraction. Right: normalized chunk overlap as $M$ increases, with the dashed line showing inter-block chunk reuse at $M=16$. Error bars indicate the standard deviation across HiLS layers and heads; shaded regions indicate the min--max range across HiLS layers.}
+    \label{fig:chunk_overlap}
+\end{figure}
+
+As shown in Figure~\ref{fig:chunk_overlap}, adjacent query tokens share most of their retrieved chunks. For the final $M=16$ query tokens, the visible historical chunk pool grows from 57 chunks at 4K context to 1032 chunks at 64K context. In contrast, the union of actually loaded chunks only grows from 43.6 to 102.1 chunks, reducing the loaded fraction from 76.4\% at 4K to 9.9\% at 64K. Although computing attention over the union introduces some invalid token--chunk pairs, the retrieved union remains far smaller than the historical chunk pool and enables efficient Tensor Core utilization by batching adjacent MHA queries. Moreover, consecutive query blocks also exhibit strong locality: on average, 92.8\% of the chunks in one block have already appeared in the previous block, suggesting that the kernel can further benefit from cache reuse. These results support our design choice of packing adjacent MHA queries and attending to the union of their selected chunks.
+% \paragraph{Diff between $Z_{i,c}$ and $\hat{Z}_{i,c}$}
+
+% \input{table/Diff_of_Z_c}
+
+
+
+
+
+
+
+
