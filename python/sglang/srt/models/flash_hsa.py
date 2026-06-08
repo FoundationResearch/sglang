@@ -1128,17 +1128,23 @@ class FlashHSAInnerXHierarchicalSparseAttention(nn.Module):
             swa_exclude_lmk=False,
         )
         # Per-q-head lmk_k path: compute and stash chunk-aggregated lmk_k
-        # whenever this prefill completes new chunks.  Pure side-effect; the
-        # selector at decode reads from the LandmarkLmkKPool.
-        if self._per_qhead_lmk_k_active and forward_batch.forward_mode.is_extend():
+        # whenever this prefill/decode completes new chunks.  Pure side-effect;
+        # the selector at decode reads from the LandmarkLmkKPool.
+        if self._per_qhead_lmk_k_active and (
+            forward_batch.forward_mode.is_extend()
+            or forward_batch.forward_mode.is_decode()
+        ):
             # In unified_path we never materialised hsa_k; slice it on demand
-            # (only when actually needed, i.e. during prefill with active LMK).
+            # (only when actually needed for active LMK cache writes).
             if unified_path and hsa_k is None:
                 if self.has_swa_branch:
                     hsa_k = k_full[..., self._fused_k_swa_dim:].contiguous()
                 else:
                     hsa_k = k_full
-            self._maybe_write_chunk_lmk_k(forward_batch, sel_q, hsa_k)
+            if forward_batch.forward_mode.is_extend():
+                self._maybe_write_chunk_lmk_k(forward_batch, sel_q, hsa_k)
+            else:
+                self._maybe_write_decode_chunk_lmk_k(forward_batch, sel_q, hsa_k)
         attn_output = self.attn(
             q_full,
             k_full,
@@ -1287,6 +1293,132 @@ class FlashHSAInnerXHierarchicalSparseAttention(nn.Module):
                 return
             slots[missing] = new_slots
             req_to_chunk.assign(req_idx_t[missing], chunk_ids_t[missing], new_slots)
+        lmk_k_pool.set(self.layer_id, slots, lmk_k, prior_b=prior_b)
+
+    def _maybe_write_decode_chunk_lmk_k(
+        self, forward_batch, sel_q, hsa_k_current=None
+    ) -> None:
+        """R51: decode-time chunk_attn_pool write.
+
+        Fires when the current decode input is the internal LMK token, meaning
+        we just completed a chunk during decode. Computes per-q-head lmk_k and
+        prior_b for the completed chunk and writes them to ``lmk_k_pool``, so
+        once this chunk leaves the SWA window (~hsa_sliding_window decodes
+        later) the selector reads correct values instead of stale prefill-time
+        data (or zeros).
+        """
+        if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
+            return  # CG capture can't include Python-side scalar sync
+        backend = getattr(forward_batch, "attn_backend", None)
+        pool = getattr(forward_batch, "token_to_kv_pool", None)
+        if backend is None or pool is None:
+            return
+        lmk_k_pool = getattr(backend, "lmk_k_pool", None)
+        req_to_chunk = getattr(backend, "req_to_chunk_pool", None)
+        md = getattr(backend, "forward_metadata", None)
+        if lmk_k_pool is None or req_to_chunk is None or md is None:
+            return
+        if get_attention_tp_size() > 1 or int(forward_batch.batch_size) != 1:
+            return  # decode-time write supports BS=1 / TP=1 only for now
+        if sel_q is None or sel_q.shape[0] != 1:
+            return
+
+        chunk_size = int(self.chunk_size)
+        seq_len = int(forward_batch.seq_lens[0].item())
+        input_ids = getattr(forward_batch, "input_ids", None)
+        lmk_id = int(getattr(self.config, "vocab_size", -1))
+        is_lmk_step = (
+            input_ids is not None
+            and lmk_id >= 0
+            and int(input_ids[-1].item()) == lmk_id
+        )
+        if not is_lmk_step:
+            return
+
+        # seq_len includes the just-arrived LMK token; the completed chunk is
+        # at positions [chunk_idx*chunk_size, (chunk_idx+1)*chunk_size). When
+        # the LMK is the current input, the LMK occupies the last slot of the
+        # chunk so completed_seq_len is the chunk boundary.
+        completed_seq_len = seq_len
+        if completed_seq_len % chunk_size != 0:
+            if (completed_seq_len + 1) % chunk_size == 0:
+                completed_seq_len += 1
+            else:
+                return
+
+        h_q = int(self.hq_hsa)
+        h_kv = int(self.hk_hsa)
+        head_dim = int(self.head_dim)
+        if h_q % h_kv != 0:
+            return
+        G = h_q // h_kv
+        chunk_idx = completed_seq_len // chunk_size - 1
+        req_idx = int(forward_batch.req_pool_indices[0].item())
+
+        page_table_1 = getattr(md, "page_table_1", None)
+        if page_table_1 is None:
+            return
+        end_pos = (chunk_idx + 1) * chunk_size
+        # If the LMK token is the current input it isn't in the KV cache yet,
+        # so the K we need is part hsa_k_current + part historic (page_table).
+        needed_table_len = end_pos - 1 if hsa_k_current is not None else end_pos
+        if needed_table_len > page_table_1.shape[1]:
+            return
+        if hsa_k_current is not None:
+            token_pos = torch.arange(
+                chunk_idx * chunk_size,
+                end_pos - 1,
+                device=sel_q.device,
+                dtype=torch.int64,
+            )
+        else:
+            token_pos = torch.arange(
+                chunk_idx * chunk_size,
+                end_pos,
+                device=sel_q.device,
+                dtype=torch.int64,
+            )
+        token_locs = page_table_1[0, token_pos].to(torch.int64)
+        k_cache = pool.get_key_buffer(self.layer_id)
+        k_chunk = k_cache[
+            token_locs, self.hk_swa : self.hk_swa + self.hk_hsa, :
+        ]
+        if hsa_k_current is not None:
+            cur_k = hsa_k_current.view(-1, h_kv, head_dim)[-1:].to(k_chunk.dtype)
+            k_chunk = torch.cat([k_chunk, cur_k], dim=0)
+        if k_chunk.shape[0] != chunk_size:
+            return
+
+        import math as _math
+
+        mu_f32 = sel_q[0].float()
+        k_f32 = k_chunk.float()
+        k_q = k_f32.repeat_interleave(G, dim=1) if G != 1 else k_f32
+        logits = torch.einsum("hd,shd->sh", mu_f32, k_q) * (1.0 / _math.sqrt(head_dim))
+        logits[-1, :] = float("-inf")
+        p = torch.softmax(logits, dim=0)
+        lmk_k = torch.einsum("sh,shd->hd", p, k_q).to(lmk_k_pool.dtype).unsqueeze(0)
+        log_p = torch.log_softmax(logits, dim=0)
+        log_p_safe = torch.where(torch.isfinite(log_p), log_p, log_p.new_zeros(()))
+        prior_b = (-(p * log_p_safe).sum(dim=0)).unsqueeze(0)
+
+        chunk_ids_t = torch.tensor(
+            [[chunk_idx]], dtype=torch.int32, device=lmk_k_pool.device
+        )
+        req_idx_1 = torch.tensor(
+            [req_idx], dtype=torch.int32, device=lmk_k_pool.device
+        )
+        slots = req_to_chunk.gather_slots(req_idx_1, chunk_ids_t)[0]
+        if int(slots[0].item()) == 0:
+            new_slots = lmk_k_pool.alloc(1)
+            if new_slots is None:
+                return
+            slots = new_slots
+            req_to_chunk.assign(
+                req_idx_1,
+                torch.tensor([chunk_idx], dtype=torch.int32, device=lmk_k_pool.device),
+                slots,
+            )
         lmk_k_pool.set(self.layer_id, slots, lmk_k, prior_b=prior_b)
 
 
