@@ -21,6 +21,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -162,9 +163,24 @@ def sglang_prefill_and_decode(sg_model, cfg, real_base, decode_tokens, device, d
     # the HSA branch (hq_hsa > hk_hsa) AND the layer was built with
     # _per_qhead_lmk_k_active=True.  Inactive otherwise (1-layer canonical
     # has hq_hsa == hk_hsa so this is a no-op).
+    #
+    # R53: SGLANG_HSA_DISABLE_EXTERNAL_POOL_INIT=1 skips this external init.
+    # Combined with SGLANG_HSA_DISABLE_AUTO_POOL_INIT=1 (which gates R52's
+    # in-backend auto-init), the two knobs let dev/test_engine_alignment.py
+    # reproduce three states: (a) pre-R52 production (both env=1, no init at
+    # all → silently disabled chunk_attn_pool path → misaligned), (b) R52
+    # production (only external=1, auto kicks in → aligned), (c) test
+    # scaffold (both=0, external init overrides → aligned).
+    _skip_external_init = os.environ.get(
+        "SGLANG_HSA_DISABLE_EXTERNAL_POOL_INIT", "0"
+    ) == "1"
     _hq_hsa = int(getattr(cfg, "num_attention_heads"))
     _hk_hsa = int(getattr(cfg, "num_key_value_heads"))
-    if _hq_hsa > _hk_hsa:
+    if (
+        not _skip_external_init
+        and _hq_hsa > _hk_hsa
+        and be.lmk_k_pool is None
+    ):
         from sglang.srt.mem_cache.landmark_pool import LandmarkLmkKPool, ReqToChunkPool
         _max_chunks = (mc + PS - 1) // PS
         be.lmk_k_pool = LandmarkLmkKPool(

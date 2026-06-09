@@ -150,8 +150,17 @@ class HSAAttnBackend(AttentionBackend):
         if _hsa_cfg is None:
             _mc = getattr(model_runner, "model_config", None)
             _hsa_cfg = getattr(_mc, "hf_text_config", _mc)
-        if _hsa_cfg is not None and bool(getattr(_hsa_cfg, "enable_prior_query", False)) and bool(
-            getattr(_hsa_cfg, "enable_lmk_q_proj", False)
+        # Env knob — used by dev/test_engine_alignment.py to reproduce the
+        # pre-R52 silent disable state on demand. Set to "1" to skip auto-init
+        # and force pools to stay None (matches pre-R52 production behaviour).
+        _disable_auto_init = os.environ.get(
+            "SGLANG_HSA_DISABLE_AUTO_POOL_INIT", "0"
+        ) == "1"
+        if (
+            not _disable_auto_init
+            and _hsa_cfg is not None
+            and bool(getattr(_hsa_cfg, "enable_prior_query", False))
+            and bool(getattr(_hsa_cfg, "enable_lmk_q_proj", False))
         ):
             cfg = _hsa_cfg
             try:
@@ -160,21 +169,30 @@ class HSAAttnBackend(AttentionBackend):
                 head_dim = int(
                     getattr(cfg, "head_dim", getattr(cfg, "hidden_size") // h_q)
                 )
-                max_total_tokens = int(
-                    getattr(model_runner, "max_total_num_tokens", 0) or 0
-                )
-                if max_total_tokens <= 0:
-                    server_args = getattr(model_runner, "server_args", None)
-                    max_total_tokens = int(
-                        getattr(server_args, "max_total_tokens", None) or 131072
+                # Pool sizing — pick the largest reasonable context the
+                # backend might see. Prefer model_config.context_len (set by
+                # the test scaffold) over max_total_num_tokens, since the
+                # latter ignores LMK insertion overhead (~+3%). Add 2x
+                # safety margin to cover stress runs with re-allocations.
+                _mc = getattr(model_runner, "model_config", None)
+                _ctx_len = int(getattr(_mc, "context_len", 0) or 0)
+                _mtt = int(getattr(model_runner, "max_total_num_tokens", 0) or 0)
+                if _mtt <= 0:
+                    _server_args = getattr(model_runner, "server_args", None)
+                    _mtt = int(
+                        getattr(_server_args, "max_total_tokens", None) or 0
                     )
+                max_total_tokens = max(_ctx_len, _mtt, 131072)
+                # Allow LMK insertion (~+3%) + headroom.
                 max_chunks_per_req = max(
-                    max_total_tokens // int(self.page_size) + 4, 4
+                    int(max_total_tokens * 33 // 32 // int(self.page_size)) + 16, 16
                 )
                 req_pool = getattr(model_runner, "req_to_token_pool", None)
                 req_pool_size = int(getattr(req_pool, "size", 1) or 1)
+                # Each req can occupy up to max_chunks_per_req slots; over-allocate
+                # 2x to accommodate re-allocations during stress testing.
                 num_chunk_slots = max(
-                    max_total_tokens // int(self.page_size) + req_pool_size + 4, 4
+                    max_chunks_per_req * max(req_pool_size, 1) * 2 + 16, 16
                 )
                 self.lmk_k_pool = LandmarkLmkKPool(
                     num_chunk_slots=num_chunk_slots,
