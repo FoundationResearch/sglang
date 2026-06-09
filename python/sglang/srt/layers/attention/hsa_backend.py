@@ -281,6 +281,33 @@ class HSAAttnBackend(AttentionBackend):
             return True
         return int(layer_id) in self._hsa_layer_ids
 
+    # R64: shared scalar cache for prefill hot paths (selection + internal SWA +
+    # chunk_attn_pool write all want the same (req_idx, prefix_len, extend_len)
+    # tuple). Compute once at layer 0, reuse across all 16 layers — drops ~80
+    # .item() CUDA syncs per prefill.
+    def _get_prefill_scalars(self, forward_batch):
+        scalars = getattr(forward_batch, "_hsa_prefill_scalars", None)
+        if scalars is not None:
+            return scalars
+        req_idx = int(forward_batch.req_pool_indices[0].item())
+        ep_cpu = getattr(forward_batch, "extend_prefix_lens_cpu", None)
+        es_cpu = getattr(forward_batch, "extend_seq_lens_cpu", None)
+        if ep_cpu is not None and len(ep_cpu) > 0:
+            prefix_len = int(ep_cpu[0])
+        elif forward_batch.extend_prefix_lens is not None:
+            prefix_len = int(forward_batch.extend_prefix_lens[0].item())
+        else:
+            prefix_len = 0
+        if es_cpu is not None and len(es_cpu) > 0:
+            extend_len = int(es_cpu[0])
+        elif forward_batch.extend_seq_lens is not None:
+            extend_len = int(forward_batch.extend_seq_lens[0].item())
+        else:
+            extend_len = 0
+        scalars = (req_idx, prefix_len, extend_len)
+        forward_batch._hsa_prefill_scalars = scalars
+        return scalars
+
     # (removed) _get_effective_window_size: InnerX ultra passes window via kwargs
 
     def _run_selection_decode(
@@ -1346,8 +1373,8 @@ class HSAAttnBackend(AttentionBackend):
         page_size = int(self.page_size)
         sm_scale = float(getattr(layer, "scaling", 1.0))
 
-        prefix_len = int(extend_prefix_lens[0].item())
-        extend_len = int(extend_seq_lens[0].item())
+        # R64: shared per-prefill scalar cache (was 2 .item() per layer here).
+        _req_idx_cached, prefix_len, extend_len = self._get_prefill_scalars(forward_batch)
         total_kv = prefix_len + extend_len  # full sequence length in cache
 
         if total_kv == 0 or extend_len == 0:
@@ -1573,8 +1600,9 @@ class HSAAttnBackend(AttentionBackend):
             HQ_sel = int(q_sel_3.shape[1])
 
         # --- 计算 prefix_len 和总序列长度 ---
-        prefix_len = int(extend_prefix_lens[0].item())
-        total_seq_len = prefix_len + int(extend_seq_lens[0].item())  # prefix + extend
+        # R64: shared per-prefill scalar cache (was 2 .item() + 1 req_idx .item() per layer).
+        _req_idx_cached, prefix_len, _extend_len_cached = self._get_prefill_scalars(forward_batch)
+        total_seq_len = prefix_len + _extend_len_cached  # prefix + extend
         S = total_seq_len // page_size  # 总 LMK chunk 数
 
         if S == 0:
@@ -1603,7 +1631,7 @@ class HSAAttnBackend(AttentionBackend):
         self._per_qhead_G_ext = None
         self._per_qhead_lmk_keys_full = None  # cache for the per-token-aware pytorch path
         if per_qhead_ext_active:
-            req_idx = int(forward_batch.req_pool_indices[0].item())
+            req_idx = _req_idx_cached  # R64: reuse layer-0 cached req_idx (was .item() per layer)
             chunk_ids = torch.arange(S, device=device, dtype=torch.int32).unsqueeze(0)  # [1, S]
             req_idx_t = torch.tensor([req_idx], dtype=torch.int32, device=device)
             slots = self.req_to_chunk_pool.gather_slots(req_idx_t, chunk_ids)[0]  # [S]
