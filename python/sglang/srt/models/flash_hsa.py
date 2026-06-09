@@ -1271,13 +1271,28 @@ class FlashHSAInnerXHierarchicalSparseAttention(nn.Module):
             return
         G = h_q // h_kv
 
-        req_idx = int(forward_batch.req_pool_indices[0].item())
-        prefix_len = int(
-            forward_batch.extend_prefix_lens[0].item()
-            if forward_batch.extend_prefix_lens is not None
-            else 0
-        )
-        extend_len = int(forward_batch.extend_seq_lens[0].item())
+        # R63: cache (req_idx, prefix_len, extend_len) once per forward to
+        # avoid 3 .item() CUDA syncs × 16 layers = 48 syncs per prefill.
+        # CPU mirrors are populated by ForwardBatch.init_new for extend, so
+        # only req_idx (no _cpu mirror) needs a one-time .item() at layer 0.
+        scalars = getattr(forward_batch, "_hsa_prefill_scalars", None)
+        if scalars is None:
+            req_idx = int(forward_batch.req_pool_indices[0].item())
+            ep_cpu = getattr(forward_batch, "extend_prefix_lens_cpu", None)
+            es_cpu = getattr(forward_batch, "extend_seq_lens_cpu", None)
+            if ep_cpu is not None and len(ep_cpu) > 0:
+                prefix_len = int(ep_cpu[0])
+            elif forward_batch.extend_prefix_lens is not None:
+                prefix_len = int(forward_batch.extend_prefix_lens[0].item())
+            else:
+                prefix_len = 0
+            if es_cpu is not None and len(es_cpu) > 0:
+                extend_len = int(es_cpu[0])
+            else:
+                extend_len = int(forward_batch.extend_seq_lens[0].item())
+            scalars = (req_idx, prefix_len, extend_len)
+            forward_batch._hsa_prefill_scalars = scalars
+        req_idx, prefix_len, extend_len = scalars
 
         already_done = prefix_len // chunk_size
         total_done_after = (prefix_len + extend_len) // chunk_size
