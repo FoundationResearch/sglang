@@ -29,6 +29,7 @@ _compute_internal_swa_extend_batched).
 
 from __future__ import annotations
 
+import os
 from typing import Optional
 
 import torch
@@ -215,7 +216,12 @@ def hsa_swa_extend_fwd(
     hsa_window: int,
     page_size: int,
     sm_scale: float,
-    block_m: int = 16,
+    # R67: default block_m=8 num_warps=2 — Blackwell sweep showed 1.27x faster
+    # than the previous BM=16 NW=4 default (632us -> 500us at T=16K, h_q=16,
+    # h_kv=2, head_dim=64, hsa_window=512). The kernel is memory-bound here:
+    # M_G = BLOCK_M * G = 8 * 8 = 64 hits TC's 64x64 tile and the smaller warp
+    # count reduces sync overhead. Override via env vars below.
+    block_m: int = 8,
     block_n: int = 64,
 ):
     """Returns (out, lse) where:
@@ -262,7 +268,9 @@ def hsa_swa_extend_fwd(
         PAGE_SIZE=int(page_size),
         BLOCK_M=int(block_m),
         BLOCK_N=int(block_n),
-        num_warps=4,
-        num_stages=1,
+        # R67: drop num_warps 4 -> 2 (kernel is memory-bound at the tuned
+        # BLOCK_M=8 size, extra warps just add sync overhead).
+        num_warps=int(os.environ.get("HSA_SWA_NW", 2)),
+        num_stages=int(os.environ.get("HSA_SWA_NS", 1)),
     )
     return out, lse
