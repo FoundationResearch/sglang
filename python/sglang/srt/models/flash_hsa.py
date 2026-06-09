@@ -1328,21 +1328,28 @@ class FlashHSAInnerXHierarchicalSparseAttention(nn.Module):
         N = last_kept - first_kept
 
         device = sel_q.device
+        # R69: gather indices are CONTIGUOUS in the common case — first_kept
+        # through last_kept-1 form a contiguous chunk range, and within each
+        # chunk we read positions [c*chunk_size, (c+1)*chunk_size). Replace
+        # the two index_select kernel launches (each a real copy: ~4MB at L=16K
+        # x 16 layers = 64MB memory traffic) with a view + strided slice.
+        # kept_chunk_ids is still computed for slot/req_to_chunk bookkeeping below.
         kept_chunk_ids = torch.arange(
             first_kept, last_kept, dtype=torch.int64, device=device
         )  # [N]
-        # End-of-chunk position within the extend window: (c+1)*chunk_size - 1 - prefix_len
-        end_idx = (kept_chunk_ids + 1) * chunk_size - 1 - prefix_len  # [N]
-        # Start-of-chunk position: c*chunk_size - prefix_len
-        start_idx = kept_chunk_ids * chunk_size - prefix_len  # [N]
-        # mu_q gather: sel_q[end_idx] -> [N, h_q, D]
-        mu_q_batch = sel_q.index_select(0, end_idx)  # [N, h_q, D]
-        # k_chunk gather: k_local[start_idx + arange(chunk_size)] -> [N, chunk_size, h_kv, D]
-        offsets = torch.arange(chunk_size, dtype=torch.int64, device=device)  # [S]
-        gather_idx = start_idx.unsqueeze(1) + offsets.unsqueeze(0)  # [N, S]
-        k_chunk_batch = k_local.index_select(0, gather_idx.reshape(-1)).view(
+        # k_local[k_start : k_start + N*chunk_size] is exactly the concatenation
+        # of the kept chunks' KV. View it as (N, chunk_size, h_kv, head_dim) —
+        # zero-copy when the underlying tensor is contiguous in dim 0 (always
+        # true for k_local = hsa_k.view(extend_len, h_kv, head_dim)).
+        k_start = first_kept * chunk_size - prefix_len  # >= 0 by construction above
+        k_chunk_batch = k_local[k_start : k_start + N * chunk_size].view(
             N, chunk_size, h_kv, head_dim
         )
+        # mu_q at chunk_end_token = (c+1)*chunk_size - 1 - prefix_len, i.e. evenly
+        # spaced. Strided slice gives a non-contiguous view; the downstream
+        # einsum in _chunk_attn_pool handles strided inputs fine.
+        e_start = (first_kept + 1) * chunk_size - 1 - prefix_len
+        mu_q_batch = sel_q[e_start : e_start + (N - 1) * chunk_size + 1 : chunk_size]  # [N, h_q, D]
 
         # Pure-pytorch chunk_attn_pool — fp32 internal, cast back at the end.
         # Computes both ``lmk_k`` (softmax-weighted V-substitute K used as the
@@ -1366,12 +1373,16 @@ class FlashHSAInnerXHierarchicalSparseAttention(nn.Module):
         # the slot tensor on forward_batch — layer 0 allocates, layers 1-15
         # read the cached slot tensor directly (no gather_slots + .item()
         # syncs per layer).
-        chunk_ids_t = kept_chunk_ids.to(torch.int32)  # [N]
+        # R68b: defer the int32 cast and req_idx tensor build to the slot
+        # allocation branch — layers 1-15 take cached_slots and don't need
+        # them. Saves 15 kernel launches per prefill (small ops but ~10us
+        # each = ~0.15ms Python wallclock).
         slot_cache_key = "_hsa_prefill_chunk_slots"
         cached_slots = getattr(forward_batch, slot_cache_key, None)
         if cached_slots is not None and cached_slots.shape[0] == N:
             slots = cached_slots
         else:
+            chunk_ids_t = kept_chunk_ids.to(torch.int32)  # [N]
             req_idx_t = torch.full(
                 (N,), req_idx, dtype=torch.int32, device=lmk_k_pool.device
             )
