@@ -1354,21 +1354,23 @@ class HSAAttnBackend(AttentionBackend):
         Returns
         -------
         swa_o : [T, HQ_hsa, D] float32
-        lse_kv : [T, H_hsa] float32  (GQA-aggregated logsumexp)
+        lse_hq : [T, HQ_hsa] float32  (per-q-head logsumexp; caller does
+                 GQA aggregation only if it needs lse_kv [T, H_hsa]).
         """
         T, _, D = q_hsa.shape
         device = q_hsa.device
 
         swa_o = torch.zeros((T, HQ_hsa, D), device=device, dtype=torch.float32)
-        lse_kv = torch.full((T, H_hsa), float("-inf"), device=device, dtype=torch.float32)
+        # R77: placeholder per-q-head LSE for empty/no-window early returns.
+        lse_hq_empty = torch.full((T, HQ_hsa), float("-inf"), device=device, dtype=torch.float32)
 
         if hsa_window <= 0:
-            return swa_o, lse_kv
+            return swa_o, lse_hq_empty
 
         md = self.forward_metadata
         pool = getattr(forward_batch, "token_to_kv_pool", None)
         if md is None or pool is None or md.token_positions is None or md.token_to_seq_id is None:
-            return swa_o, lse_kv
+            return swa_o, lse_hq_empty
 
         # --- batch=1 only ---
         extend_seq_lens = md.extend_seq_lens
@@ -1390,11 +1392,13 @@ class HSAAttnBackend(AttentionBackend):
         total_kv = prefix_len + extend_len  # full sequence length in cache
 
         if total_kv == 0 or extend_len == 0:
-            return swa_o, lse_kv
+            return swa_o, lse_hq_empty
 
         # --- Build single-sequence kv_indices over [0, total_kv) ---
         # Each linear position i in kv_indices maps to cache slot for engine pos i.
-        kv_indices = page_table_1[0, :total_kv].to(torch.int64).contiguous()
+        # R78: keep page_table_1's int32 — the kernel internally casts each
+        # loaded slot to int64 (saves a per-layer dtype copy + halves bw).
+        kv_indices = page_table_1[0, :total_kv].contiguous()
 
         # HSA heads slice of KV cache.
         pool_k = pool.get_key_buffer(layer.layer_id)[:, H_swa:H_swa + H_hsa, :]
@@ -1420,10 +1424,6 @@ class HSAAttnBackend(AttentionBackend):
         # 64MB of memory bandwidth per layer for nothing. Skipping saves
         # ~1GB of memory traffic per 16K prefill (16 layers).
 
-        # --- Aggregate per-q-head LSE to per-kv-head ---
-        lse_per_group = lse_raw.view(T, H_hsa, Gh)
-        lse_kv = torch.logsumexp(lse_per_group, dim=-1)
-
         # R71: stash per-q-head LSE for the per-q-head fusion path. Keep in
         # fp32 — both downstream consumers (the maxpool topk kernel and the
         # cat-with-scores at forward_extend step 5) want fp32, so casting to
@@ -1431,7 +1431,13 @@ class HSAAttnBackend(AttentionBackend):
         # with .to(fp32) internally. Skipping saves 16 launches per prefill.
         self._last_swa_lse_hq_extend = lse_raw
 
-        return swa_o, lse_kv
+        # R77: skip the per-layer torch.logsumexp(lse_raw, dim=Gh) — only the
+        # legacy h_kv chunk_weight branch in forward_extend uses lse_kv, and
+        # the per_qhead branch (active whenever the selector is per-q-head)
+        # uses lse_raw directly. Returning lse_raw lets the caller compute
+        # lse_kv on demand. Removed call had ~480us CPU dispatch overhead
+        # per layer (max + sub + exp + sum + log decomposition).
+        return swa_o, lse_raw
 
     def _compute_internal_swa_extend_reference(
         self,
@@ -1456,21 +1462,21 @@ class HSAAttnBackend(AttentionBackend):
         Returns
         -------
         swa_o : [T, HQ_hsa, D] float32
-        lse_kv : [T, H_hsa] float32
+        lse_hq : [T, HQ_hsa] float32  (R77: per-q-head; caller aggregates if needed)
         """
         T, _, D = q_hsa.shape
         device = q_hsa.device
 
         swa_o = torch.zeros((T, HQ_hsa, D), device=device, dtype=torch.float32)
-        lse_kv = torch.full((T, H_hsa), float("-inf"), device=device, dtype=torch.float32)
+        lse_hq_empty = torch.full((T, HQ_hsa), float("-inf"), device=device, dtype=torch.float32)
 
         if hsa_window <= 0:
-            return swa_o, lse_kv
+            return swa_o, lse_hq_empty
 
         md = self.forward_metadata
         pool = getattr(forward_batch, "token_to_kv_pool", None)
         if md is None or pool is None or md.token_positions is None or md.token_to_seq_id is None:
-            return swa_o, lse_kv
+            return swa_o, lse_hq_empty
 
         k_cache_all = pool.get_key_buffer(layer.layer_id)
         v_cache_all = pool.get_value_buffer(layer.layer_id)
@@ -1483,7 +1489,7 @@ class HSAAttnBackend(AttentionBackend):
 
         engine_indices = md.engine_indices
         if engine_indices is None:
-            return swa_o, lse_kv
+            return swa_o, lse_hq_empty
 
         # Per-q-head LSE (h_q-shape) for the per-q-head fusion path.
         lse_hq = torch.full((T, HQ_hsa), float("-inf"), device=device, dtype=torch.float32)
@@ -1519,14 +1525,15 @@ class HSAAttnBackend(AttentionBackend):
                 hq_start = kv_h * Gh
                 swa_o[t, hq_start : hq_start + Gh, :] = o
 
-            # Aggregate logsumexp across GQA groups → per-kv-head.
-            lse_kv[t] = torch.logsumexp(lse_per_q, dim=-1)
             # Per-q-head LSE for the per-q-head fusion path (matches the
             # batched variant's stash so the fusion code finds it).
             lse_hq[t] = lse_per_q.reshape(HQ_hsa)
 
-        self._last_swa_lse_hq_extend = lse_hq.to(q_hsa.dtype)
-        return swa_o, lse_kv
+        # R77: return per-q-head LSE (matches _batched API); caller lazily
+        # aggregates to per-kv-head if it needs lse_kv.
+        lse_hq_f32 = lse_hq.contiguous()
+        self._last_swa_lse_hq_extend = lse_hq_f32
+        return swa_o, lse_hq_f32
 
     def _run_selection_extend(
         self,
@@ -2210,7 +2217,9 @@ class HSAAttnBackend(AttentionBackend):
         page_table_1 = md.page_table_1
 
         # Step 3: Internal SWA on HSA heads.
-        swa_o_inner, lse_kv = self._compute_internal_swa_extend(
+        # R77: second return is now `lse_raw` [T, HQ_hsa] (per-q-head) — the
+        # legacy h_kv branch computes lse_kv on demand below.
+        swa_o_inner, lse_raw = self._compute_internal_swa_extend(
             q_hsa=q_hsa,
             layer=layer,
             forward_batch=forward_batch,
@@ -2268,35 +2277,36 @@ class HSAAttnBackend(AttentionBackend):
         )
 
         if per_qhead_fusion and hsa_window > 0:
-            # R74: skip the materialized valid_hq bool reshape (was a 4-D
-            # expand + .reshape -> always forces a copy because the strides
-            # from expand don't fit the new packed shape). Instead view scores
-            # as 4-D (free), masked_fill against the 4-D strided valid view,
-            # then view back. Saves one (T*HQ_hsa*TOPK) bool tensor per layer.
-            scores_4d = per_qhead_scores.view(T, H_hsa, Gh, TOPK)
-            valid_4d = valid.unsqueeze(2).expand(T, H_hsa, Gh, TOPK)  # strided view
-            scores_hq = scores_4d.masked_fill(~valid_4d, float("-inf")).view(T, HQ_hsa, TOPK)
-            if not self.enable_softmax1:
-                cat_scores = torch.cat(
-                    [scores_hq, per_qhead_lse.unsqueeze(-1)], dim=-1
-                )  # [T, HQ_hsa, K+1]
-                swa_weight_idx = -1
-            else:
-                cat_scores = torch.cat(
-                    [
-                        scores_hq,
-                        per_qhead_lse.unsqueeze(-1),
-                        torch.zeros(T, HQ_hsa, 1, device=scores_hq.device, dtype=scores_hq.dtype),
-                    ],
-                    dim=-1,
-                )  # [T, HQ_hsa, K+2]
-                swa_weight_idx = -2
-            merged_w = torch.softmax(cat_scores, dim=-1)
-            merged_w = torch.nan_to_num(merged_w, nan=0.0)
-            w_q = merged_w[:, :, :TOPK].to(q_hsa.dtype).contiguous()  # already h_q
-            swa_w_q = merged_w[:, :, swa_weight_idx]  # [T, HQ_hsa]
+            # R76: reuse the existing fused_chunk_weight_per_qhead_decode kernel
+            # for extend too. Kernel handles valid-mask + cat(lse, [0]) +
+            # softmax + nan_to_num + bf16 cast + swa_w_q split in one launch.
+            # Replaces the per-layer chain:
+            #   scores_4d.view -> valid_4d.expand -> masked_fill -> view -> cat(2/3)
+            #   -> softmax -> nan_to_num -> slice+to(bf16)+contiguous -> slice
+            # (~10 ops -> 1 kernel per layer; saves ~150 launches per 16K prefill).
+            sel_pages_i32 = (
+                selected_page_ids
+                if selected_page_ids.dtype == torch.int32 and selected_page_ids.is_contiguous()
+                else selected_page_ids.to(torch.int32).contiguous()
+            )
+            scores_contig = (
+                per_qhead_scores
+                if per_qhead_scores.is_contiguous()
+                else per_qhead_scores.contiguous()
+            )
+            w_q, swa_w_q = fused_chunk_weight_per_qhead_decode(
+                per_qhead_scores=scores_contig,
+                per_qhead_lse=per_qhead_lse,
+                selected_page_ids=sel_pages_i32,
+                Gh=Gh,
+                enable_softmax1=bool(self.enable_softmax1),
+                out_dtype=q_hsa.dtype,
+            )
             swa_w_kv = None
         elif hsa_window > 0:
+            # R77: compute lse_kv on demand here (per_qhead branch above
+            # doesn't need it). lse_raw is [T, HQ_hsa] per-q-head fp32.
+            lse_kv = torch.logsumexp(lse_raw.view(T, H_hsa, Gh), dim=-1)
             scores = selected_scores.masked_fill(~valid, float("-inf"))
             if not self.enable_softmax1:
                 cat_scores = torch.cat(

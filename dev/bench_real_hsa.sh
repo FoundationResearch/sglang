@@ -27,6 +27,7 @@ run_one() {
         --input-len "$input_len" --output-len "$DECODE_LEN" \
         --context-length "$ctx" \
         --attention-backend "$backend" \
+        --page-size 64 \
         --disable-cuda-graph \
         --mem-fraction-static 0.50 \
         --trust-remote-code 2>&1 \

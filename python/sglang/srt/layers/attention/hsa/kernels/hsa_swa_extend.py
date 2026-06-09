@@ -239,10 +239,14 @@ def hsa_swa_extend_fwd(
     lse = torch.full((T, HQ), float("-inf"), device=q_hsa.device, dtype=torch.float32)
 
     q_ = q_hsa if q_hsa.is_contiguous() else q_hsa.contiguous()
-    k_ = k_cache_hsa.contiguous()
-    v_ = v_cache_hsa.contiguous()
-    idx_ = kv_indices.to(torch.int64) if kv_indices.dtype != torch.int64 else kv_indices
-    idx_ = idx_.contiguous()
+    k_ = k_cache_hsa if k_cache_hsa.is_contiguous() else k_cache_hsa.contiguous()
+    v_ = v_cache_hsa if v_cache_hsa.is_contiguous() else v_cache_hsa.contiguous()
+    # R78: kernel casts loaded slot to int64 inline (line ~160), so int32
+    # indices work too. Halves the kv_indices memory bandwidth at no fidelity
+    # cost. Avoids a per-layer .to(int64) dispatch + copy.
+    if kv_indices.dtype not in (torch.int32, torch.int64):
+        kv_indices = kv_indices.to(torch.int32)
+    idx_ = kv_indices if kv_indices.is_contiguous() else kv_indices.contiguous()
 
     grid = (triton.cdiv(T, block_m), H)
     hsa_swa_extend_kernel[grid](
