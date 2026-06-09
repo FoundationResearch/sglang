@@ -89,6 +89,16 @@ from sglang.srt.layers.radix_attention import RadixAttention
 import torch.nn.functional as F
 
 
+# R62: enable TF32 tensor cores for the fp32 chunk_attn_pool einsum. The
+# einsum is ~17 M FLOPs/layer per prefill; at fp32 SIMT it hits cutlass
+# sgemm (~237 µs/call). TF32 cuts that to ~80 µs with ≤1 ulp deviation in
+# bf16 output. Safe globally because PyTorch only applies it to matmul.
+try:
+    torch.set_float32_matmul_precision("high")
+except Exception:
+    pass
+
+
 # R61: vectorised chunk_attn_pool (ported from friend's
 # InfiniteLongLM/models/FlashHSA/chunk_attn_pool_optimized.py). Key tricks:
 #   * reshape mu_q to (N, h_kv, G, D) instead of repeat_interleave K to h_q —

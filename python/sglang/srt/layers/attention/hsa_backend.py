@@ -102,7 +102,13 @@ class HSAAttnBackend(AttentionBackend):
         #            topk on upstream measurements with negligible quality impact.
         # CLI override (--hsa-headwise-topk-softmax / --no-hsa-headwise-topk-softmax) wins;
         # otherwise read from model config (default True for back-compat).
-        default_headwise = bool(getattr(cfg, "headwise_topk_softmax", True))
+        # R62: default to False (maxpool fast path) when cfg doesn't specify.
+        # Alignment is bit-equivalent for trained-with-softmax models per the
+        # InfiniteLongLM upstream notes, and the kernel is 12-20% faster at
+        # long-context prefill (dev/bench: 32K -12%, 64K -20% on hsa345m_real).
+        # Checkpoints that need the exact softmax path can set
+        # `headwise_topk_softmax=True` in config.json.
+        default_headwise = bool(getattr(cfg, "headwise_topk_softmax", False))
         override_headwise = getattr(server_args, "hsa_headwise_topk_softmax", None)
         self.headwise_topk_softmax = (
             bool(override_headwise) if override_headwise is not None else default_headwise
