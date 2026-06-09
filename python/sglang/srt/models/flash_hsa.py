@@ -1234,25 +1234,47 @@ class FlashHSAInnerXHierarchicalSparseAttention(nn.Module):
         # Reshape K to per-head view.
         k_local = hsa_k.view(extend_len, h_kv, head_dim)
 
-        # Vectorise across all newly-complete chunks.  Each chunk's start/end
-        # is required to lie fully inside this extend window.
-        new_chunk_ids = list(range(already_done, total_done_after))
-        starts = [c * chunk_size - prefix_len for c in new_chunk_ids]
-        ends = [(c + 1) * chunk_size - 1 - prefix_len for c in new_chunk_ids]
-        kept = [
-            (c, s, e)
-            for (c, s, e) in zip(new_chunk_ids, starts, ends)
-            if 0 <= s and e < extend_len
-        ]
-        if not kept:
+        # R60: vectorise across all newly-complete chunks. Replaces the
+        # previous Python list-comprehension + torch.stack pattern (which
+        # was N CPU-side tensor allocs per layer × 16 layers = thousands of
+        # dispatcher calls per prefill at 16K+) with vectorised index_select.
+        first_chunk = already_done
+        last_chunk = total_done_after  # exclusive
+        # Each chunk c occupies [c*chunk_size, (c+1)*chunk_size) in global
+        # positions; within this extend that's [c*chunk_size - prefix_len,
+        # (c+1)*chunk_size - prefix_len). Keep only chunks whose full window
+        # falls inside [0, extend_len). For a contiguous extend that's a
+        # simple range filter — compute the bounds on CPU.
+        first_kept = first_chunk
+        # start = first_kept*chunk_size - prefix_len >= 0
+        if first_kept * chunk_size - prefix_len < 0:
+            first_kept = (prefix_len + chunk_size - 1) // chunk_size
+        last_kept = last_chunk  # exclusive
+        # end = (last_kept-1+1)*chunk_size - 1 - prefix_len < extend_len
+        # i.e. last_kept*chunk_size - prefix_len <= extend_len
+        max_last = (prefix_len + extend_len) // chunk_size
+        if last_kept > max_last:
+            last_kept = max_last
+        if last_kept <= first_kept:
             return
-        N = len(kept)
+        N = last_kept - first_kept
 
-        # Build (N, head_dim_axes) batches.
-        mu_q_batch = torch.stack([sel_q[e] for (_, _, e) in kept], dim=0)  # (N, h_q, D)
-        k_chunk_batch = torch.stack(
-            [k_local[s : s + chunk_size] for (_, s, _) in kept], dim=0
-        )  # (N, S, h_kv, D)
+        device = sel_q.device
+        kept_chunk_ids = torch.arange(
+            first_kept, last_kept, dtype=torch.int64, device=device
+        )  # [N]
+        # End-of-chunk position within the extend window: (c+1)*chunk_size - 1 - prefix_len
+        end_idx = (kept_chunk_ids + 1) * chunk_size - 1 - prefix_len  # [N]
+        # Start-of-chunk position: c*chunk_size - prefix_len
+        start_idx = kept_chunk_ids * chunk_size - prefix_len  # [N]
+        # mu_q gather: sel_q[end_idx] -> [N, h_q, D]
+        mu_q_batch = sel_q.index_select(0, end_idx)  # [N, h_q, D]
+        # k_chunk gather: k_local[start_idx + arange(chunk_size)] -> [N, chunk_size, h_kv, D]
+        offsets = torch.arange(chunk_size, dtype=torch.int64, device=device)  # [S]
+        gather_idx = start_idx.unsqueeze(1) + offsets.unsqueeze(0)  # [N, S]
+        k_chunk_batch = k_local.index_select(0, gather_idx.reshape(-1)).view(
+            N, chunk_size, h_kv, head_dim
+        )
 
         # Pure-pytorch chunk_attn_pool — fp32 internal, cast back at the end.
         # Computes both ``lmk_k`` (softmax-weighted V-substitute K used as the
@@ -1277,22 +1299,34 @@ class FlashHSAInnerXHierarchicalSparseAttention(nn.Module):
         log_p_safe = torch.where(torch.isfinite(log_p), log_p, log_p.new_zeros(()))
         prior_b = -(p * log_p_safe).sum(dim=1)  # (N, h_q) fp32
 
-        # R47 (Item #8): reuse slot across layers per (req, chunk) to keep
-        # the (req, chunk) -> slot mapping stable across layer writes.
-        chunk_ids_t = torch.tensor([c for c, _, _ in kept], dtype=torch.int32, device=lmk_k_pool.device)
-        req_idx_t = torch.full((N,), req_idx, dtype=torch.int32, device=lmk_k_pool.device)
-        existing_slots = req_to_chunk.gather_slots(
-            torch.tensor([req_idx], dtype=torch.int32, device=lmk_k_pool.device),
-            chunk_ids_t.unsqueeze(0),
-        )[0]
-        slots = existing_slots.clone()
-        missing = slots == 0
-        if bool(missing.any().item()):
-            new_slots = lmk_k_pool.alloc(int(missing.sum().item()))
-            if new_slots is None:
-                return
-            slots[missing] = new_slots
-            req_to_chunk.assign(req_idx_t[missing], chunk_ids_t[missing], new_slots)
+        # R47+R60: reuse slot across layers per (req, chunk). R60 also caches
+        # the slot tensor on forward_batch — layer 0 allocates, layers 1-15
+        # read the cached slot tensor directly (no gather_slots + .item()
+        # syncs per layer).
+        chunk_ids_t = kept_chunk_ids.to(torch.int32)  # [N]
+        slot_cache_key = "_hsa_prefill_chunk_slots"
+        cached_slots = getattr(forward_batch, slot_cache_key, None)
+        if cached_slots is not None and cached_slots.shape[0] == N:
+            slots = cached_slots
+        else:
+            req_idx_t = torch.full(
+                (N,), req_idx, dtype=torch.int32, device=lmk_k_pool.device
+            )
+            existing_slots = req_to_chunk.gather_slots(
+                torch.tensor([req_idx], dtype=torch.int32, device=lmk_k_pool.device),
+                chunk_ids_t.unsqueeze(0),
+            )[0]
+            slots = existing_slots.clone()
+            missing = slots == 0
+            # Use device-side any() — still requires a sync but only ONCE for
+            # the whole prefill (layer 0 only).
+            if bool(missing.any().item()):
+                new_slots = lmk_k_pool.alloc(int(missing.sum().item()))
+                if new_slots is None:
+                    return
+                slots[missing] = new_slots
+                req_to_chunk.assign(req_idx_t[missing], chunk_ids_t[missing], new_slots)
+            setattr(forward_batch, slot_cache_key, slots)
         lmk_k_pool.set(self.layer_id, slots, lmk_k, prior_b=prior_b)
 
         # R59: pre-allocate slots for future decode chunks so the decode-time
