@@ -1295,26 +1295,56 @@ class FlashHSAInnerXHierarchicalSparseAttention(nn.Module):
             req_to_chunk.assign(req_idx_t[missing], chunk_ids_t[missing], new_slots)
         lmk_k_pool.set(self.layer_id, slots, lmk_k, prior_b=prior_b)
 
+        # R59: pre-allocate slots for future decode chunks so the decode-time
+        # write path can be CUDA-graph-safe (no host-side alloc/sync). Only
+        # done by the first HSA layer of the prefill. Cap at
+        # req_to_chunk_pool.max_chunks - total_done_after to avoid OOB.
+        decode_prealloc_cfg = int(
+            getattr(self.config, "_hsa_decode_chunk_prealloc", 512)
+        )
+        max_chunks_room = int(req_to_chunk.max_chunks) - int(total_done_after)
+        decode_prealloc = max(0, min(decode_prealloc_cfg, max_chunks_room))
+        if decode_prealloc > 0 and self.layer_id == 0:
+            future_chunk_start = total_done_after
+            future_chunk_end = future_chunk_start + decode_prealloc
+            future_ids = torch.arange(
+                future_chunk_start, future_chunk_end,
+                dtype=torch.int32, device=lmk_k_pool.device,
+            )
+            existing_future = req_to_chunk.gather_slots(
+                torch.tensor([req_idx], dtype=torch.int32, device=lmk_k_pool.device),
+                future_ids.unsqueeze(0),
+            )[0]
+            missing_future = existing_future == 0
+            n_future = int(missing_future.sum().item())
+            if n_future > 0:
+                new_future_slots = lmk_k_pool.alloc(n_future)
+                if new_future_slots is not None:
+                    req_to_chunk.assign(
+                        torch.full((n_future,), req_idx, dtype=torch.int32,
+                                   device=lmk_k_pool.device),
+                        future_ids[missing_future],
+                        new_future_slots,
+                    )
+
     def _maybe_write_decode_chunk_lmk_k(
         self, forward_batch, sel_q, hsa_k_current=None
     ) -> None:
-        """R51: decode-time chunk_attn_pool write.
+        """R51+R59: decode-time chunk_attn_pool write.
 
-        Fires when the current decode input is the internal LMK token, meaning
-        we just completed a chunk during decode. Computes per-q-head lmk_k and
-        prior_b for the completed chunk and writes them to ``lmk_k_pool``, so
-        once this chunk leaves the SWA window (~hsa_sliding_window decodes
-        later) the selector reads correct values instead of stale prefill-time
-        data (or zeros).
+        Two paths:
+          * Non-CG (fast eager): cache `is_lmk_step` per forward via R55,
+            early-return on the 63/64 non-boundary steps. Cheap.
+          * CG capture (R59): no host-side syncs allowed; run the compute
+            unconditionally every step and mask the store via device-side
+            `torch.where(is_boundary_d, ...)`. Slots are pre-allocated at
+            prefill end so no alloc is needed mid-decode.
 
-        R55: hoist `is_lmk_step` + `seq_len` checks to forward_batch-level
-        cache. Called per-layer per-step; 63/64 steps return early because the
-        current token isn't the LMK token. Pre-R55 each layer paid 2 CUDA
-        syncs to discover that → 2 × 16 × 63/64 ≈ 31 wasted syncs per chunk.
-        Cache the answer on forward_batch the first time we look it up.
+        Both paths converge on the same result (the pool entry for the
+        completed chunk's lmk_k+prior_b) but the CG path adds ~12 device
+        ops per non-boundary step — wasted work for eager, but enables the
+        whole forward to be captured into a single graph and replayed.
         """
-        if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
-            return  # CG capture can't include Python-side scalar sync
         backend = getattr(forward_batch, "attn_backend", None)
         pool = getattr(forward_batch, "token_to_kv_pool", None)
         if backend is None or pool is None:
@@ -1330,108 +1360,143 @@ class FlashHSAInnerXHierarchicalSparseAttention(nn.Module):
             return
 
         chunk_size = int(self.chunk_size)
-        # R55: try cache first — set by the first HSA layer in this forward.
-        cache = getattr(forward_batch, "_hsa_lmk_step_cache", None)
-        if cache is None:
-            lmk_id = int(getattr(self.config, "vocab_size", -1))
-            input_ids = getattr(forward_batch, "input_ids", None)
-            if input_ids is None or lmk_id < 0:
-                forward_batch._hsa_lmk_step_cache = (False, 0)
-                return
-            # Single sync for the whole forward (was 16x pre-R55).
-            seq_len = int(forward_batch.seq_lens[0].item())
-            is_lmk = int(input_ids[-1].item()) == lmk_id
-            cache = (is_lmk, seq_len)
-            forward_batch._hsa_lmk_step_cache = cache
-        is_lmk_step, seq_len = cache
-        if not is_lmk_step:
-            return
-
-        # seq_len includes the just-arrived LMK token; the completed chunk is
-        # at positions [chunk_idx*chunk_size, (chunk_idx+1)*chunk_size). When
-        # the LMK is the current input, the LMK occupies the last slot of the
-        # chunk so completed_seq_len is the chunk boundary.
-        completed_seq_len = seq_len
-        if completed_seq_len % chunk_size != 0:
-            if (completed_seq_len + 1) % chunk_size == 0:
-                completed_seq_len += 1
-            else:
-                return
-
         h_q = int(self.hq_hsa)
         h_kv = int(self.hk_hsa)
         head_dim = int(self.head_dim)
         if h_q % h_kv != 0:
             return
         G = h_q // h_kv
-        chunk_idx = completed_seq_len // chunk_size - 1
-        req_idx = int(forward_batch.req_pool_indices[0].item())
 
         page_table_1 = getattr(md, "page_table_1", None)
         if page_table_1 is None:
             return
-        end_pos = (chunk_idx + 1) * chunk_size
-        # If the LMK token is the current input it isn't in the KV cache yet,
-        # so the K we need is part hsa_k_current + part historic (page_table).
-        needed_table_len = end_pos - 1 if hsa_k_current is not None else end_pos
-        if needed_table_len > page_table_1.shape[1]:
+
+        # Fast eager path: R55 cache + early-return on non-boundary steps.
+        # Skipped during CG capture (Python-side sync is illegal there) —
+        # we fall through to the device-side R59 path below.
+        is_capturing = (
+            torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()
+        )
+        if not is_capturing:
+            cache = getattr(forward_batch, "_hsa_lmk_step_cache", None)
+            if cache is None:
+                lmk_id_py = int(getattr(self.config, "vocab_size", -1))
+                input_ids = getattr(forward_batch, "input_ids", None)
+                if input_ids is None or lmk_id_py < 0:
+                    forward_batch._hsa_lmk_step_cache = (False, 0)
+                    return
+                # Single sync for the whole forward (was 16x pre-R55).
+                seq_len = int(forward_batch.seq_lens[0].item())
+                is_lmk = int(input_ids[-1].item()) == lmk_id_py
+                cache = (is_lmk, seq_len)
+                forward_batch._hsa_lmk_step_cache = cache
+            is_lmk_step, _seq_len_cpu = cache
+            if not is_lmk_step:
+                return
+            # Fall through and run the device-side compute below — same
+            # algorithm whether we hit the eager early-return or not. The
+            # store mask `write_mask_d` is True at the boundary, False
+            # otherwise; for the eager path we've already filtered, so the
+            # mask is purely a safety net.
+        # ALL device-side from here on — no .item(), no Python int from CUDA.
+
+        # seq_len_d [1] int64: current sequence length after appending this
+        # step's input. cache_seqlens_int32 is the same buffer the attention
+        # kernels consume so it's always populated (and live under CG).
+        cache_seqlens = md.cache_seqlens_int32  # [B] int32, B==1
+        seq_len_d = cache_seqlens[:1].to(torch.int64)
+        # Chunk boundary check: seq_len is on a chunk boundary when
+        # seq_len % chunk_size == 0 (the LMK token at position chunk_end
+        # got committed and seq_len advanced past it).
+        is_boundary_d = (seq_len_d % chunk_size == 0)  # [1] bool
+        # chunk_idx for the just-completed chunk.  Always non-negative because
+        # is_boundary masks the store; on non-boundary steps the value can be
+        # an in-progress chunk index — that's fine, we won't write.
+        completed_chunk_idx_d = (seq_len_d // chunk_size - 1).clamp(min=0)  # [1] int64
+
+        # Bounds guard: if a long decode runs past the pre-allocated slot
+        # range (decode_prealloc chunks), we silently skip. Use cpu-side
+        # check via req_to_chunk_pool max_chunks to keep this host-only at
+        # capture time.
+        if int(completed_chunk_idx_d.max().item() if not (torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()) else 0) >= req_to_chunk.max_chunks:
+            # Only run the bounds check outside CG capture (inside capture
+            # the seq_len bounds were chosen by the cuda-graph-max-bs flag).
             return
+
+        # Gather pre-allocated slot for this req+chunk. Returns 0 if slot
+        # wasn't pre-allocated (e.g., decode ran beyond prealloc window) —
+        # in that case writing to slot 0 is masked by is_boundary anyway,
+        # AND we further mask slot==0 below to avoid polluting the padding
+        # row.
+        chunk_ids_d = completed_chunk_idx_d.to(torch.int32).view(1, 1)  # [1, 1] int32
+        req_idx_d = forward_batch.req_pool_indices[:1].to(torch.int32)  # [1] int32
+        slots_d = req_to_chunk.gather_slots(req_idx_d, chunk_ids_d)[0]  # [1] int32
+        # slot==0 means "no allocation"; mask those out too.
+        valid_slot_d = (slots_d > 0)  # [1] bool
+        write_mask_d = is_boundary_d & valid_slot_d  # [1] bool
+
+        # Also check input_ids[-1] == lmk_id for an extra correctness gate.
+        # input_ids is always available during decode; use last position.
+        lmk_id = int(getattr(self.config, "vocab_size", -1))
+        input_ids = getattr(forward_batch, "input_ids", None)
+        if input_ids is not None and lmk_id >= 0:
+            is_lmk_id_d = (input_ids[-1:] == lmk_id).view(1)  # [1] bool
+            write_mask_d = write_mask_d & is_lmk_id_d
+
+        # Build position indices for the just-completed chunk on device.
+        # token_pos[i] = completed_chunk_idx * chunk_size + i, for i in [0, chunk_size-1]
+        # If hsa_k_current is provided, the LAST position's K is "current K"
+        # (not yet in cache), so we read chunk_size-1 from page_table_1 +
+        # take the current K for the final slot.
+        chunk_offset_d = completed_chunk_idx_d * chunk_size  # [1] int64
         if hsa_k_current is not None:
-            token_pos = torch.arange(
-                chunk_idx * chunk_size,
-                end_pos - 1,
-                device=sel_q.device,
-                dtype=torch.int64,
-            )
+            n_from_cache = chunk_size - 1
         else:
-            token_pos = torch.arange(
-                chunk_idx * chunk_size,
-                end_pos,
-                device=sel_q.device,
-                dtype=torch.int64,
-            )
-        token_locs = page_table_1[0, token_pos].to(torch.int64)
+            n_from_cache = chunk_size
+        local_range = torch.arange(
+            n_from_cache, device=sel_q.device, dtype=torch.int64
+        )
+        token_pos_d = chunk_offset_d + local_range  # [n_from_cache]
+        # Clip to valid page_table range (avoid OOB on capture-time large bounds)
+        token_pos_clipped_d = token_pos_d.clamp(max=page_table_1.shape[1] - 1)
+        token_locs_d = page_table_1[0, token_pos_clipped_d].to(torch.int64)
         k_cache = pool.get_key_buffer(self.layer_id)
         k_chunk = k_cache[
-            token_locs, self.hk_swa : self.hk_swa + self.hk_hsa, :
+            token_locs_d, self.hk_swa : self.hk_swa + self.hk_hsa, :
         ]
         if hsa_k_current is not None:
             cur_k = hsa_k_current.view(-1, h_kv, head_dim)[-1:].to(k_chunk.dtype)
             k_chunk = torch.cat([k_chunk, cur_k], dim=0)
-        if k_chunk.shape[0] != chunk_size:
-            return
+        # k_chunk shape MUST be [chunk_size, h_kv, head_dim] — guaranteed by
+        # construction now (always read chunk_size positions).
 
         import math as _math
-
         mu_f32 = sel_q[0].float()
         k_f32 = k_chunk.float()
         k_q = k_f32.repeat_interleave(G, dim=1) if G != 1 else k_f32
         logits = torch.einsum("hd,shd->sh", mu_f32, k_q) * (1.0 / _math.sqrt(head_dim))
-        logits[-1, :] = float("-inf")
+        # Mask the LMK position (last) to -inf — it shouldn't contribute to
+        # the chunk_attn_pool over chunk content (matches official semantics).
+        # In-place on the last row.
+        logits = logits.clone()
+        logits[-1] = float("-inf")
         p = torch.softmax(logits, dim=0)
         lmk_k = torch.einsum("sh,shd->hd", p, k_q).to(lmk_k_pool.dtype).unsqueeze(0)
         log_p = torch.log_softmax(logits, dim=0)
         log_p_safe = torch.where(torch.isfinite(log_p), log_p, log_p.new_zeros(()))
         prior_b = (-(p * log_p_safe).sum(dim=0)).unsqueeze(0)
 
-        chunk_ids_t = torch.tensor(
-            [[chunk_idx]], dtype=torch.int32, device=lmk_k_pool.device
-        )
-        req_idx_1 = torch.tensor(
-            [req_idx], dtype=torch.int32, device=lmk_k_pool.device
-        )
-        slots = req_to_chunk.gather_slots(req_idx_1, chunk_ids_t)[0]
-        if int(slots[0].item()) == 0:
-            new_slots = lmk_k_pool.alloc(1)
-            if new_slots is None:
-                return
-            slots = new_slots
-            req_to_chunk.assign(
-                req_idx_1,
-                torch.tensor([chunk_idx], dtype=torch.int32, device=lmk_k_pool.device),
-                slots,
-            )
-        lmk_k_pool.set(self.layer_id, slots, lmk_k, prior_b=prior_b)
+        # CG-safe conditional store: read old, blend with write_mask, write back.
+        layer_pool_k = lmk_k_pool.pool[int(self.layer_id)]      # [N+1, h_q, D]
+        layer_pool_pb = lmk_k_pool.prior_b_pool[int(self.layer_id)]  # [N+1, h_q]
+        slot_idx_d = slots_d.to(torch.int64)  # [1] int64
+        # Where write_mask is True, write the new value; else keep old.
+        old_k = layer_pool_k.index_select(0, slot_idx_d)  # [1, h_q, D]
+        new_k = torch.where(write_mask_d.view(-1, 1, 1), lmk_k, old_k)
+        layer_pool_k.index_copy_(0, slot_idx_d, new_k)
+        old_pb = layer_pool_pb.index_select(0, slot_idx_d)  # [1, h_q]
+        new_pb = torch.where(write_mask_d.view(-1, 1), prior_b, old_pb)
+        layer_pool_pb.index_copy_(0, slot_idx_d, new_pb)
 
 
 class FlashHSAInnerXDecoderLayer(nn.Module):
