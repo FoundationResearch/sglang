@@ -140,19 +140,36 @@ class LandmarkLmkKPool:
         Slot id 0 returns the zero padding row, which is the right neutral
         element for masked positions.  Negative values (-1 sentinel) are
         clamped to 0.
+
+        R79: SGLang's gather_slots already returns non-negative ints (masked
+        via `slots * valid`), so the defensive clamp is a no-op in production.
+        Skip it when slots is already on the pool device and int64.
         """
-        idx = slots.clamp(min=0).to(self.pool.device, torch.int64)
-        flat = idx.reshape(-1)
+        if slots.dtype == torch.int64 and slots.device == self.pool.device:
+            flat = slots.reshape(-1)
+            out_shape = (*slots.shape, self.h_q, self.head_dim)
+        else:
+            idx = slots.clamp(min=0).to(self.pool.device, torch.int64)
+            flat = idx.reshape(-1)
+            out_shape = (*idx.shape, self.h_q, self.head_dim)
         gathered = self.pool[int(layer_id)].index_select(0, flat)  # [n, H, D]
-        return gathered.view(*idx.shape, self.h_q, self.head_dim)
+        return gathered.view(*out_shape)
 
     def get_prior_b(self, layer_id: int, slots: torch.Tensor) -> torch.Tensor:
         """Gather ``[..., h_q]`` prior_b from ``slots``.  Slot 0 returns zeros
-        (additive identity), so masked positions contribute nothing to scores."""
-        idx = slots.clamp(min=0).to(self.prior_b_pool.device, torch.int64)
-        flat = idx.reshape(-1)
+        (additive identity), so masked positions contribute nothing to scores.
+
+        R79: skip clamp + .to when slots is already int64 on the pool device.
+        """
+        if slots.dtype == torch.int64 and slots.device == self.prior_b_pool.device:
+            flat = slots.reshape(-1)
+            out_shape = (*slots.shape, self.h_q)
+        else:
+            idx = slots.clamp(min=0).to(self.prior_b_pool.device, torch.int64)
+            flat = idx.reshape(-1)
+            out_shape = (*idx.shape, self.h_q)
         gathered = self.prior_b_pool[int(layer_id)].index_select(0, flat)  # [n, H]
-        return gathered.view(*idx.shape, self.h_q)
+        return gathered.view(*out_shape)
 
 
 class ReqToChunkPool:

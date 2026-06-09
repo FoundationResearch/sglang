@@ -1657,10 +1657,22 @@ class HSAAttnBackend(AttentionBackend):
         self._per_qhead_G_ext = None
         self._per_qhead_lmk_keys_full = None  # cache for the per-token-aware pytorch path
         if per_qhead_ext_active:
-            req_idx = _req_idx_cached  # R64: reuse layer-0 cached req_idx (was .item() per layer)
-            chunk_ids = torch.arange(S, device=device, dtype=torch.int32).unsqueeze(0)  # [1, S]
-            req_idx_t = torch.tensor([req_idx], dtype=torch.int32, device=device)
-            slots = self.req_to_chunk_pool.gather_slots(req_idx_t, chunk_ids)[0]  # [S]
+            # R79: cache (S, slots_i64) once per prefill — slots only depends
+            # on (req_idx, S), both invariant within a prefill. The int64
+            # cast lets get/get_prior_b take their no-clamp fast path. Saves
+            # per-layer arange + tensor(req_idx) + gather_slots dispatches.
+            slots_cache = getattr(forward_batch, "_hsa_prefill_chunk_slots_S", None)
+            if slots_cache is None or slots_cache[0] != S:
+                req_idx = _req_idx_cached  # R64 cached
+                chunk_ids = torch.arange(S, device=device, dtype=torch.int32).unsqueeze(0)
+                req_idx_t = torch.tensor([req_idx], dtype=torch.int32, device=device)
+                slots = (
+                    self.req_to_chunk_pool.gather_slots(req_idx_t, chunk_ids)[0]
+                    .to(torch.int64)
+                )
+                forward_batch._hsa_prefill_chunk_slots_S = (S, slots)
+            else:
+                slots = slots_cache[1]
             lmk_keys_full = self.lmk_k_pool.get(int(layer.layer_id), slots)  # [S, h_q, D]
             self._per_qhead_lmk_keys_full = lmk_keys_full
             self._per_qhead_prior_b_ext = self.lmk_k_pool.get_prior_b(int(layer.layer_id), slots)  # [S, h_q]
