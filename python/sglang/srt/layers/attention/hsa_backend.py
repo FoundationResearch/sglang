@@ -84,7 +84,13 @@ class HSAAttnBackend(AttentionBackend):
         server_args = getattr(model_runner, "server_args", None)
         cfg = getattr(getattr(model_runner, "model", None), "config", None)
 
-        default_topk = getattr(cfg, "hsa_topk", 64)
+        # R75: align fallback with FlashHSAConfig default (16, see
+        # configs/flash_hsa.py:66) so that if a future config class change
+        # introduces a different default, the backend won't silently use a
+        # stale value. R72 was caused by exactly this kind of drift —
+        # backend defaulted to False while config class defaulted to True,
+        # masking the maxpool kernel for months.
+        default_topk = getattr(cfg, "hsa_topk", 16)
         override_topk = getattr(server_args, "hsa_topk", None)
         self.hsa_topk = int(override_topk) if override_topk is not None else int(default_topk)
 
@@ -117,8 +123,14 @@ class HSAAttnBackend(AttentionBackend):
         self.hsa_layers = getattr(server_args, "hsa_layers", None)
         self._hsa_layer_ids: Optional[Set[int]] = self._resolve_hsa_layer_ids()
 
-        # LHSA merged softmax: enable_softmax1 adds a zero logit to the denominator.
-        self.enable_softmax1 = bool(getattr(cfg, "enable_softmax1", False))
+        # LHSA merged softmax: enable_softmax1 adds a zero logit to the
+        # denominator. R75: align fallback with FlashHSAConfig default
+        # (True, see configs/flash_hsa.py:64) so the training-time choice
+        # is preserved if a checkpoint omits the key. Backend used to
+        # default to False, which differs from training and would silently
+        # produce slightly different attention weights for any config that
+        # didn't load through FlashHSAConfig.
+        self.enable_softmax1 = bool(getattr(cfg, "enable_softmax1", True))
 
         # InnerX ultra only: we always run split-head stitch for HSA layers.
         # SWA window and LMK visibility are controlled by per-layer kwargs.
