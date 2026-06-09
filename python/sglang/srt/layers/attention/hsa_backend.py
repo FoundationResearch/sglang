@@ -1412,8 +1412,12 @@ class HSAAttnBackend(AttentionBackend):
         lse_per_group = lse_raw.view(T, H_hsa, Gh)
         lse_kv = torch.logsumexp(lse_per_group, dim=-1)
 
-        # Stash per-q-head LSE for the per-q-head fusion path (qwen-LHSA).
-        self._last_swa_lse_hq_extend = lse_raw.to(q_hsa.dtype)
+        # R71: stash per-q-head LSE for the per-q-head fusion path. Keep in
+        # fp32 — both downstream consumers (the maxpool topk kernel and the
+        # cat-with-scores at forward_extend step 5) want fp32, so casting to
+        # bf16 here was a per-layer kernel launch that the kernel then undid
+        # with .to(fp32) internally. Skipping saves 16 launches per prefill.
+        self._last_swa_lse_hq_extend = lse_raw
 
         return swa_o, lse_kv
 
