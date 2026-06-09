@@ -189,11 +189,16 @@ class FlashHSAConfig(PretrainedConfig):
         self.hsa_sliding_window = kwargs.pop("hsa_sliding_window", None)
         self.hsa_visible_window = int(kwargs.pop("hsa_visible_window", -1))
         self.full_upper_hsa = bool(kwargs.pop("full_upper_hsa", False))
-        # Prefill topk strategy. True (default, back-compat): softmax-then-max-pooling
-        # using the training kernel (computes hsa_lse, logaddexp with swa_lse, softmax).
-        # False: max-pooling-only path that skips hsa_lse and uses swa_lse directly as
-        # the per-query normalizer. ~2x faster prefill topk per upstream measurements.
-        self.headwise_topk_softmax = bool(kwargs.pop("headwise_topk_softmax", True))
+        # Prefill topk strategy. True: softmax-then-max-pooling using the
+        # training kernel (computes hsa_lse, logaddexp with swa_lse, softmax).
+        # False (R72 default): max-pooling-only path that skips hsa_lse and
+        # uses swa_lse directly as the per-query normalizer. ~2x faster prefill
+        # topk per upstream measurements; ~5-15% wallclock prefill at 8K-64K.
+        # R62 changed hsa_backend's default to False but this config default
+        # was still True, silently forcing the slow pure-PyTorch fallback.
+        # Checkpoints that need the exact softmax path can set
+        # `headwise_topk_softmax: true` in config.json.
+        self.headwise_topk_softmax = bool(kwargs.pop("headwise_topk_softmax", False))
         # Base model variant (kept for config compat; OLMo3 post-norm is the only supported path)
         self.base_model = str(kwargs.pop("base_model", "olmo3"))
 
