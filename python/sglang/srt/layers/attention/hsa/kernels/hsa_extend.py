@@ -50,6 +50,8 @@ def hsa_extend_paged_fwd_kernel(
     W_ptr,
     OUT_ptr,
     SEQ_ID_MAP_ptr,
+    SWA_O_ptr,
+    SWA_W_ptr,
     stride_qb: tl.constexpr,
     stride_qh: tl.constexpr,
     stride_qd: tl.constexpr,
@@ -79,6 +81,7 @@ def hsa_extend_paged_fwd_kernel(
     PAGE_SIZE: tl.constexpr,
     MAX_T: tl.constexpr,
     mask_last_token: tl.constexpr,
+    BLEND_SWA: tl.constexpr,
     BLOCK_M: tl.constexpr,
 ):
     pid_m = tl.program_id(0)
@@ -220,6 +223,30 @@ def hsa_extend_paged_fwd_kernel(
         out_page = tl.dot(p.to(v.dtype), v)  # [BLOCK_M*G, D]
         acc = acc + weights[:, None] * out_page.to(tl.float32)
 
+    # R80: optional epilogue — fuse SWA blend
+    #   out = bf16( acc + swa_o[t, hq, :] * swa_w[t, hq] )
+    # Matches hsa_decode_paged_fwd_kernel's BLEND_SWA epilogue. Caller
+    # guarantees swa_o_inner [T, HQ, D] bf16 contiguous and swa_w_q
+    # [T, HQ] bf16 contiguous. Saves a standalone addcmul launch per layer.
+    if BLEND_SWA:
+        # swa_o is contiguous [T, HQ, D] — stride (HQ*D, D, 1).
+        swa_o_offsets = (
+            row_tok_flat[:, None].to(tl.int64) * (HQ * D)
+            + row_hq_flat[:, None].to(tl.int64) * D
+            + offs_d[None, :].to(tl.int64)
+        )
+        swa_o = tl.load(
+            SWA_O_ptr + swa_o_offsets,
+            mask=row_mask_flat[:, None],
+            other=0.0,
+        ).to(tl.float32)  # [BLOCK_M*G, D] bf16 -> fp32
+        # swa_w is contiguous [T, HQ] — stride (HQ, 1).
+        swa_w_offsets = row_tok_flat.to(tl.int64) * HQ + row_hq_flat.to(tl.int64)
+        swa_w = tl.load(
+            SWA_W_ptr + swa_w_offsets, mask=row_mask_flat, other=0.0
+        ).to(tl.float32)  # [BLOCK_M*G]
+        acc = acc + swa_o * swa_w[:, None]
+
     # Store [BLOCK_M*G, D] -> Out[offs_m, hq_start..hq_start+G-1, :]
     out_offsets = (
         row_tok_flat[:, None] * stride_out_b
@@ -249,6 +276,11 @@ def hsa_extend_paged_fwd(
     block_m: int = 1,
     num_warps: int = 2,
     num_stages: int = 2,
+    # R80: optional fused SWA blend epilogue.
+    # When provided, computes out = bf16(acc + swa_o_inner * swa_w_q) in one
+    # kernel — saves the standalone addcmul launch in forward_extend.
+    swa_o_inner: Optional[torch.Tensor] = None,
+    swa_w_q: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Q-batched paged sparse-attention for extend (G-fused, block-diagonal TC).
 
@@ -312,6 +344,20 @@ def hsa_extend_paged_fwd(
     if out is None:
         out = torch.empty((T, HQ, D), device=q.device, dtype=torch.bfloat16)
 
+    blend_swa = (swa_o_inner is not None) and (swa_w_q is not None)
+    if blend_swa:
+        assert swa_o_inner.shape == (T, HQ, D), (
+            f"swa_o_inner {tuple(swa_o_inner.shape)} != ({T}, {HQ}, {D})"
+        )
+        assert swa_w_q.shape == (T, HQ), (
+            f"swa_w_q {tuple(swa_w_q.shape)} != ({T}, {HQ})"
+        )
+        swa_o_ = swa_o_inner if swa_o_inner.is_contiguous() else swa_o_inner.contiguous()
+        swa_w_ = swa_w_q if swa_w_q.is_contiguous() else swa_w_q.contiguous()
+    else:
+        swa_o_ = q_  # dummy pointer (unused under BLEND_SWA=False)
+        swa_w_ = q_
+
     # Grid: (T/BLOCK_M, H_kv) — each program handles BLOCK_M tokens, all G q-heads
     grid = (triton.cdiv(T, block_m), H)
     hsa_extend_paged_fwd_kernel[grid](
@@ -323,6 +369,8 @@ def hsa_extend_paged_fwd(
         w_,
         out,
         seq_map_,
+        swa_o_,
+        swa_w_,
         q_.stride(0),
         q_.stride(1),
         q_.stride(2),
@@ -352,6 +400,7 @@ def hsa_extend_paged_fwd(
         PAGE_SIZE=int(page_size),
         MAX_T=MAX_T,
         mask_last_token=bool(mask_last_token),
+        BLEND_SWA=bool(blend_swa),
         BLOCK_M=int(block_m),
         num_warps=int(num_warps),
         num_stages=int(num_stages),

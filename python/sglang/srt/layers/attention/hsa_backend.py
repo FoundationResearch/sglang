@@ -2021,15 +2021,20 @@ class HSAAttnBackend(AttentionBackend):
         H_hsa: int,
         HQ_hsa: int,
         sm_scale: Optional[float] = None,
+        swa_o_inner: Optional[torch.Tensor] = None,
+        swa_w_q: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Dispatch to Triton kernel (production) or reference implementation."""
         if self._USE_EXTEND_REFERENCE:
-            return self._hsa_sparse_attn_extend_reference(
+            out = self._hsa_sparse_attn_extend_reference(
                 q_hsa=q_hsa, k_cache=k_cache, v_cache=v_cache,
                 page_table_1=page_table_1, selected_page_ids=selected_page_ids,
                 hsa_weights=hsa_weights, H_hsa=H_hsa, HQ_hsa=HQ_hsa,
                 sm_scale=sm_scale,
             )
+            if swa_o_inner is not None and swa_w_q is not None:
+                out = torch.addcmul(out, swa_o_inner, swa_w_q[:, :, None])
+            return out
         # R37: Q-batched extend kernel (collapses (T, HQ) grid to (T/BLOCK_M, HQ)).
         md = self.forward_metadata
         import os as _os
@@ -2047,6 +2052,8 @@ class HSAAttnBackend(AttentionBackend):
             block_m=int(_os.environ.get("HSA_SPARSE_BM", 1)),
             num_warps=int(_os.environ.get("HSA_SPARSE_NW", 2)),
             num_stages=int(_os.environ.get("HSA_SPARSE_NS", 2)),
+            swa_o_inner=swa_o_inner,
+            swa_w_q=swa_w_q,
         )
 
     def _hsa_sparse_attn_extend_reference(
@@ -2359,7 +2366,25 @@ class HSAAttnBackend(AttentionBackend):
                 .contiguous()
             )
 
-        # Step 6: Paged HSA sparse attention.
+        # Step 6+7 R80: fuse the SWA blend epilogue into the HSA sparse kernel.
+        # When swa_w_q is per-HQ, hsa_extend_paged_fwd does:
+        #   out = bf16(acc + swa_o_inner * swa_w_q)
+        # in its store epilogue — saves the standalone addcmul launch.
+        # Fallback path (swa_w_kv only, hsa_window <= 0 branch) still expands
+        # swa_w_kv to swa_w_q first, then addcmul outside.
+        if swa_w_q is None and swa_w_kv is not None:
+            swa_w_q = (
+                swa_w_kv[:, :, None]
+                .expand(T, H_hsa, Gh)
+                .reshape(T, HQ_hsa)
+                .contiguous()
+            )
+        blend_swa_in_kernel = swa_w_q is not None
+        swa_w_q_for_kernel = (
+            swa_w_q.to(q_hsa.dtype) if (blend_swa_in_kernel and swa_w_q.dtype != q_hsa.dtype) else swa_w_q
+        )
+        if blend_swa_in_kernel and not swa_w_q_for_kernel.is_contiguous():
+            swa_w_q_for_kernel = swa_w_q_for_kernel.contiguous()
         k_cache_hsa = pool.get_key_buffer(layer.layer_id)[:, H_swa : H_swa + H_hsa, :]
         v_cache_hsa = pool.get_value_buffer(layer.layer_id)[:, H_swa : H_swa + H_hsa, :]
         out_hsa = self._hsa_sparse_attn_extend(
@@ -2372,21 +2397,9 @@ class HSAAttnBackend(AttentionBackend):
             H_hsa=H_hsa,
             HQ_hsa=HQ_hsa,
             sm_scale=getattr(layer, "scaling", None),
-        )  # [T, HQ_hsa, D] bf16
-
-        # Step 7: Weighted SWA fusion (LHSA: o_lower = hsa_o + swa_o * swa_weight).
-        if swa_w_q is None and swa_w_kv is not None:
-            swa_w_q = (
-                swa_w_kv[:, :, None]
-                .expand(T, H_hsa, Gh)
-                .reshape(T, HQ_hsa)
-            )
-        if swa_w_q is not None:
-            # R66: do the fusion in bf16 — swa_o_inner is now bf16 (was forced
-            # fp32 pre-R66), out_hsa is bf16 from the sparse kernel, swa_w_q is
-            # bf16 from softmax. bf16 + bf16*bf16 stays bf16; saves a (T,
-            # HQ_hsa, D) fp32 buffer per layer plus the cast-back at line 2341.
-            out_hsa = torch.addcmul(out_hsa, swa_o_inner, swa_w_q[:, :, None])
+            swa_o_inner=swa_o_inner if blend_swa_in_kernel else None,
+            swa_w_q=swa_w_q_for_kernel if blend_swa_in_kernel else None,
+        )  # [T, HQ_hsa, D] bf16, SWA blend already applied if requested
 
         # Step 8: Write HSA heads into the pre-allocated output tensor.
         dense_out_3[:, HQ_swa:, :] = out_hsa.to(dense_out_3.dtype)
