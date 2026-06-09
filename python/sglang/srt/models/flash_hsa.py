@@ -86,6 +86,49 @@ def _try_fused_per_head_rmsnorm_3d_inplace(
     return True
 from sglang.srt.layers.linear import ColumnParallelLinear, MergedColumnParallelLinear, ReplicatedLinear, RowParallelLinear
 from sglang.srt.layers.radix_attention import RadixAttention
+import torch.nn.functional as F
+
+
+# R61: vectorised chunk_attn_pool (ported from friend's
+# InfiniteLongLM/models/FlashHSA/chunk_attn_pool_optimized.py). Key tricks:
+#   * reshape mu_q to (N, h_kv, G, D) instead of repeat_interleave K to h_q —
+#     keeps logits at (N, S, h_kv, G) so K bandwidth stays 8x smaller (h_kv
+#     vs h_q).
+#   * entropy via lse - E[z] (one logsumexp + one weighted-sum) instead of
+#     log_softmax + (p * log_p).sum() — drops one softmax-grade kernel.
+# Compiled once per process (cache key uses tensor dtype + shape).
+def _chunk_attn_pool_impl(
+    mu_q: torch.Tensor,        # (N, h_q, D) fp32 or any float
+    k_chunked: torch.Tensor,   # (N, S, h_kv, D) fp32
+    out_dtype: torch.dtype,
+    sm_scale: float,
+    G: int,
+):
+    N, h_q, D = mu_q.shape
+    _, S, h_kv, _ = k_chunked.shape
+    mu_group = mu_q.reshape(N, h_kv, G, D)
+    logits = torch.einsum("nhgd,nshd->nshg", mu_group, k_chunked) * sm_scale
+    last_mask = torch.zeros(S, dtype=torch.bool, device=logits.device)
+    last_mask[-1] = True
+    logits = logits.masked_fill(last_mask.view(1, S, 1, 1), float("-inf"))
+    p = F.softmax(logits, dim=1)
+    lmk_k = torch.einsum("nshg,nshd->nhgd", p, k_chunked)
+    lmk_k = lmk_k.reshape(N, h_q, D).to(out_dtype)
+    logits_safe = torch.where(torch.isfinite(logits), logits, logits.new_zeros(()))
+    lse = torch.logsumexp(logits, dim=1)               # (N, h_kv, G)
+    expected_z = (p * logits_safe).sum(dim=1)          # (N, h_kv, G)
+    prior_b = (lse - expected_z).reshape(N, h_q)
+    return lmk_k, prior_b
+
+
+try:
+    _chunk_attn_pool_compiled = torch.compile(
+        _chunk_attn_pool_impl,
+        fullgraph=True,
+        dynamic=True,
+    )
+except Exception:
+    _chunk_attn_pool_compiled = None
 from sglang.srt.layers.rotary_embedding import RotaryEmbedding, get_rope
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
 from sglang.srt.layers.vocab_parallel_embedding import (
@@ -1281,23 +1324,18 @@ class FlashHSAInnerXHierarchicalSparseAttention(nn.Module):
         # landmark KEY in the topk selector) AND ``prior_b`` (entropy of the
         # per-q-head attention distribution, added as a bias to selection
         # scores — mirrors lhsa_layer's ``lmk_b``).
+        # R61: vectorised chunk_attn_pool (no K repeat_interleave, lse-E[z]
+        # entropy, optional torch.compile). Keeps logits at (N, S, h_kv, G)
+        # instead of (N, S, h_q) — 8x less memory bandwidth for K read.
         sm_scale = 1.0 / _math.sqrt(head_dim)
         mu_f32 = mu_q_batch.float()
         k_f32 = k_chunk_batch.float()
-        k_q = k_f32.repeat_interleave(G, dim=2) if G != 1 else k_f32  # (N, S, h_q, D)
-        logits = torch.einsum("nhd,nshd->nsh", mu_f32, k_q) * sm_scale  # (N, S, h_q)
-        last_mask = torch.zeros(chunk_size, dtype=torch.bool, device=mu_f32.device)
-        last_mask[-1] = True
-        logits = logits.masked_fill(last_mask.view(1, chunk_size, 1), float("-inf"))
-        p = torch.softmax(logits, dim=1)  # (N, S, h_q)
-        lmk_k = torch.einsum("nsh,nshd->nhd", p, k_q).to(lmk_k_pool.dtype)  # (N, h_q, D)
-        # Entropy bias.  log_softmax puts -inf where logits were -inf; the
-        # corresponding ``p`` is exactly 0 there, but ``p * log_p`` would be
-        # ``0 * (-inf) = NaN``.  Replace the -inf entries with 0 so the sum is
-        # well-defined.  Matches lhsa_layer.py:_chunk_attn_pool_impl.
-        log_p = torch.log_softmax(logits, dim=1)
-        log_p_safe = torch.where(torch.isfinite(log_p), log_p, log_p.new_zeros(()))
-        prior_b = -(p * log_p_safe).sum(dim=1)  # (N, h_q) fp32
+        fn = _chunk_attn_pool_compiled if _chunk_attn_pool_compiled is not None else _chunk_attn_pool_impl
+        try:
+            lmk_k, prior_b = fn(mu_f32, k_f32, lmk_k_pool.dtype, sm_scale, G)
+        except Exception:
+            # torch.compile can fail for unusual shapes — fall back to eager.
+            lmk_k, prior_b = _chunk_attn_pool_impl(mu_f32, k_f32, lmk_k_pool.dtype, sm_scale, G)
 
         # R47+R60: reuse slot across layers per (req, chunk). R60 also caches
         # the slot tensor on forward_batch — layer 0 allocates, layers 1-15
