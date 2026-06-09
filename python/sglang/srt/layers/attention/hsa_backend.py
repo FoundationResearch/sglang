@@ -2256,8 +2256,14 @@ class HSAAttnBackend(AttentionBackend):
         )
 
         if per_qhead_fusion and hsa_window > 0:
-            valid_hq = valid.unsqueeze(2).expand(T, H_hsa, Gh, TOPK).reshape(T, HQ_hsa, TOPK)
-            scores_hq = per_qhead_scores.masked_fill(~valid_hq, float("-inf"))
+            # R74: skip the materialized valid_hq bool reshape (was a 4-D
+            # expand + .reshape -> always forces a copy because the strides
+            # from expand don't fit the new packed shape). Instead view scores
+            # as 4-D (free), masked_fill against the 4-D strided valid view,
+            # then view back. Saves one (T*HQ_hsa*TOPK) bool tensor per layer.
+            scores_4d = per_qhead_scores.view(T, H_hsa, Gh, TOPK)
+            valid_4d = valid.unsqueeze(2).expand(T, H_hsa, Gh, TOPK)  # strided view
+            scores_hq = scores_4d.masked_fill(~valid_4d, float("-inf")).view(T, HQ_hsa, TOPK)
             if not self.enable_softmax1:
                 cat_scores = torch.cat(
                     [scores_hq, per_qhead_lse.unsqueeze(-1)], dim=-1
