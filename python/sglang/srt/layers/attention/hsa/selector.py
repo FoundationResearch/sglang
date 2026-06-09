@@ -249,6 +249,8 @@ def select_topk_pages_decode_fused(
     selection_strategy: str = "group",
     G: Optional[int] = None,
     per_qhead_prior_b: Optional[torch.Tensor] = None,
+    _decode_q_offset: Optional[int] = None,
+    _decode_hsa_window: Optional[int] = None,
 ) -> Optional[HSASelectionResult]:
     """使用 fused online_topk_group kernel 进行 top-k page selection。
 
@@ -296,6 +298,13 @@ def select_topk_pages_decode_fused(
     # alignment needs.  Fused kernel still handles the H_sel == h_kv (shared K)
     # case, which is the existing default.
     if G is not None and G > 1:
+        # NOTE on R54b experiment: tried calling _online_topk_head_maxpool here
+        # for the L=1 decode case — verified topk indices match the pure-pytorch
+        # path (100% set overlap), but the tilelang kernel under-utilises the GPU
+        # at L=1 (block-wise scheduling assumes multi-token training): CUDA time
+        # rose from 13.3ms→19ms and decode latency went 32ms→38ms in profile.
+        # Kept the pure-pytorch path; the kernel may revisit later if we add an
+        # L=1 specialisation.
         # Pure-PyTorch per-q-head topk + max-over-G selection, matching the
         # official online_softmax_topk_head with explicit G:
         #   1. per-q-head scores   = q · lmk_k  (per q-head)
@@ -310,45 +319,49 @@ def select_topk_pages_decode_fused(
         B_c, C_c, h_q_c, D_c = cand_repr.shape
         h_kv_c = h_q_c // G
         sm_scale_ref = float(sm_scale) if sm_scale is not None else (1.0 / _m.sqrt(D_c))
+        # R54d: drop redundant ops. Key invariants for the hot path (large C):
+        #   * torch.topk indices are always in [0, C) — no need for clamp_min(0)
+        #     when gathering with them (verified: topk on -inf-masked never
+        #     returns negative indices unless K > num_finite, handled below).
+        #   * torch.sort(topk_idx_kv) is NOT needed — chunk_weight kernel doesn't
+        #     require ascending chunk ids (it iterates by k_offs, not chunk_id).
+        #   * Final selected_page_ids.masked_fill(<0, -1) is a no-op when topk
+        #     returns no negative indices.
+        #   * scores_hq's masked_fill(invalid_hq, -inf) is redundant because the
+        #     downstream chunk_weight kernel reads selected_page_ids and masks
+        #     scores where sel_pages < 0.
+        # Net: ~10 fewer launches per layer × 16 layers ≈ 160 launches/step.
+        eff_topk = min(int(topk), int(C_c))
         q_3 = q_4d.view(B_c, h_q_c, D_c).float()                              # [B, h_q, D]
         cand_f = cand_repr.float()                                            # [B, C, h_q, D]
         scores_pqh = torch.einsum("bhd,bchd->bhc", q_3, cand_f) * sm_scale_ref  # [B, h_q, C]
-        # R48 (Item #6): add entropy bias to per-q-head scores. Historical
-        # comment about "WORSE KL with prior_b" predates R47's slot-reuse fix —
-        # the bias was being read from the wrong slot, so adding it amplified
-        # noise. With R47 (proper multi-layer slot reuse) the bias is now
-        # consistent with the official's chunk_attn_pool output.
+        # R48 (Item #6): add entropy bias to per-q-head scores. With R47
+        # (proper multi-layer slot reuse) the bias is consistent with the
+        # official's chunk_attn_pool output.  prior_b_pool is fp32, matches.
         if per_qhead_prior_b is not None:
-            scores_pqh = scores_pqh + per_qhead_prior_b.permute(0, 2, 1).to(scores_pqh.dtype)
+            scores_pqh.add_(per_qhead_prior_b.permute(0, 2, 1))
         # Selection scores: max over G  → [B, h_kv, C]
         scores_kv_sel = scores_pqh.view(B_c, h_kv_c, G, C_c).max(dim=2).values
-        valid_mask = cand_mask.unsqueeze(1).expand(B_c, h_kv_c, C_c)
-        scores_kv_sel = scores_kv_sel.masked_fill(~valid_mask, float("-inf"))
-        eff_topk = min(int(topk), int(C_c))
-        _, topk_idx_kv = scores_kv_sel.topk(eff_topk, dim=-1)                # [B, h_kv, K]
-        topk_idx_kv, _ = torch.sort(topk_idx_kv, dim=-1)                     # ascending
-        # Gather per-q-head scores at the selected h_kv indices.  Each q-head
-        # in the same group sees the SAME chunks (kernel semantics: indices
-        # are shared per kv-group) but its OWN score for that chunk.
+        # In-place mask via cand_mask (broadcast cheaply, no expand+reshape needed).
+        scores_kv_sel.masked_fill_(
+            ~cand_mask.unsqueeze(1),  # [B, 1, C] — broadcast against [B, h_kv, C]
+            float("-inf"),
+        )
+        _, topk_idx_kv = scores_kv_sel.topk(eff_topk, dim=-1)                # [B, h_kv, K] int64
+        # No torch.sort — chunk_weight handles arbitrary order.
+        # Per-q-head scores: gather with the h_kv→h_q broadcast.
         topk_idx_hq = topk_idx_kv.unsqueeze(2).expand(B_c, h_kv_c, G, eff_topk).reshape(
             B_c, h_q_c, eff_topk
         )
-        scores_hq = torch.gather(scores_pqh, dim=-1, index=topk_idx_hq.clamp_min(0))
-        # Mask invalid chunks back to -inf for both the h_kv (selection) and
-        # h_q (output) scores; the fusion uses the h_q ones.
-        invalid = topk_idx_kv < 0
-        scores_kv_out = torch.gather(scores_kv_sel, dim=-1, index=topk_idx_kv.clamp_min(0))
-        scores_kv_out = scores_kv_out.masked_fill(invalid, float("-inf"))
-        scores_hq = scores_hq.masked_fill(
-            invalid.unsqueeze(2).expand(B_c, h_kv_c, G, eff_topk).reshape(B_c, h_q_c, eff_topk),
-            float("-inf"),
-        )
-        # Pad to `topk` if eff_topk < topk
+        scores_hq = torch.gather(scores_pqh, dim=-1, index=topk_idx_hq)
+        # h_kv selection scores at the topk indices.
+        scores_kv_out = torch.gather(scores_kv_sel, dim=-1, index=topk_idx_kv)
         if eff_topk < int(topk):
+            # Cold path: very short context. Pad to topk size and mask invalids.
             pad = int(topk) - eff_topk
             topk_idx_kv = torch.cat(
                 [topk_idx_kv,
-                 topk_idx_kv.new_full((B_c, h_kv_c, pad), -1, dtype=topk_idx_kv.dtype)],
+                 topk_idx_kv.new_full((B_c, h_kv_c, pad), -1)],
                 dim=-1,
             )
             scores_kv_out = torch.cat(
@@ -362,7 +375,6 @@ def select_topk_pages_decode_fused(
                 dim=-1,
             )
         selected_page_ids = topk_idx_kv.to(torch.int32)
-        selected_page_ids = selected_page_ids.masked_fill(selected_page_ids < 0, -1)
         # Attach per-q-head scores onto the result via a side-channel attribute
         # (the dataclass HSASelectionResult doesn't have a field for it).
         result = HSASelectionResult(

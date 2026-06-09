@@ -1306,6 +1306,12 @@ class FlashHSAInnerXHierarchicalSparseAttention(nn.Module):
         once this chunk leaves the SWA window (~hsa_sliding_window decodes
         later) the selector reads correct values instead of stale prefill-time
         data (or zeros).
+
+        R55: hoist `is_lmk_step` + `seq_len` checks to forward_batch-level
+        cache. Called per-layer per-step; 63/64 steps return early because the
+        current token isn't the LMK token. Pre-R55 each layer paid 2 CUDA
+        syncs to discover that → 2 × 16 × 63/64 ≈ 31 wasted syncs per chunk.
+        Cache the answer on forward_batch the first time we look it up.
         """
         if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
             return  # CG capture can't include Python-side scalar sync
@@ -1324,14 +1330,20 @@ class FlashHSAInnerXHierarchicalSparseAttention(nn.Module):
             return
 
         chunk_size = int(self.chunk_size)
-        seq_len = int(forward_batch.seq_lens[0].item())
-        input_ids = getattr(forward_batch, "input_ids", None)
-        lmk_id = int(getattr(self.config, "vocab_size", -1))
-        is_lmk_step = (
-            input_ids is not None
-            and lmk_id >= 0
-            and int(input_ids[-1].item()) == lmk_id
-        )
+        # R55: try cache first — set by the first HSA layer in this forward.
+        cache = getattr(forward_batch, "_hsa_lmk_step_cache", None)
+        if cache is None:
+            lmk_id = int(getattr(self.config, "vocab_size", -1))
+            input_ids = getattr(forward_batch, "input_ids", None)
+            if input_ids is None or lmk_id < 0:
+                forward_batch._hsa_lmk_step_cache = (False, 0)
+                return
+            # Single sync for the whole forward (was 16x pre-R55).
+            seq_len = int(forward_batch.seq_lens[0].item())
+            is_lmk = int(input_ids[-1].item()) == lmk_id
+            cache = (is_lmk, seq_len)
+            forward_batch._hsa_lmk_step_cache = cache
+        is_lmk_step, seq_len = cache
         if not is_lmk_step:
             return
 

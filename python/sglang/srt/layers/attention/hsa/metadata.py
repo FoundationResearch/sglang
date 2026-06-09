@@ -55,6 +55,23 @@ class HSAMetadata:
     # depends only on cache_seqlens + hsa_window, identical across HSA layers.
     hsa_effective_cands: Optional[torch.Tensor] = None
 
+    # R54a: layer-invariant per-step selector scratch — only built when
+    # per_qhead path is active (HSA chunk_attn_pool config). cand_page_ids /
+    # cand_mask depend only on cache_seqlens + page_size + hsa_window;
+    # per_qhead_slots depends only on those + req_pool_indices via
+    # req_to_chunk_pool. All identical across HSA layers; this kills ~96
+    # redundant launches per decode step (~6 ops × 16 layers).
+    hsa_per_step_cand_page_ids: Optional[torch.Tensor] = None  # [B, C_max] int32
+    hsa_per_step_cand_mask: Optional[torch.Tensor] = None  # [B, C_max] bool
+    hsa_per_step_slots: Optional[torch.Tensor] = None  # [B, C_max] int32 lmk slot ids
+    hsa_per_step_hsa_window: Optional[int] = None  # cache for sanity check
+
+    # R54c: per-step pre-gathered lmk_k + prior_b across ALL layers — collapses
+    # 16x (lmk_k_pool.get + get_prior_b) ≈ 96 launches into 2 multi-layer
+    # index_selects. Shapes: [num_layers, B, C, h_q, D] and [num_layers, B, C, h_q].
+    hsa_per_step_all_lmk_k: Optional[torch.Tensor] = None
+    hsa_per_step_all_prior_b: Optional[torch.Tensor] = None
+
     # ---- Extend-specific fields ----
     token_positions: Optional[torch.Tensor] = None  # [total_extend_tokens] global pos
     token_to_seq_id: Optional[torch.Tensor] = None  # [total_extend_tokens] -> batch idx

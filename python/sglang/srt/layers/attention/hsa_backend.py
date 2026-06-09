@@ -169,30 +169,38 @@ class HSAAttnBackend(AttentionBackend):
                 head_dim = int(
                     getattr(cfg, "head_dim", getattr(cfg, "hidden_size") // h_q)
                 )
-                # Pool sizing — pick the largest reasonable context the
-                # backend might see. Prefer model_config.context_len (set by
-                # the test scaffold) over max_total_num_tokens, since the
-                # latter ignores LMK insertion overhead (~+3%). Add 2x
-                # safety margin to cover stress runs with re-allocations.
+                # Pool sizing — base on PER-REQUEST context (model_config.context_len
+                # or max_req_input_len), NOT on the global KV-pool size. Using
+                # max_total_num_tokens here is wrong: it's the *aggregate* token
+                # capacity across all concurrent reqs AND all layers, so it
+                # over-counts by req_pool_size × num_layers and easily yields
+                # 10^10+ slots → multi-TB allocation. We just need per-req chunks.
                 _mc = getattr(model_runner, "model_config", None)
                 _ctx_len = int(getattr(_mc, "context_len", 0) or 0)
-                _mtt = int(getattr(model_runner, "max_total_num_tokens", 0) or 0)
-                if _mtt <= 0:
+                if _ctx_len <= 0:
+                    _ctx_len = int(getattr(_mc, "max_req_input_len", 0) or 0)
+                if _ctx_len <= 0:
                     _server_args = getattr(model_runner, "server_args", None)
-                    _mtt = int(
-                        getattr(_server_args, "max_total_tokens", None) or 0
+                    _ctx_len = int(
+                        getattr(_server_args, "context_length", None) or 0
                     )
-                max_total_tokens = max(_ctx_len, _mtt, 131072)
-                # Allow LMK insertion (~+3%) + headroom.
+                if _ctx_len <= 0:
+                    _ctx_len = 131072  # last-ditch fallback
+                # Allow LMK insertion (~+3%) + small slack.
                 max_chunks_per_req = max(
-                    int(max_total_tokens * 33 // 32 // int(self.page_size)) + 16, 16
+                    int(_ctx_len * 33 // 32 // int(self.page_size)) + 16, 16
                 )
                 req_pool = getattr(model_runner, "req_to_token_pool", None)
                 req_pool_size = int(getattr(req_pool, "size", 1) or 1)
-                # Each req can occupy up to max_chunks_per_req slots; over-allocate
-                # 2x to accommodate re-allocations during stress testing.
+                # Each concurrent req can occupy up to max_chunks_per_req slots.
+                # Cap total slots so the lmk_k_pool itself stays bounded: at
+                # 16 heads × 64 D × 2B/elem × 16 layers ≈ 32 KiB per slot;
+                # we want ≤ ~4 GiB → ~128K slots ceiling. Production rarely
+                # has all reqs holding the full context simultaneously, so cap
+                # at min(req_pool_size, 128) × max_chunks_per_req.
+                effective_reqs = min(max(req_pool_size, 1), 128)
                 num_chunk_slots = max(
-                    max_chunks_per_req * max(req_pool_size, 1) * 2 + 16, 16
+                    max_chunks_per_req * effective_reqs + 16, 16
                 )
                 self.lmk_k_pool = LandmarkLmkKPool(
                     num_chunk_slots=num_chunk_slots,
@@ -412,28 +420,74 @@ class HSAAttnBackend(AttentionBackend):
             return
 
         # Slow path still needs the materialised cand_page_ids/cand_mask + the
-        # effective_cands [B] tensor.  Compute them here (only hits per-qhead/unified
-        # paths, both inactive for HSA-345M legacy h_kv mode).
-        seq_lens_i64 = md.cache_seqlens_int32.to(torch.int64)
-        completed_pages = seq_lens_i64 // page_size
-        if hsa_window > 0:
-            limit_chunk = (seq_lens_i64 - hsa_window).clamp(min=0) // page_size
-            effective_cands = torch.min(completed_pages, limit_chunk).clamp(min=0)
+        # effective_cands [B] tensor.  R54a: cache layer-invariant scratch in
+        # forward_metadata so we only build it once per step (was 16x per step
+        # for 16-layer 345M HSA — ~96 launches saved).
+        cached_pi = getattr(md, "hsa_per_step_cand_page_ids", None)
+        cached_cm = getattr(md, "hsa_per_step_cand_mask", None)
+        cached_window = getattr(md, "hsa_per_step_hsa_window", None)
+        if (
+            cached_pi is not None
+            and cached_cm is not None
+            and cached_window == hsa_window
+            and cached_pi.shape == (B, C_max)
+        ):
+            cand_page_ids = cached_pi
+            cand_mask = cached_cm
         else:
-            effective_cands = completed_pages.clamp(min=0)
-        cand_range = torch.arange(C_max, device=device, dtype=torch.int32)
-        cand_page_ids = cand_range.unsqueeze(0).expand(B, C_max).contiguous()
-        cand_mask = cand_page_ids < effective_cands.unsqueeze(1).to(torch.int32)
-        cand_page_ids = cand_page_ids.masked_fill(~cand_mask, -1)
+            seq_lens_i64 = md.cache_seqlens_int32.to(torch.int64)
+            completed_pages = seq_lens_i64 // page_size
+            if hsa_window > 0:
+                limit_chunk = (seq_lens_i64 - hsa_window).clamp(min=0) // page_size
+                effective_cands = torch.min(completed_pages, limit_chunk).clamp(min=0)
+            else:
+                effective_cands = completed_pages.clamp(min=0)
+            cand_range = torch.arange(C_max, device=device, dtype=torch.int32)
+            cand_page_ids = cand_range.unsqueeze(0).expand(B, C_max).contiguous()
+            cand_mask = cand_page_ids < effective_cands.unsqueeze(1).to(torch.int32)
+            cand_page_ids = cand_page_ids.masked_fill(~cand_mask, -1)
+            md.hsa_per_step_cand_page_ids = cand_page_ids
+            md.hsa_per_step_cand_mask = cand_mask
+            md.hsa_per_step_hsa_window = hsa_window
 
         if per_qhead_active:
-            # cand_page_ids[B, C_max] -> slot ids -> [B, C_max, h_q, D]
-            slots = self.req_to_chunk_pool.gather_slots(
-                forward_batch.req_pool_indices, cand_page_ids
-            )
-            cand_repr = self.lmk_k_pool.get(int(layer.layer_id), slots)
+            # R54a: slots = req_to_chunk_pool.gather_slots(req_pool_indices,
+            # cand_page_ids) is layer-invariant (same req_pool_indices +
+            # same cand_page_ids); cache it too.
+            slots = getattr(md, "hsa_per_step_slots", None)
+            if slots is None or slots.shape != cand_page_ids.shape:
+                slots = self.req_to_chunk_pool.gather_slots(
+                    forward_batch.req_pool_indices, cand_page_ids
+                )
+                md.hsa_per_step_slots = slots
+            # R54c: batch the lmk_k + prior_b gathers across ALL layers in one
+            # multi-layer index_select instead of per-layer (saves ~94 launches/
+            # step for 16-layer 345M HSA). Lazily on the first per_qhead layer.
+            all_lmk_k = getattr(md, "hsa_per_step_all_lmk_k", None)
+            all_prior_b = getattr(md, "hsa_per_step_all_prior_b", None)
+            if all_lmk_k is None or all_prior_b is None:
+                # pool.pool: [L, num_chunk_slots+1, h_q, head_dim]
+                # prior_b_pool: [L, num_chunk_slots+1, h_q]
+                pool_pool = self.lmk_k_pool.pool
+                pb_pool = self.lmk_k_pool.prior_b_pool
+                flat_idx = (
+                    slots.clamp(min=0).to(pool_pool.device, torch.int64).reshape(-1)
+                )
+                # [L, B*C, h_q, D] / [L, B*C, h_q]
+                gathered_k = pool_pool.index_select(1, flat_idx)
+                gathered_pb = pb_pool.index_select(1, flat_idx)
+                all_lmk_k = gathered_k.view(
+                    pool_pool.shape[0], *slots.shape,
+                    pool_pool.shape[2], pool_pool.shape[3],
+                )
+                all_prior_b = gathered_pb.view(
+                    pb_pool.shape[0], *slots.shape, pb_pool.shape[2]
+                )
+                md.hsa_per_step_all_lmk_k = all_lmk_k
+                md.hsa_per_step_all_prior_b = all_prior_b
+            cand_repr = all_lmk_k[int(layer.layer_id)]
             # prior_b (entropy bias) per chunk per q-head, [B, C_max, h_q]
-            self._per_qhead_prior_b = self.lmk_k_pool.get_prior_b(int(layer.layer_id), slots)
+            self._per_qhead_prior_b = all_prior_b[int(layer.layer_id)]
             H_sel = cand_repr.shape[2]
             D = cand_repr.shape[3]
             # G for the topk kernel — switches it to per-q-head mode.
@@ -485,6 +539,9 @@ class HSAAttnBackend(AttentionBackend):
                 q_sel = tensor_model_parallel_all_gather(q_sel.contiguous(), dim=-1)
         sm_scale_val = getattr(layer, "scaling", None)
 
+        # R54b: for the per-qhead path, hand the kernel q_offset+hsa_window so
+        # it can do causal+window masking internally (no separate masked_fill).
+        # max_seqlen_k is already an int on CPU (set by init_forward_metadata).
         sel = select_topk_pages_decode_fused(
             q=q_sel,
             cand_page_ids=cand_page_ids,
@@ -496,6 +553,8 @@ class HSAAttnBackend(AttentionBackend):
             selection_strategy=str(self.hsa_selection_strategy),
             G=getattr(self, "_per_qhead_G", None),
             per_qhead_prior_b=getattr(self, "_per_qhead_prior_b", None),
+            _decode_q_offset=int(md.max_seqlen_k) - 1,
+            _decode_hsa_window=int(hsa_window),
         )
         if sel is None:
             sel = select_topk_pages_decode(
