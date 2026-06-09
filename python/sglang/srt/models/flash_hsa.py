@@ -108,12 +108,17 @@ except Exception:
 #     log_softmax + (p * log_p).sum() — drops one softmax-grade kernel.
 # Compiled once per process (cache key uses tensor dtype + shape).
 def _chunk_attn_pool_impl(
-    mu_q: torch.Tensor,        # (N, h_q, D) fp32 or any float
-    k_chunked: torch.Tensor,   # (N, S, h_kv, D) fp32
+    mu_q: torch.Tensor,        # (N, h_q, D) any float dtype — cast to fp32 inside
+    k_chunked: torch.Tensor,   # (N, S, h_kv, D) any float dtype
     out_dtype: torch.dtype,
     sm_scale: float,
     G: int,
 ):
+    # R70: cast to fp32 inside the compiled fn so inductor can fuse the cast
+    # with the einsum input load (eliminates 2 launches/layer + materialised
+    # fp32 buffer). Mathematically identical to the caller-side .float() path.
+    mu_q = mu_q.float()
+    k_chunked = k_chunked.float()
     N, h_q, D = mu_q.shape
     _, S, h_kv, _ = k_chunked.shape
     mu_group = mu_q.reshape(N, h_kv, G, D)
@@ -1359,15 +1364,17 @@ class FlashHSAInnerXHierarchicalSparseAttention(nn.Module):
         # R61: vectorised chunk_attn_pool (no K repeat_interleave, lse-E[z]
         # entropy, optional torch.compile). Keeps logits at (N, S, h_kv, G)
         # instead of (N, S, h_q) — 8x less memory bandwidth for K read.
+        # R70: pass bf16 in — the compiled impl now does the fp32 cast inside
+        # its graph, so inductor can fuse it with the einsum input load.
         sm_scale = 1.0 / _math.sqrt(head_dim)
-        mu_f32 = mu_q_batch.float()
-        k_f32 = k_chunk_batch.float()
         fn = _chunk_attn_pool_compiled if _chunk_attn_pool_compiled is not None else _chunk_attn_pool_impl
         try:
-            lmk_k, prior_b = fn(mu_f32, k_f32, lmk_k_pool.dtype, sm_scale, G)
+            lmk_k, prior_b = fn(mu_q_batch, k_chunk_batch, lmk_k_pool.dtype, sm_scale, G)
         except Exception:
             # torch.compile can fail for unusual shapes — fall back to eager.
-            lmk_k, prior_b = _chunk_attn_pool_impl(mu_f32, k_f32, lmk_k_pool.dtype, sm_scale, G)
+            lmk_k, prior_b = _chunk_attn_pool_impl(
+                mu_q_batch, k_chunk_batch, lmk_k_pool.dtype, sm_scale, G
+            )
 
         # R47+R60: reuse slot across layers per (req, chunk). R60 also caches
         # the slot tensor on forward_batch — layer 0 allocates, layers 1-15
