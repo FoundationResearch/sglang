@@ -1392,7 +1392,7 @@ class HSAAttnBackend(AttentionBackend):
         # program (M=BLOCK_M*G=128 at G=4, hitting TC sweet spot) instead of
         # the generic _fwd_kernel_unified which reloaded K once per q-head.
         from sglang.srt.layers.attention.hsa.kernels import hsa_swa_extend_fwd
-        swa_o_bf16, lse_raw = hsa_swa_extend_fwd(
+        swa_o, lse_raw = hsa_swa_extend_fwd(
             q_hsa=q_hsa,
             k_cache_hsa=pool_k,
             v_cache_hsa=pool_v,
@@ -1403,7 +1403,10 @@ class HSAAttnBackend(AttentionBackend):
             page_size=page_size,
             sm_scale=sm_scale,
         )
-        swa_o = swa_o_bf16.to(torch.float32)
+        # R66: keep swa_o in bf16 — the fusion at forward_extend step 7 mixes
+        # it with bf16 out_hsa anyway, so the .to(fp32) here just burned
+        # 64MB of memory bandwidth per layer for nothing. Skipping saves
+        # ~1GB of memory traffic per 16K prefill (16 layers).
 
         # --- Aggregate per-q-head LSE to per-kv-head ---
         lse_per_group = lse_raw.view(T, H_hsa, Gh)
@@ -2335,7 +2338,11 @@ class HSAAttnBackend(AttentionBackend):
                 .reshape(T, HQ_hsa)
             )
         if swa_w_q is not None:
-            out_hsa = out_hsa.to(torch.float32) + swa_o_inner * swa_w_q[:, :, None]
+            # R66: do the fusion in bf16 — swa_o_inner is now bf16 (was forced
+            # fp32 pre-R66), out_hsa is bf16 from the sparse kernel, swa_w_q is
+            # bf16 from softmax. bf16 + bf16*bf16 stays bf16; saves a (T,
+            # HQ_hsa, D) fp32 buffer per layer plus the cast-back at line 2341.
+            out_hsa = torch.addcmul(out_hsa, swa_o_inner, swa_w_q[:, :, None])
 
         # Step 8: Write HSA heads into the pre-allocated output tensor.
         dense_out_3[:, HQ_swa:, :] = out_hsa.to(dense_out_3.dtype)
