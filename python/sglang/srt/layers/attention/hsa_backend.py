@@ -20,6 +20,7 @@ from sglang.srt.layers.attention.hsa.kernels.cuda_graph_buffers import (
     update_hsa_cg_buffers,
 )
 from sglang.srt.layers.attention.hsa.metadata import HSAMetadata
+from sglang.srt.mem_cache.landmark_pool import LandmarkLmkKPool, ReqToChunkPool
 from sglang.srt.layers.attention.hsa.selector import (
     _online_topk_group,
     _online_topk_head_maxpool,
@@ -135,14 +136,71 @@ class HSAAttnBackend(AttentionBackend):
         self._dense_backend = TritonAttnBackend(model_runner, **kwargs)
         self.forward_metadata: Optional[HSAMetadata] = None
 
-        # Per-q-head lmk_k pools.  Optional — populated externally (e.g. by
-        # dev/align/compare.py or a server scaffold for the qwen_lhsa /
-        # high-GQA variants).  When set, the HSA layer's prefill writes
-        # chunk-aggregated lmk_k here and the selector reads from it instead
-        # of synthesising from last-token-K in the KV cache.  None disables
-        # the path entirely → selector uses the existing shared-K behaviour.
+        # R52: auto-init per-q-head lmk_k pools when the config asks for the
+        # chunk_attn_pool path. Previously these stayed None in production
+        # sglang and `_maybe_write_chunk_lmk_k` returned early — silently
+        # disabling all of R47 (slot reuse), R48 (prior_b), and R51 (decode
+        # chunk write). The pools are only set externally by dev/align tests,
+        # which is why alignment tests PASSed while production diverged.
         self.lmk_k_pool = None
         self.req_to_chunk_pool = None
+        # Resolve config: prefer model.config (works for both production
+        # model_runner and the SimpleNamespace mock used by dev/align/compare.py).
+        _hsa_cfg = getattr(getattr(model_runner, "model", None), "config", None)
+        if _hsa_cfg is None:
+            _mc = getattr(model_runner, "model_config", None)
+            _hsa_cfg = getattr(_mc, "hf_text_config", _mc)
+        if _hsa_cfg is not None and bool(getattr(_hsa_cfg, "enable_prior_query", False)) and bool(
+            getattr(_hsa_cfg, "enable_lmk_q_proj", False)
+        ):
+            cfg = _hsa_cfg
+            try:
+                num_layers = int(getattr(cfg, "num_hidden_layers", 1))
+                h_q = int(getattr(cfg, "num_attention_heads"))
+                head_dim = int(
+                    getattr(cfg, "head_dim", getattr(cfg, "hidden_size") // h_q)
+                )
+                max_total_tokens = int(
+                    getattr(model_runner, "max_total_num_tokens", 0) or 0
+                )
+                if max_total_tokens <= 0:
+                    server_args = getattr(model_runner, "server_args", None)
+                    max_total_tokens = int(
+                        getattr(server_args, "max_total_tokens", None) or 131072
+                    )
+                max_chunks_per_req = max(
+                    max_total_tokens // int(self.page_size) + 4, 4
+                )
+                req_pool = getattr(model_runner, "req_to_token_pool", None)
+                req_pool_size = int(getattr(req_pool, "size", 1) or 1)
+                num_chunk_slots = max(
+                    max_total_tokens // int(self.page_size) + req_pool_size + 4, 4
+                )
+                self.lmk_k_pool = LandmarkLmkKPool(
+                    num_chunk_slots=num_chunk_slots,
+                    num_layers=num_layers,
+                    h_q=h_q,
+                    head_dim=head_dim,
+                    dtype=torch.bfloat16,
+                    device=self.device,
+                )
+                self.req_to_chunk_pool = ReqToChunkPool(
+                    num_reqs=req_pool_size,
+                    max_chunks_per_req=max_chunks_per_req,
+                    device=self.device,
+                )
+                if os.environ.get("SGLANG_HSA_ALIGN_DEBUG", "0") == "1":
+                    print(
+                        f"[HSA-align] init lmk_k_pool slots={num_chunk_slots}, "
+                        f"layers={num_layers}, h_q={h_q}, head_dim={head_dim}, "
+                        f"req_pool={req_pool_size}, "
+                        f"max_chunks_per_req={max_chunks_per_req}",
+                        flush=True,
+                    )
+            except Exception as e:
+                logger.warning("Failed to initialize HSA lmk_k_pool: %s", e)
+                self.lmk_k_pool = None
+                self.req_to_chunk_pool = None
         # When per_qhead is active, the selector also computes per-q-head
         # scores (gathered at the chunks selected by max-over-G) and the SWA
         # branch exposes per-q-head LSE.  These are consumed by the
