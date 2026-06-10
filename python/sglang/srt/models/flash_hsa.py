@@ -1137,9 +1137,20 @@ class FlashHSAInnerXHierarchicalSparseAttention(nn.Module):
             and not bool(getattr(self.config, "nope_retrieval", False))
             and sel_q.shape[-1] == self.head_dim
         ):
-            sel_q, _ = self.rotary_emb(
-                positions, sel_q.contiguous(), torch.empty_like(sel_q)
-            )
+            # R84: rotary_emb takes a key tensor it RoPE's alongside the query;
+            # the selector path has no key, so we passed torch.empty_like(sel_q)
+            # as a dummy — the kernel ran an unnecessary RoPE on it AND we
+            # allocated a fresh buffer every layer. A [T, 0]-shape key both
+            # skips the wasted kernel work and is essentially free to allocate.
+            # Cache it on forward_batch so layers 1-15 reuse it.
+            dummy_key = getattr(forward_batch, "_hsa_rope_dummy_key", None)
+            if dummy_key is None or dummy_key.shape[0] != sel_q.shape[0]:
+                dummy_key = torch.empty(
+                    (sel_q.shape[0], 0), dtype=sel_q.dtype, device=sel_q.device
+                )
+                forward_batch._hsa_rope_dummy_key = dummy_key
+            sel_q_contig = sel_q if sel_q.is_contiguous() else sel_q.contiguous()
+            sel_q, _ = self.rotary_emb(positions, sel_q_contig, dummy_key)
 
         # Concatenate heads into the single KV cache layout: [SWA | HSA].
         if unified_path:
