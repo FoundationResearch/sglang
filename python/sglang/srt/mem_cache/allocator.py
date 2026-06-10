@@ -226,16 +226,27 @@ def alloc_extend_kernel(
         - (pre_len + page_size - 1) // page_size * page_size
     )
 
-    offset_many_page = tl.arange(0, max_num_extend_tokens)
-    page_start = tl.load(
-        free_page_ptr + new_page_start_loc + offset_many_page // page_size,
-        mask=offset_many_page < num_part2,
-    )
-    tl.store(
-        out_indices + output_start_loc + num_part1 + offset_many_page,
-        page_start * page_size + offset_many_page % page_size,
-        mask=offset_many_page < num_part2,
-    )
+    # Fill in BLOCK_FILL-sized tiles via a RUNTIME loop, rather than one
+    # tl.arange(0, max_num_extend_tokens). A single arange over the full extend
+    # makes max_num_extend_tokens a compile-time tile width, so a one-shot
+    # prefill of a very long sequence (e.g. 512K tokens) bakes a 2^19-wide
+    # register tensor that hangs ptxas. The tiled loop keeps the compiled tile
+    # fixed (BLOCK_FILL) and scales iteration count at runtime — identical
+    # indices, just computed in chunks.
+    BLOCK_FILL: tl.constexpr = 2048
+    num_chunks = (num_part2 + BLOCK_FILL - 1) // BLOCK_FILL
+    for c in range(0, num_chunks):
+        offset_many_page = c * BLOCK_FILL + tl.arange(0, BLOCK_FILL)
+        fill_mask = offset_many_page < num_part2
+        page_start = tl.load(
+            free_page_ptr + new_page_start_loc + offset_many_page // page_size,
+            mask=fill_mask,
+        )
+        tl.store(
+            out_indices + output_start_loc + num_part1 + offset_many_page,
+            page_start * page_size + offset_many_page % page_size,
+            mask=fill_mask,
+        )
     if pre_len + num_part1 + num_part2 == seq_len:
         return
 

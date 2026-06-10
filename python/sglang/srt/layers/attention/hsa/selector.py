@@ -8,7 +8,103 @@ from typing import Optional, Tuple
 
 import torch
 
+try:
+    import triton
+    import triton.language as tl
+except Exception:  # pragma: no cover
+    triton = None
+    tl = None
+
 logger = logging.getLogger(__name__)
+
+
+if triton is not None:
+
+    @triton.jit
+    def _pqh_score_maxpool_kernel(
+        Q_ptr,          # [B, h_q, D]  (q dtype, e.g. bf16)
+        CAND_ptr,       # [B, C, h_q, D]  (bf16)
+        PRIOR_ptr,      # [B, C, h_q]  fp32 (or dummy when not USE_PRIOR)
+        MASK_ptr,       # [B, C]  bool/int8
+        SPQH_ptr,       # [B, h_q, C]  fp32  (out: per-q-head scores)
+        SKV_ptr,        # [B, h_kv, C] fp32  (out: max-over-G, masked)
+        sm_scale: tl.constexpr,
+        C: tl.constexpr, D: tl.constexpr, G: tl.constexpr, HQ: tl.constexpr,
+        s_qb: tl.constexpr, s_qh: tl.constexpr,
+        s_cb: tl.constexpr, s_cc: tl.constexpr, s_ch: tl.constexpr,
+        s_pb: tl.constexpr, s_pc: tl.constexpr,
+        s_spb: tl.constexpr, s_sph: tl.constexpr,
+        s_skb: tl.constexpr, s_skh: tl.constexpr,
+        BLOCK_C: tl.constexpr, USE_PRIOR: tl.constexpr,
+    ):
+        """Fused per-q-head selection score: scores = (q·cand)*scale + prior,
+        then max over the G query heads sharing a kv head, masked by cand_mask.
+        Loads bf16 cand/q and accumulates in fp32 (identical to upcasting first,
+        since the pool stores bf16). Replaces 6 eager ops (2 casts + einsum +
+        permute/add + max + masked_fill) with one launch. Grid (B, h_kv, C-blk)."""
+        pid_b = tl.program_id(0)
+        pid_kv = tl.program_id(1)
+        pid_c = tl.program_id(2)
+        offs_c = pid_c * BLOCK_C + tl.arange(0, BLOCK_C)
+        c_in = offs_c < C
+        offs_d = tl.arange(0, D)
+        cmask = tl.load(MASK_ptr + pid_b * C + offs_c, mask=c_in, other=0).to(tl.int1)
+        running = tl.full((BLOCK_C,), -float("inf"), dtype=tl.float32)
+        for g in range(0, G):
+            hq = pid_kv * G + g
+            q = tl.load(Q_ptr + pid_b * s_qb + hq * s_qh + offs_d).to(tl.float32)  # [D]
+            cptr = (CAND_ptr + pid_b * s_cb + offs_c[:, None] * s_cc
+                    + hq * s_ch + offs_d[None, :])
+            cand = tl.load(cptr, mask=c_in[:, None], other=0.0).to(tl.float32)  # [BLOCK_C, D]
+            s = tl.sum(cand * q[None, :], axis=1) * sm_scale  # [BLOCK_C]
+            if USE_PRIOR:
+                s += tl.load(PRIOR_ptr + pid_b * s_pb + offs_c * s_pc + hq,
+                             mask=c_in, other=0.0).to(tl.float32)
+            tl.store(SPQH_ptr + pid_b * s_spb + hq * s_sph + offs_c, s, mask=c_in)
+            running = tl.maximum(running, s)
+        running = tl.where(cmask, running, -float("inf"))
+        tl.store(SKV_ptr + pid_b * s_skb + pid_kv * s_skh + offs_c, running, mask=c_in)
+
+
+def _pqh_score_maxpool(q_3, cand_repr, per_qhead_prior_b, cand_mask, sm_scale, G, h_kv):
+    """Driver for _pqh_score_maxpool_kernel. Returns (scores_pqh [B,h_q,C] fp32,
+    scores_kv_sel [B,h_kv,C] fp32 masked)."""
+    B, h_q, D = q_3.shape
+    C = cand_repr.shape[1]
+    q_c = q_3 if q_3.is_contiguous() else q_3.contiguous()
+    cand_c = cand_repr if cand_repr.is_contiguous() else cand_repr.contiguous()
+    scores_pqh = torch.empty((B, h_q, C), device=q_3.device, dtype=torch.float32)
+    scores_kv = torch.empty((B, h_kv, C), device=q_3.device, dtype=torch.float32)
+    use_prior = per_qhead_prior_b is not None
+    if use_prior:
+        prior = per_qhead_prior_b if per_qhead_prior_b.is_contiguous() else per_qhead_prior_b.contiguous()
+    else:
+        prior = scores_pqh  # dummy
+    mask_i8 = cand_mask.to(torch.int8)
+    # Occupancy-adaptive block: batch-1 decode has only B*h_kv "rows", so the only
+    # parallelism is over C. Size BLOCK_C to target ~256 programs (≈2×SM count),
+    # clamped to [8, 64]. Short context (small C) → small block → many programs;
+    # long context → larger block so each program amortises its q-load over more c.
+    import os as _os
+    _bc_env = _os.getenv("HSA_PQH_BLOCK_C")
+    if _bc_env is not None:
+        BLOCK_C = int(_bc_env)
+    else:
+        target_blocks = max(1, 256 // max(1, B * h_kv))
+        BLOCK_C = (C + target_blocks - 1) // target_blocks
+        BLOCK_C = max(8, min(64, triton.next_power_of_2(BLOCK_C)))
+    grid = (B, h_kv, (C + BLOCK_C - 1) // BLOCK_C)
+    _pqh_score_maxpool_kernel[grid](
+        q_c, cand_c, prior, mask_i8, scores_pqh, scores_kv,
+        float(sm_scale), C, D, G, h_q,
+        q_c.stride(0), q_c.stride(1),
+        cand_c.stride(0), cand_c.stride(1), cand_c.stride(2),
+        prior.stride(0) if use_prior else 0, prior.stride(1) if use_prior else 0,
+        scores_pqh.stride(0), scores_pqh.stride(1),
+        scores_kv.stride(0), scores_kv.stride(1),
+        BLOCK_C=BLOCK_C, USE_PRIOR=use_prior, num_warps=4,
+    )
+    return scores_pqh, scores_kv
 
 # 尝试导入 fused online topk kernel（优先路径），失败则 fallback 到 torch topk
 _online_topk_group = None
@@ -332,30 +428,36 @@ def select_topk_pages_decode_fused(
         #     scores where sel_pages < 0.
         # Net: ~10 fewer launches per layer × 16 layers ≈ 160 launches/step.
         eff_topk = min(int(topk), int(C_c))
-        q_3 = q_4d.view(B_c, h_q_c, D_c).float()                              # [B, h_q, D]
-        cand_f = cand_repr.float()                                            # [B, C, h_q, D]
-        scores_pqh = torch.einsum("bhd,bchd->bhc", q_3, cand_f) * sm_scale_ref  # [B, h_q, C]
-        # R48 (Item #6): add entropy bias to per-q-head scores. With R47
-        # (proper multi-layer slot reuse) the bias is consistent with the
-        # official's chunk_attn_pool output.  prior_b_pool is fp32, matches.
-        if per_qhead_prior_b is not None:
-            scores_pqh.add_(per_qhead_prior_b.permute(0, 2, 1))
-        # Selection scores: max over G  → [B, h_kv, C]
-        scores_kv_sel = scores_pqh.view(B_c, h_kv_c, G, C_c).max(dim=2).values
-        # In-place mask via cand_mask (broadcast cheaply, no expand+reshape needed).
-        scores_kv_sel.masked_fill_(
-            ~cand_mask.unsqueeze(1),  # [B, 1, C] — broadcast against [B, h_kv, C]
-            float("-inf"),
-        )
-        _, topk_idx_kv = scores_kv_sel.topk(eff_topk, dim=-1)                # [B, h_kv, K] int64
-        # No torch.sort — chunk_weight handles arbitrary order.
+        # R75: fuse the 6-op score chain (2 casts + einsum + prior add + max-over-G
+        # + masked_fill) into one Triton launch. cand_repr is already bf16 in the
+        # pool, so the kernel's bf16-load/fp32-accumulate is bit-identical to the
+        # old .float()-then-fp32-einsum, while skipping the ~2MB/layer fp32 copy
+        # and cutting decode kernel count (the CG-decode wall-time bottleneck).
+        # R48: entropy bias (prior_b) is added per q-head inside the kernel.
+        q_3v = q_4d.view(B_c, h_q_c, D_c)                                      # [B, h_q, D]
+        if triton is not None:
+            scores_pqh, scores_kv_sel = _pqh_score_maxpool(
+                q_3v, cand_repr, per_qhead_prior_b, cand_mask,
+                sm_scale_ref, G, h_kv_c,
+            )
+        else:  # pragma: no cover — torch fallback
+            scores_pqh = torch.einsum(
+                "bhd,bchd->bhc", q_3v.float(), cand_repr.float()
+            ) * sm_scale_ref
+            if per_qhead_prior_b is not None:
+                scores_pqh.add_(per_qhead_prior_b.permute(0, 2, 1))
+            scores_kv_sel = scores_pqh.view(B_c, h_kv_c, G, C_c).max(dim=2).values
+            scores_kv_sel.masked_fill_(~cand_mask.unsqueeze(1), float("-inf"))
+        # R76: keep the topk VALUES (== gather(scores_kv_sel, topk_idx_kv)) instead
+        # of discarding then re-gathering them — saves one gather/layer. sorted=False
+        # since chunk_weight iterates by k_offs, not chunk order (value/index pairs
+        # stay matched regardless of sorting).
+        scores_kv_out, topk_idx_kv = scores_kv_sel.topk(eff_topk, dim=-1, sorted=False)  # [B,h_kv,K]
         # Per-q-head scores: gather with the h_kv→h_q broadcast.
         topk_idx_hq = topk_idx_kv.unsqueeze(2).expand(B_c, h_kv_c, G, eff_topk).reshape(
             B_c, h_q_c, eff_topk
         )
         scores_hq = torch.gather(scores_pqh, dim=-1, index=topk_idx_hq)
-        # h_kv selection scores at the topk indices.
-        scores_kv_out = torch.gather(scores_kv_sel, dim=-1, index=topk_idx_kv)
         if eff_topk < int(topk):
             # Cold path: very short context. Pad to topk size and mask invalids.
             pad = int(topk) - eff_topk
