@@ -385,13 +385,20 @@ def hsa_decode_reduce_kernel(
 def _pick_split_k(B: int, HQ: int, TOPK: int, num_sms: int = 132) -> int:
     """Pick a SPLIT_K that uses the GPU well without over-shooting.
 
-    Aim for B*HQ*SPLIT_K ≈ num_sms (slightly under).  TOPK must be divisible
-    by SPLIT_K for the simple per-split iteration count.
+    Aim for B*HQ*SPLIT_K up to ~2x num_sms.  TOPK must be divisible by SPLIT_K
+    for the simple per-split iteration count.  `HSA_DECODE_SPLIT` overrides.
     """
+    import os
+    _env = os.getenv("HSA_DECODE_SPLIT")
+    if _env is not None:
+        s = int(_env)
+        return s if (s >= 1 and TOPK % s == 0) else 1
     if B * HQ >= num_sms:
         return 1
-    # Find the largest divisor of TOPK such that B*HQ*split <= ~2x num_sms.
-    target = max(num_sms // (B * HQ), 1)
+    # H200 tuning: allow B*HQ*split up to ~2x num_sms (matches the docstring and
+    # the prior fixed split=16).  At B*HQ=16 on 132 SMs this picks 16, measured
+    # ~3% faster than the 8 the old 1x target gave (16K decode 3.74→3.62ms).
+    target = max(2 * num_sms // (B * HQ), 1)
     best = 1
     for s in (16, 8, 4, 2, 1):
         if TOPK % s == 0 and s <= target:
