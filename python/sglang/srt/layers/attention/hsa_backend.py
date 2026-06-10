@@ -1775,17 +1775,17 @@ class HSAAttnBackend(AttentionBackend):
                 )
                 fused_indices = fused_indices_mp.to(torch.int32)         # [1, T, h_kv, K]
                 # R81: keep scores in their native dtype (bf16 from maxpool).
-                # fused_chunk_weight_per_qhead_decode now accepts bf16 scores
-                # via SCORES_IS_BF16 — saves the per-layer fp32 cast.
                 scores_hq_sel_t = scores_hq_mp.squeeze(0)  # [T, h_q, K] bf16
-                T_q_mp = q_sel_3.shape[0]
-                K_eff = int(fused_indices_mp.shape[-1])
-                # h_kv-level fused_scores: max over G of per-q-head scores at selected K
-                # (matching the slow path's topk_scores_kv semantics).
-                scores_kv_sel_t = (
-                    scores_hq_sel_t.view(T_q_mp, h_kv_e, G_e, K_eff).max(dim=2).values
-                )
-                fused_scores = scores_kv_sel_t.unsqueeze(0).to(torch.float32)
+                # R85: skip the per-layer max-over-G that built `fused_scores`.
+                # forward_extend's per_qhead_fusion branch consumes
+                # `_last_per_qhead_scores_extend` directly, never reading
+                # `md.hsa_ext_selected_scores` from this path. The legacy
+                # h_kv branch (only active when per_qhead_scores is None,
+                # i.e. not maxpool) doesn't run here. Stash `fused_indices`
+                # as a stand-in score tensor — it satisfies the None-check
+                # and keeps shape compatible. Saves max + cast + cast + cast
+                # + unsqueeze per layer (~80us CPU dispatch * 16 layers).
+                fused_scores = fused_indices
                 self._last_per_qhead_scores_extend = scores_hq_sel_t
             else:
                 # ---- Pure-PyTorch fallback (default, headwise_topk_softmax=True) ----
