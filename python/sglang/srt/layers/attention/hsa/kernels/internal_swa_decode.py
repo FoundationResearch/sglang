@@ -26,6 +26,11 @@ BLOCK_W chunks and maintains running (max, sum, output) state for
 numerical-stable online softmax.
 
 LMK exclusion happens inside the kernel via `(pos+1) % page_size != 0`.
+
+R88: optional split-W parallelism — grid becomes (B*HQ_hsa, SPLIT_W) so we
+can use ~140 SMs instead of just 16.  Each split walks its share of the
+W blocks and writes a partial (m, l, acc) tuple; a small reduce kernel
+combines them via the online-softmax merge.
 """
 from __future__ import annotations
 
@@ -41,8 +46,10 @@ def fused_internal_swa_decode_kernel(
     v_cache_ptr,          # [Nloc*H_total*D] bf16
     page_table_1_ptr,     # [B*max_seqlen] int32
     cache_seqlens_ptr,    # [B] int32
-    swa_o_ptr,            # [B*HQ_hsa*D] fp32  (output)
-    lse_hq_ptr,           # [B*HQ_hsa]    bf16 (output)
+    swa_o_ptr,            # [B*HQ_hsa*D] fp32  (output; SPLIT_W==1 path) OR
+                          # [B*HQ_hsa*SPLIT_W*D] fp32 (partial accumulators; SPLIT_W>1)
+    lse_hq_ptr,           # [B*HQ_hsa]    bf16 (output; SPLIT_W==1 path) OR
+                          # [B*HQ_hsa*SPLIT_W*2] fp32 (partial (m, l); SPLIT_W>1)
     sm_scale,
     H_swa: tl.constexpr,
     H_hsa: tl.constexpr,
@@ -54,9 +61,12 @@ def fused_internal_swa_decode_kernel(
     hsa_window: tl.constexpr,
     BLOCK_W: tl.constexpr,
     NUM_W_BLOCKS: tl.constexpr,
+    SPLIT_W: tl.constexpr,
+    BLOCKS_PER_SPLIT: tl.constexpr,
 ):
-    """One program per (b, hq). Streaming flash attention over the window."""
+    """One program per (b, hq, split). Streaming flash attention over the window."""
     pid = tl.program_id(axis=0)
+    pid_split = tl.program_id(axis=1)
     b = pid // HQ_hsa
     hq = pid % HQ_hsa
 
@@ -80,7 +90,11 @@ def fused_internal_swa_decode_kernel(
     l_i = tl.zeros([], tl.float32)  # running sum of exp(logit - m)
     acc = tl.zeros([D], tl.float32)
 
-    for w_idx in tl.static_range(NUM_W_BLOCKS):
+    # R88: each split processes its slice of NUM_W_BLOCKS.
+    w_start = pid_split * BLOCKS_PER_SPLIT
+    w_end = tl.minimum(w_start + BLOCKS_PER_SPLIT, NUM_W_BLOCKS)
+
+    for w_idx in range(w_start, w_end):
         w_block_start = w_idx * BLOCK_W
         w_offs_in_window = w_block_start + tl.arange(0, BLOCK_W)
         w_global = chunk_start_pos + w_offs_in_window  # absolute positions
@@ -122,15 +136,86 @@ def fused_internal_swa_decode_kernel(
         l_i = l_i * alpha + block_sum
         m_i = m_new
 
-    # Finalise — guard against all-masked window (l_i == 0).
-    safe_l = tl.where(l_i > 0.0, l_i, 1.0)
+    if SPLIT_W == 1:
+        # Single-split path: finalize in-kernel.
+        safe_l = tl.where(l_i > 0.0, l_i, 1.0)
+        o = acc / safe_l
+        # When the window is empty, output stays at 0 (init) and lse stays at -inf.
+        o = tl.where(l_i > 0.0, o, 0.0)
+        lse = tl.where(l_i > 0.0, m_i + tl.log(l_i), float("-inf"))
+        tl.store(swa_o_ptr + (b * HQ_hsa + hq) * D + d_offs, o)
+        tl.store(lse_hq_ptr + b * HQ_hsa + hq, lse.to(tl.bfloat16))
+    else:
+        # Partial output: write (m_i, l_i, acc) so the reduce kernel can merge.
+        # Layout per (b, hq):
+        #   swa_o_ptr     : [B, HQ, SPLIT_W, D] fp32   (partial acc, unnormalized)
+        #   lse_hq_ptr    : [B, HQ, SPLIT_W, 2] fp32   ((m, l) pair per split)
+        out_off = ((b * HQ_hsa + hq) * SPLIT_W + pid_split) * D + d_offs
+        tl.store(swa_o_ptr + out_off, acc)
+        ml_off = ((b * HQ_hsa + hq) * SPLIT_W + pid_split) * 2
+        tl.store(lse_hq_ptr + ml_off + 0, m_i)
+        tl.store(lse_hq_ptr + ml_off + 1, l_i)
+
+
+@triton.jit
+def fused_internal_swa_decode_reduce_kernel(
+    partial_o_ptr,        # [B, HQ_hsa, SPLIT_W, D] fp32
+    partial_ml_ptr,       # [B, HQ_hsa, SPLIT_W, 2] fp32 (m, l per split)
+    swa_o_ptr,            # [B, HQ_hsa, D] fp32     (final output)
+    lse_hq_ptr,           # [B, HQ_hsa]    bf16     (final logsumexp)
+    HQ_hsa: tl.constexpr,
+    D: tl.constexpr,
+    SPLIT_W: tl.constexpr,
+):
+    pid = tl.program_id(axis=0)
+    b = pid // HQ_hsa
+    hq = pid % HQ_hsa
+    d_offs = tl.arange(0, D)
+
+    # First pass: find global max m_global.
+    m_global = float("-inf")
+    for s in range(0, SPLIT_W):
+        ml_off = ((b * HQ_hsa + hq) * SPLIT_W + s) * 2
+        m_s = tl.load(partial_ml_ptr + ml_off)
+        m_global = tl.maximum(m_global, m_s)
+
+    # Second pass: rescale & sum.
+    l_global = tl.zeros([], tl.float32)
+    acc = tl.zeros([D], tl.float32)
+    for s in range(0, SPLIT_W):
+        ml_off = ((b * HQ_hsa + hq) * SPLIT_W + s) * 2
+        m_s = tl.load(partial_ml_ptr + ml_off + 0)
+        l_s = tl.load(partial_ml_ptr + ml_off + 1)
+        out_off = ((b * HQ_hsa + hq) * SPLIT_W + s) * D + d_offs
+        acc_s = tl.load(partial_o_ptr + out_off)
+
+        alpha = tl.exp(m_s - m_global)
+        l_global = l_global + l_s * alpha
+        acc = acc + acc_s * alpha
+
+    # Finalize.
+    safe_l = tl.where(l_global > 0.0, l_global, 1.0)
     o = acc / safe_l
-    # When the window is empty, output stays at 0 (init) and lse stays at -inf.
-    o = tl.where(l_i > 0.0, o, 0.0)
-    lse = tl.where(l_i > 0.0, m_i + tl.log(l_i), float("-inf"))
+    o = tl.where(l_global > 0.0, o, 0.0)
+    lse = tl.where(l_global > 0.0, m_global + tl.log(l_global), float("-inf"))
 
     tl.store(swa_o_ptr + (b * HQ_hsa + hq) * D + d_offs, o)
     tl.store(lse_hq_ptr + b * HQ_hsa + hq, lse.to(tl.bfloat16))
+
+
+def _pick_split_w(B: int, HQ_hsa: int, num_w_blocks: int, num_sms: int = 132) -> int:
+    """Pick SPLIT_W: cover SMs without going past num_w_blocks."""
+    if B * HQ_hsa >= num_sms or num_w_blocks <= 1:
+        return 1
+    target = max(num_sms // (B * HQ_hsa), 1)
+    # SPLIT_W shouldn't exceed num_w_blocks. Pick the smallest power-of-2
+    # split that uses enough SMs.
+    best = 1
+    for s in (8, 4, 2, 1):
+        if s <= target and s <= num_w_blocks:
+            best = s
+            break
+    return best
 
 
 def fused_internal_swa_decode(
@@ -177,14 +262,28 @@ def fused_internal_swa_decode(
     BLOCK_W = 128
     NUM_W_BLOCKS = (W_total + BLOCK_W - 1) // BLOCK_W
 
-    fused_internal_swa_decode_kernel[(B * HQ_hsa,)](
+    # R88: split-W decision.
+    split_w = _pick_split_w(B, HQ_hsa, NUM_W_BLOCKS)
+    blocks_per_split = (NUM_W_BLOCKS + split_w - 1) // split_w
+
+    if split_w == 1:
+        # No partial buffers needed; write directly to swa_o/lse_hq.
+        partial_o_ptr = swa_o
+        partial_ml_ptr = lse_hq  # ignored
+    else:
+        partial_o = torch.empty((B, HQ_hsa, split_w, D), device=device, dtype=torch.float32)
+        partial_ml = torch.empty((B, HQ_hsa, split_w, 2), device=device, dtype=torch.float32)
+        partial_o_ptr = partial_o
+        partial_ml_ptr = partial_ml
+
+    fused_internal_swa_decode_kernel[(B * HQ_hsa, split_w)](
         q_hsa.contiguous(),
         k_cache_full.contiguous(),
         v_cache_full.contiguous(),
         page_table_1.contiguous(),
         cache_seqlens.contiguous(),
-        swa_o,
-        lse_hq,
+        partial_o_ptr,
+        partial_ml_ptr,
         float(sm_scale),
         H_swa=int(H_swa),
         H_hsa=int(H_hsa),
@@ -196,7 +295,21 @@ def fused_internal_swa_decode(
         hsa_window=int(hsa_window),
         BLOCK_W=int(BLOCK_W),
         NUM_W_BLOCKS=int(NUM_W_BLOCKS),
+        SPLIT_W=int(split_w),
+        BLOCKS_PER_SPLIT=int(blocks_per_split),
         num_warps=4,
     )
+
+    if split_w > 1:
+        fused_internal_swa_decode_reduce_kernel[(B * HQ_hsa,)](
+            partial_o,
+            partial_ml,
+            swa_o,
+            lse_hq,
+            HQ_hsa=int(HQ_hsa),
+            D=int(D),
+            SPLIT_W=int(split_w),
+            num_warps=2,
+        )
 
     return swa_o, lse_hq

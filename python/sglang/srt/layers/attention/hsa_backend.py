@@ -1215,19 +1215,13 @@ class HSAAttnBackend(AttentionBackend):
                 )
                 swa_w_kv = None  # signal: use swa_w_q downstream
             elif hsa_window > 0:
-                # R18+R20+R27: fused legacy h_kv chunk_weight + GQA broadcast +
-                # HQ-granular swa_w output + inline logsumexp(lse_hq → lse_kv).
-                # R33: kernel accepts int32 OR int64 page_ids; no host-side cast.
-                w_q, swa_w_q = fused_chunk_weight_h_kv_decode(
-                    selected_scores=selected_scores,
-                    lse_hq=lse_hq_bf16,
-                    selected_page_ids=selected_page_ids if selected_page_ids.is_contiguous()
-                    else selected_page_ids.contiguous(),
-                    Gh=Gh,
-                    enable_softmax1=bool(self.enable_softmax1),
-                    out_dtype=q_hsa.dtype,
-                )
-                swa_w_kv = None  # use swa_w_q directly downstream
+                # R86: chunk-weight is folded into hsa_decode_paged_fwd's
+                # entry block (see hsa_decode.py INLINE_WEIGHTS).  We skip
+                # the standalone fused_chunk_weight_h_kv_decode kernel —
+                # 16 launches/step under CG at HSA-345M.
+                w_q = None
+                swa_w_q = None
+                swa_w_kv = None
             else:
                 # No internal SWA: independent softmax over scores.
                 valid = selected_page_ids >= 0
@@ -1253,19 +1247,43 @@ class HSAAttnBackend(AttentionBackend):
 
             k_cache_hsa = pool.get_key_buffer(layer.layer_id)[:, H_swa : H_swa + H_hsa, :]
             v_cache_hsa = pool.get_value_buffer(layer.layer_id)[:, H_swa : H_swa + H_hsa, :]
-            out_hsa = hsa_decode_paged_fwd(
-                q=q_hsa,
-                k_cache=k_cache_hsa,
-                v_cache=v_cache_hsa,
-                page_table_1=page_table_1,
-                selected_page_ids=selected_page_ids,
-                hsa_weights=w_q,
-                page_size=int(self.page_size),
-                sm_scale=getattr(layer, "scaling", None),
-                mask_last_token=True,
-                swa_o_inner=swa_o_inner if swa_w_q is not None else None,
-                swa_w_q=swa_w_q,
-            )  # [B, HQ_hsa, D] bf16 (blend already applied inside kernel)
+            # R86: when on the h_kv path (per_qhead_scores is None) AND
+            # internal-SWA is active (hsa_window > 0), pass selected_scores +
+            # lse_hq directly so the kernel computes weights + swa_w inline.
+            inline_h_kv = (
+                w_q is None
+                and (not per_qhead_fusion)
+                and hsa_window > 0
+            )
+            if inline_h_kv:
+                out_hsa = hsa_decode_paged_fwd(
+                    q=q_hsa,
+                    k_cache=k_cache_hsa,
+                    v_cache=v_cache_hsa,
+                    page_table_1=page_table_1,
+                    selected_page_ids=selected_page_ids,
+                    selected_scores=selected_scores,
+                    lse_hq=lse_hq_bf16,
+                    enable_softmax1=bool(self.enable_softmax1),
+                    page_size=int(self.page_size),
+                    sm_scale=getattr(layer, "scaling", None),
+                    mask_last_token=True,
+                    swa_o_inner=swa_o_inner,
+                )
+            else:
+                out_hsa = hsa_decode_paged_fwd(
+                    q=q_hsa,
+                    k_cache=k_cache_hsa,
+                    v_cache=v_cache_hsa,
+                    page_table_1=page_table_1,
+                    selected_page_ids=selected_page_ids,
+                    hsa_weights=w_q,
+                    page_size=int(self.page_size),
+                    sm_scale=getattr(layer, "scaling", None),
+                    mask_last_token=True,
+                    swa_o_inner=swa_o_inner if swa_w_q is not None else None,
+                    swa_w_q=swa_w_q,
+                )  # [B, HQ_hsa, D] bf16 (blend already applied inside kernel)
 
             # R34: HSA-345M has HQ_swa == 0 — skip the empty+slice-write that
             # otherwise copies out_hsa into a fresh out_all (≈2KB/layer × 16
