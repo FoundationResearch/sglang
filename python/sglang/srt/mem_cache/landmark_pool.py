@@ -123,15 +123,32 @@ class LandmarkLmkKPool:
         If ``prior_b`` (shape ``[n, h_q]``) is provided, write into the
         parallel prior_b_pool at the same slots.  Caller guarantees slots are
         real (>0) and distinct.
+
+        R82: skip dispatch-only .to() calls when dtype + device already match.
         """
         if slots.numel() == 0:
             return
-        idx = slots.to(self.pool.device, torch.int64)
-        v = values.to(dtype=self.pool.dtype, device=self.pool.device)
+        idx = (
+            slots
+            if (slots.dtype == torch.int64 and slots.device == self.pool.device)
+            else slots.to(self.pool.device, torch.int64)
+        )
+        v = (
+            values
+            if (values.dtype == self.pool.dtype and values.device == self.pool.device)
+            else values.to(dtype=self.pool.dtype, device=self.pool.device)
+        )
         # pool: [L, N+1, H, D]
         self.pool[int(layer_id)].index_copy_(0, idx, v)
         if prior_b is not None:
-            pb = prior_b.to(dtype=self.prior_b_pool.dtype, device=self.prior_b_pool.device)
+            pb = (
+                prior_b
+                if (prior_b.dtype == self.prior_b_pool.dtype
+                    and prior_b.device == self.prior_b_pool.device)
+                else prior_b.to(
+                    dtype=self.prior_b_pool.dtype, device=self.prior_b_pool.device
+                )
+            )
             self.prior_b_pool[int(layer_id)].index_copy_(0, idx, pb)
 
     def get(self, layer_id: int, slots: torch.Tensor) -> torch.Tensor:
@@ -204,10 +221,18 @@ class ReqToChunkPool:
     def gather_slots(self, req_idx: torch.Tensor, chunk_ids: torch.Tensor) -> torch.Tensor:
         """For batch ``req_idx`` shape ``[B]`` and ``chunk_ids`` shape ``[B, C]``
         (-1 sentinel for padded entries), return slot ids shape ``[B, C]``.
-        Out-of-range chunks return 0 (padding slot)."""
-        r = req_idx.to(self.device, torch.int64).view(-1, 1).expand(-1, chunk_ids.shape[1])
-        c = chunk_ids.to(self.device, torch.int64).clamp(min=0)
-        slots = self.req_to_chunk_slot[r, c]
+        Out-of-range chunks return 0 (padding slot).
+
+        R82: skip the .to() dispatches when dtype + device already match.
+        """
+        if req_idx.dtype != torch.int64 or req_idx.device != self.device:
+            req_idx = req_idx.to(self.device, torch.int64)
+        r = req_idx.view(-1, 1).expand(-1, chunk_ids.shape[1])
+        if chunk_ids.dtype != torch.int64 or chunk_ids.device != self.device:
+            c_i64 = chunk_ids.to(self.device, torch.int64).clamp(min=0)
+        else:
+            c_i64 = chunk_ids.clamp(min=0)
+        slots = self.req_to_chunk_slot[r, c_i64]
         # Mask out padded chunks (chunk_id < 0) -> 0
         valid = (chunk_ids >= 0).to(slots.dtype)
         return slots * valid

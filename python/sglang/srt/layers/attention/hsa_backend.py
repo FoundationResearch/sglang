@@ -2186,7 +2186,14 @@ class HSAAttnBackend(AttentionBackend):
         # When HQ_swa == 0 (all heads are HSA, e.g. hsa_denom=1), skip this step.
         H_total = int(layer.tp_k_head_num)
 
-        dense_out_3 = torch.empty((T, HQ_total, D), device=q.device, dtype=q.dtype)
+        # R83: HSA-345M has HQ_swa==0 — skip the dense_out_3 alloc + slice-write
+        # of out_hsa into it, mirroring R34's decode fast path. Per layer saves
+        # 1 empty + 1 slice copy (~7us CPU + 50us CUDA each).
+        dense_out_3 = (
+            torch.empty((T, HQ_total, D), device=q.device, dtype=q.dtype)
+            if HQ_swa > 0
+            else None
+        )
 
         if HQ_swa > 0 and H_swa > 0:
             # We call the triton kernel directly with head-sliced tensor views,
@@ -2271,6 +2278,9 @@ class HSAAttnBackend(AttentionBackend):
         if selected_page_ids is None or selected_scores is None:
             # No selection results (e.g. all tokens at early positions).
             # HSA heads uninitialized; zero them.
+            if dense_out_3 is None:
+                out_hsa_zero = torch.zeros((T, HQ_hsa, D), device=q.device, dtype=q.dtype)
+                return out_hsa_zero.reshape(T, HQ_total * D)
             dense_out_3[:, HQ_swa:, :] = 0
             return dense_out_3.reshape(T, HQ_total * D)
 
@@ -2406,5 +2416,9 @@ class HSAAttnBackend(AttentionBackend):
         )  # [T, HQ_hsa, D] bf16, SWA blend already applied if requested
 
         # Step 8: Write HSA heads into the pre-allocated output tensor.
+        # R83: when HQ_swa==0, out_hsa already covers all heads — return
+        # directly without the empty+slice-write.
+        if dense_out_3 is None:
+            return out_hsa.reshape(T, HQ_total * D)
         dense_out_3[:, HQ_swa:, :] = out_hsa.to(dense_out_3.dtype)
         return dense_out_3.reshape(T, HQ_total * D)
