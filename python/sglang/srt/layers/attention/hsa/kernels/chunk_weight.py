@@ -23,7 +23,7 @@ import triton.language as tl
 
 @triton.jit
 def fused_chunk_weight_per_qhead_kernel(
-    scores_ptr,           # [B, HQ, TOPK]  float32
+    scores_ptr,           # [B, HQ, TOPK]  bf16 OR float32
     lse_ptr,              # [B, HQ]        bf16 OR float32
     selected_pages_ptr,   # [B, H, TOPK]   int32  (>=0 means valid)
     w_q_ptr,              # [B, HQ, TOPK]  bf16   (output)
@@ -34,6 +34,7 @@ def fused_chunk_weight_per_qhead_kernel(
     TOPK: tl.constexpr,
     SOFTMAX1: tl.constexpr,
     LSE_IS_BF16: tl.constexpr,
+    SCORES_IS_BF16: tl.constexpr,
     BLOCK_K: tl.constexpr,
 ):
     pid = tl.program_id(axis=0)
@@ -44,12 +45,19 @@ def fused_chunk_weight_per_qhead_kernel(
     k_offs = tl.arange(0, BLOCK_K)
     k_mask = k_offs < TOPK
 
-    # Load per-q-head scores (float32).
-    scores = tl.load(
-        scores_ptr + (b * HQ + hq) * TOPK + k_offs,
-        mask=k_mask,
-        other=float("-inf"),
-    )
+    # R81: accept bf16 OR fp32 scores. Cast to fp32 for numerical stability.
+    if SCORES_IS_BF16:
+        scores = tl.load(
+            scores_ptr + (b * HQ + hq) * TOPK + k_offs,
+            mask=k_mask,
+            other=float("-inf"),
+        ).to(tl.float32)
+    else:
+        scores = tl.load(
+            scores_ptr + (b * HQ + hq) * TOPK + k_offs,
+            mask=k_mask,
+            other=float("-inf"),
+        )
 
     # Valid mask: derived from selected_page_ids >= 0 (broadcast h_kv -> h_q).
     sel_pages = tl.load(
@@ -261,7 +269,10 @@ def fused_chunk_weight_per_qhead_decode(
     w_q     : [B, HQ_hsa, TOPK] bf16    (chunk weights for hsa_decode_paged_fwd)
     swa_w_q : [B, HQ_hsa]      float32  (SWA blend weight)
     """
-    assert per_qhead_scores.dtype == torch.float32, per_qhead_scores.dtype
+    # R81: accept bf16 OR fp32 scores. fp32 was forced before, but the
+    # maxpool selector produces bf16 scores — let us skip a .to(fp32) cast
+    # in the caller (saves ~1 dispatch per layer).
+    assert per_qhead_scores.dtype in (torch.float32, torch.bfloat16), per_qhead_scores.dtype
     assert per_qhead_scores.is_contiguous(), "per_qhead_scores must be contiguous"
     assert selected_page_ids.dtype == torch.int32, selected_page_ids.dtype
     assert selected_page_ids.is_contiguous(), "selected_page_ids must be contiguous"
@@ -295,6 +306,7 @@ def fused_chunk_weight_per_qhead_decode(
         TOPK=TOPK,
         SOFTMAX1=bool(enable_softmax1),
         LSE_IS_BF16=(lse_contig.dtype == torch.bfloat16),
+        SCORES_IS_BF16=(per_qhead_scores.dtype == torch.bfloat16),
         BLOCK_K=BLOCK_K,
         num_warps=4,
     )

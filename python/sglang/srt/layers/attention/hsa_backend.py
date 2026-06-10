@@ -1774,7 +1774,10 @@ class HSAAttnBackend(AttentionBackend):
                     is_training=False,
                 )
                 fused_indices = fused_indices_mp.to(torch.int32)         # [1, T, h_kv, K]
-                scores_hq_sel_t = scores_hq_mp.squeeze(0).to(torch.float32)  # [T, h_q, K]
+                # R81: keep scores in their native dtype (bf16 from maxpool).
+                # fused_chunk_weight_per_qhead_decode now accepts bf16 scores
+                # via SCORES_IS_BF16 — saves the per-layer fp32 cast.
+                scores_hq_sel_t = scores_hq_mp.squeeze(0)  # [T, h_q, K] bf16
                 T_q_mp = q_sel_3.shape[0]
                 K_eff = int(fused_indices_mp.shape[-1])
                 # h_kv-level fused_scores: max over G of per-q-head scores at selected K
@@ -2379,10 +2382,11 @@ class HSAAttnBackend(AttentionBackend):
                 .reshape(T, HQ_hsa)
                 .contiguous()
             )
+        # R81: kernel internally casts loaded swa_w_q to fp32 (see hsa_extend.py
+        # BLEND_SWA epilogue). Pass it in its native fp32 dtype — saves a
+        # per-layer .to(bf16) cast.
         blend_swa_in_kernel = swa_w_q is not None
-        swa_w_q_for_kernel = (
-            swa_w_q.to(q_hsa.dtype) if (blend_swa_in_kernel and swa_w_q.dtype != q_hsa.dtype) else swa_w_q
-        )
+        swa_w_q_for_kernel = swa_w_q
         if blend_swa_in_kernel and not swa_w_q_for_kernel.is_contiguous():
             swa_w_q_for_kernel = swa_w_q_for_kernel.contiguous()
         k_cache_hsa = pool.get_key_buffer(layer.layer_id)[:, H_swa : H_swa + H_hsa, :]
