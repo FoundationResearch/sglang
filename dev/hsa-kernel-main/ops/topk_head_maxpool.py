@@ -215,8 +215,12 @@ def fused_topk_max_pooling_kernel(batch, seq_len, s_len, h_kv, groups, head_dim,
         # GEMM requires M % 16 == 0. For shared-K path M = BLOCK_L*groups, so
         # use the smallest BLOCK_L that makes M >= 16. For per-q-head path the
         # GEMM is per-g with M = BLOCK_L, so BLOCK_L itself must be >= 16.
-        BLOCK_L = 16
+        # R90: per_qhead BLOCK_L=64 to hit Hopper wgmma m64 sweet spot AND keep
+        # all 64 threads busy in the topk-update tail (was 16/64 with BLOCK_L=16).
+        BLOCK_L = 64 if per_qhead_lmks else 16
     if BLOCK_S is None:
+        # Tried BLOCK_S=32 for per_qhead — score_shared grows to 64KB, occupancy
+        # drops, select regressed +68%. Stay at 16.
         BLOCK_S = 16
     BLOCK_D = head_dim
     if threads is None:
@@ -280,7 +284,9 @@ def fused_topk_max_pooling_kernel(batch, seq_len, s_len, h_kv, groups, head_dim,
                     # When use_head_mask=True, inactive local heads skip the
                     # GEMM entirely and are filled with -inf so they cannot win
                     # the following max-over-G selection.
-                    for g in T.serial(groups):
+                    # R90: pipelined K load + GEMM across G groups. 3-stage is the
+                    # sweet spot — extending to 4 yields no further gain.
+                    for g in T.Pipelined(groups, num_stages=3):
                         if (not use_head_mask) or (HeadMask[i_h, g] != 0):
                             for s_idx, d in T.Parallel(BLOCK_S, BLOCK_D):
                                 ts = base_s + s_idx
@@ -431,6 +437,8 @@ def recompute_topk_max_pooling_scores_kernel(
         # fp32 (O(BLOCK_L^2) SMEM growth), so we cannot push BLOCK_L as high
         # as in the selection kernel. Per-q-head path keeps a per-g GEMM and
         # only allocates [BLOCK_L, GEMM_N] fragment, so 16 is fine there.
+        # (Tried BLOCK_L=32 — recompute regressed 3x due to acc_s_g fragment
+        # [32, 512] = 256 regs/thread causing register spills on Blackwell.)
         BLOCK_L = 16 if per_qhead_lmks else 8
     if BLOCK_TK is None:
         BLOCK_TK = 16
@@ -467,6 +475,9 @@ def recompute_topk_max_pooling_scores_kernel(
                     tk_base = tk_block * BLOCK_TK
                     tk_size = T.min(BLOCK_TK, topk - tk_base)
 
+                    # NOTE: tried T.Pipelined(groups, num_stages=3) here — it
+                    # regressed 30-46% because the K-gather has Indices[]
+                    # lookups + bounds branches that defeat pipeline overlap.
                     for g in T.serial(groups):
                         if (not use_head_mask) or (HeadMask[i_h, g] != 0):
                             # Load K for this (tk_block, g)
