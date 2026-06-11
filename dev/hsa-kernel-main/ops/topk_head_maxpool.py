@@ -1,3 +1,4 @@
+import os
 import torch
 import tilelang
 import tilelang.language as T
@@ -215,12 +216,12 @@ def fused_topk_max_pooling_kernel(batch, seq_len, s_len, h_kv, groups, head_dim,
         # GEMM requires M % 16 == 0. For shared-K path M = BLOCK_L*groups, so
         # use the smallest BLOCK_L that makes M >= 16. For per-q-head path the
         # GEMM is per-g with M = BLOCK_L, so BLOCK_L itself must be >= 16.
-        BLOCK_L = 16
+        BLOCK_L = int(os.environ.get("HSA_MP_BLOCK_L", "16"))
     if BLOCK_S is None:
-        BLOCK_S = 16
+        BLOCK_S = int(os.environ.get("HSA_MP_BLOCK_S", "16"))
     BLOCK_D = head_dim
     if threads is None:
-        threads = 64
+        threads = int(os.environ.get("HSA_MP_THREADS", "64"))
 
     GEMM_M = BLOCK_L * groups
     num_s_blocks = tilelang.cdiv(s_len_var, BLOCK_S)
@@ -247,6 +248,10 @@ def fused_topk_max_pooling_kernel(batch, seq_len, s_len, h_kv, groups, head_dim,
             K_shared = T.alloc_shared([BLOCK_S, BLOCK_D], dtype)
             score_shared = T.alloc_shared([GEMM_M, BLOCK_S], accum_dtype)
             acc_s = T.alloc_fragment([GEMM_M, BLOCK_S], accum_dtype)
+            # R89: parallel max-over-G reduction buffer. Removes the serial
+            # inner g-loop (groups iterations per chunk) from the per-query
+            # topk scan, moving it onto all `threads` lanes instead of BLOCK_L.
+            score_maxg = T.alloc_shared([BLOCK_L, BLOCK_S], accum_dtype)
 
             # Per-g GEMM staging (only used when per_qhead_lmks=True)
             Q_g_shared = T.alloc_shared([BLOCK_L, BLOCK_D], dtype)
@@ -331,31 +336,40 @@ def fused_topk_max_pooling_kernel(batch, seq_len, s_len, h_kv, groups, head_dim,
 
                 T.sync_threads()
 
+                # R89: parallel max-over-G reduction across all `threads` lanes.
+                # For each (l_idx, s_idx) chunk, fold the per-g selection logit
+                # (scaled qk + bias - lse_swa) into score_maxg[l_idx, s_idx].
+                # Masked (-inf) groups are skipped; fully-masked / OOB chunks
+                # stay -inf so they never win topk.
+                for l_idx, s_idx in T.Parallel(BLOCK_L, BLOCK_S):
+                    ts_p = base_s + s_idx
+                    tq_p = base_l + l_idx
+                    cur_p = T.alloc_var(accum_dtype)
+                    cur_p = -T.infinity(accum_dtype)
+                    if ts_p < s_len_var:
+                        for g in T.serial(groups):
+                            v_p = T.alloc_var(accum_dtype)
+                            v_p = score_shared[l_idx * groups + g, s_idx] * sm_scale
+                            if v_p != -T.infinity(accum_dtype):
+                                if use_bias:
+                                    v_p += bias[i_b, ts_p, i_h, g]
+                                if use_lse_swa:
+                                    v_p -= LSE_SWA[i_b, tq_p, i_h, g]
+                                if v_p > cur_p:
+                                    cur_p = v_p
+                    score_maxg[l_idx, s_idx] = cur_p
+                T.sync_threads()
+
                 tx = T.get_thread_binding()
                 my_l_idx = tx
                 my_tq = base_l + my_l_idx
                 cur_max_val = T.alloc_var(accum_dtype)
-                val = T.alloc_var(accum_dtype)
 
                 if (my_tq < seq_len_var) and (tx < BLOCK_L):
                     for s_idx in T.serial(BLOCK_S):
                         ts = base_s + s_idx
                         if ts < s_len_var:
-                            cur_max_val = -T.infinity(accum_dtype)
-                            # max over groups using selection logits = scaled qk + bias - lse_swa
-                            for g in T.serial(groups):
-                                val = score_shared[my_l_idx * groups + g, s_idx] * sm_scale
-                                if val == -T.infinity(accum_dtype):
-                                    # Keep -inf for causal-masked positions
-                                    val = -T.infinity(accum_dtype)
-                                else:
-                                    if use_bias:
-                                        val += bias[i_b, ts, i_h, g]
-                                    if use_lse_swa:
-                                        val -= LSE_SWA[i_b, my_tq, i_h, g]
-                                if val > cur_max_val:
-                                    cur_max_val = val
-
+                            cur_max_val = score_maxg[my_l_idx, s_idx]
                             if cur_max_val > topk_max_scores_local[topk - 1]:
                                 moving = T.alloc_var("bool")
                                 moving = True
