@@ -2,7 +2,7 @@
 \centering
 \small
 \setlength{\tabcolsep}{5pt}
-\caption{Inference latency of HiLS-Attention vs.\ full attention at the 345M scale on a single NVIDIA H200 (batch size 1, bf16, chunk size 64, top-$k=32$, 512-token sliding window). Prefill is the warm-run latency for the full input; decode is the median per-token latency with CUDA graphs. Speedup is full attention $/$ HiLS-Attention ($>1$ means HiLS-Attention is faster). HiLS-Attention reaches parity at $\sim$16K and is $8.5\times$/$15.7\times$ faster (prefill/decode) at 512K.}
+\caption{Inference latency of HiLS-Attention vs.\ full attention at the 345M scale on a single NVIDIA H200 (batch size 1, bf16, chunk size 64, top-$k=32$, 512-token sliding window). Prefill is the warm-run latency for the full input; decode is the median per-token latency with CUDA graphs. Speedup is full attention $/$ HiLS-Attention ($>1$ means HiLS-Attention is faster). HiLS-Attention reaches parity at $\sim$16K and is $13.5\times$/$15.7\times$ faster (prefill/decode) at 512K.}
 \label{tab:efficiency}
 \begin{tabular}{r rrr rrr}
 \toprule
@@ -10,13 +10,13 @@
 \cmidrule(lr){2-4}\cmidrule(lr){5-7}
 Context & HiLS-Attn & Full & Speedup & HiLS-Attn & Full & Speedup \\
 \midrule
-8K   & 50    & 29     & 0.58$\times$ & 3.87 & 2.83  & 0.73$\times$ \\
-16K  & 90    & 85     & 0.95$\times$ & 3.87 & 4.21  & 1.09$\times$ \\
-32K  & 167   & 290    & 1.74$\times$ & 3.93 & 6.74  & 1.72$\times$ \\
-64K  & 365   & 1{,}058  & 2.89$\times$ & 4.08 & 12.01 & 2.94$\times$ \\
-128K & 901   & 4{,}162  & 4.62$\times$ & 4.35 & 22.45 & 5.16$\times$ \\
-256K & 2{,}510 & 16{,}751 & 6.67$\times$ & 4.71 & 43.59 & 9.26$\times$ \\
-512K & 7{,}888 & 66{,}993 & 8.49$\times$ & 5.47 & 85.90 & 15.7$\times$ \\
+8K   & 47    & 29     & 0.62$\times$ & 3.87 & 2.83  & 0.73$\times$ \\
+16K  & 81    & 85     & 1.05$\times$ & 3.87 & 4.21  & 1.09$\times$ \\
+32K  & 154   & 290    & 1.88$\times$ & 3.93 & 6.74  & 1.72$\times$ \\
+64K  & 317   & 1{,}058  & 3.34$\times$ & 4.08 & 12.01 & 2.94$\times$ \\
+128K & 715   & 4{,}162  & 5.82$\times$ & 4.35 & 22.45 & 5.16$\times$ \\
+256K & 1{,}796 & 16{,}751 & 9.33$\times$ & 4.71 & 43.59 & 9.26$\times$ \\
+512K & 4{,}972 & 66{,}993 & 13.5$\times$ & 5.47 & 85.90 & 15.7$\times$ \\
 \bottomrule
 \end{tabular}
 \end{table}
