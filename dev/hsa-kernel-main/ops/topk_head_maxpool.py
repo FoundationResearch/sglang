@@ -228,6 +228,17 @@ def fused_topk_max_pooling_kernel(batch, seq_len, s_len, h_kv, groups, head_dim,
     BLOCK_D = head_dim
     if threads is None:
         threads = int(os.environ.get("HSA_MP_THREADS", "64"))
+    # R90/R89 dispatch: smart default — BLOCK_L=16 (R89 H200-target) enables
+    # the parallel max-over-G prepass; BLOCK_L>=32 (R90 Blackwell-target with
+    # wgmma m64 sweet spot) prefers inline max-over-G in the topk-update
+    # because the prepass HBM access scales with BLOCK_L and stops being a
+    # win past 16. HSA_MP_MAXG_PREPASS env forces a specific path:
+    # "0" = inline (R90 style), "1" = prepass (R89 style), unset = auto.
+    _prepass_env = os.environ.get("HSA_MP_MAXG_PREPASS", "")
+    if _prepass_env == "":
+        USE_MAXG_PREPASS = (BLOCK_L <= 16)
+    else:
+        USE_MAXG_PREPASS = int(_prepass_env) != 0
 
     GEMM_M = BLOCK_L * groups
     num_s_blocks = tilelang.cdiv(s_len_var, BLOCK_S)
@@ -344,40 +355,59 @@ def fused_topk_max_pooling_kernel(batch, seq_len, s_len, h_kv, groups, head_dim,
 
                 T.sync_threads()
 
-                # R89: parallel max-over-G reduction across all `threads` lanes.
-                # For each (l_idx, s_idx) chunk, fold the per-g selection logit
-                # (scaled qk + bias - lse_swa) into score_maxg[l_idx, s_idx].
-                # Masked (-inf) groups are skipped; fully-masked / OOB chunks
-                # stay -inf so they never win topk.
-                for l_idx, s_idx in T.Parallel(BLOCK_L, BLOCK_S):
-                    ts_p = base_s + s_idx
-                    tq_p = base_l + l_idx
-                    cur_p = T.alloc_var(accum_dtype)
-                    cur_p = -T.infinity(accum_dtype)
-                    if ts_p < s_len_var:
-                        for g in T.serial(groups):
-                            v_p = T.alloc_var(accum_dtype)
-                            v_p = score_shared[l_idx * groups + g, s_idx] * sm_scale
-                            if v_p != -T.infinity(accum_dtype):
-                                if use_bias:
-                                    v_p += bias[i_b, ts_p, i_h, g]
-                                if use_lse_swa:
-                                    v_p -= LSE_SWA[i_b, tq_p, i_h, g]
-                                if v_p > cur_p:
-                                    cur_p = v_p
-                    score_maxg[l_idx, s_idx] = cur_p
-                T.sync_threads()
+                if USE_MAXG_PREPASS:
+                    # R89 (H200-optimal): parallel max-over-G reduction across
+                    # all `threads` lanes. For each (l_idx, s_idx) chunk, fold
+                    # the per-g selection logit (scaled qk + bias - lse_swa)
+                    # into score_maxg[l_idx, s_idx]. Masked (-inf) groups are
+                    # skipped; fully-masked/OOB chunks stay -inf so they
+                    # cannot win topk.
+                    for l_idx, s_idx in T.Parallel(BLOCK_L, BLOCK_S):
+                        ts_p = base_s + s_idx
+                        tq_p = base_l + l_idx
+                        cur_p = T.alloc_var(accum_dtype)
+                        cur_p = -T.infinity(accum_dtype)
+                        if ts_p < s_len_var:
+                            for g in T.serial(groups):
+                                v_p = T.alloc_var(accum_dtype)
+                                v_p = score_shared[l_idx * groups + g, s_idx] * sm_scale
+                                if v_p != -T.infinity(accum_dtype):
+                                    if use_bias:
+                                        v_p += bias[i_b, ts_p, i_h, g]
+                                    if use_lse_swa:
+                                        v_p -= LSE_SWA[i_b, tq_p, i_h, g]
+                                    if v_p > cur_p:
+                                        cur_p = v_p
+                        score_maxg[l_idx, s_idx] = cur_p
+                    T.sync_threads()
 
                 tx = T.get_thread_binding()
                 my_l_idx = tx
                 my_tq = base_l + my_l_idx
                 cur_max_val = T.alloc_var(accum_dtype)
+                val = T.alloc_var(accum_dtype)
 
                 if (my_tq < seq_len_var) and (tx < BLOCK_L):
                     for s_idx in T.serial(BLOCK_S):
                         ts = base_s + s_idx
                         if ts < s_len_var:
-                            cur_max_val = score_maxg[my_l_idx, s_idx]
+                            if USE_MAXG_PREPASS:
+                                cur_max_val = score_maxg[my_l_idx, s_idx]
+                            else:
+                                # R90 (Blackwell-friendly): inline max-over-G
+                                # in the topk-update loop. Avoids the prepass
+                                # overhead when BL=64 makes prepass HBM
+                                # access expensive.
+                                cur_max_val = -T.infinity(accum_dtype)
+                                for g in T.serial(groups):
+                                    val = score_shared[my_l_idx * groups + g, s_idx] * sm_scale
+                                    if val != -T.infinity(accum_dtype):
+                                        if use_bias:
+                                            val += bias[i_b, ts, i_h, g]
+                                        if use_lse_swa:
+                                            val -= LSE_SWA[i_b, my_tq, i_h, g]
+                                        if val > cur_max_val:
+                                            cur_max_val = val
                             if cur_max_val > topk_max_scores_local[topk - 1]:
                                 moving = T.alloc_var("bool")
                                 moving = True
