@@ -127,7 +127,12 @@ def fused_internal_swa_decode_kernel(
         # Online softmax update
         block_max = tl.max(scores, axis=0)
         m_new = tl.maximum(m_i, block_max)
-        alpha = tl.exp(m_i - m_new)
+        # Guard m_new == -inf (m_i and this whole block both -inf, i.e. an
+        # empty/all-masked window prefix). Without it alpha = exp(-inf - -inf)
+        # = exp(nan) = nan, and acc = 0 * nan = nan poisons every later valid
+        # block. Short sequences (seqlen < hsa_window) hit this. alpha=1.0
+        # keeps acc/l_i at 0 across the empty prefix.
+        alpha = tl.where(m_new == float("-inf"), 1.0, tl.exp(m_i - m_new))
         exp_scores = tl.exp(scores - m_new)
         exp_scores = tl.where(w_valid, exp_scores, 0.0)
         block_sum = tl.sum(exp_scores, axis=0)
@@ -189,7 +194,9 @@ def fused_internal_swa_decode_reduce_kernel(
         out_off = ((b * HQ_hsa + hq) * SPLIT_W + s) * D + d_offs
         acc_s = tl.load(partial_o_ptr + out_off)
 
-        alpha = tl.exp(m_s - m_global)
+        # Same -inf guard as the main kernel: if every split is empty
+        # m_global == -inf and exp(-inf - -inf) = nan would poison the sum.
+        alpha = tl.where(m_global == float("-inf"), 1.0, tl.exp(m_s - m_global))
         l_global = l_global + l_s * alpha
         acc = acc + acc_s * alpha
 
