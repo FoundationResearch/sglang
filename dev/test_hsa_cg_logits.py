@@ -35,15 +35,23 @@ OUTPUT_LEN = int(os.environ.get("OUTPUT_LEN", 4))
 
 sys.argv = [
     "bench",
-    "--model-path", "/home/hal-alex/workspace/aligned345m_bench",
+    "--model-path", "/home/hal-alex/workspace/sglang/dev/bench_models/aligned345m_bench",
     "--tp", "1", "--batch-size", "1",
     "--input-len", str(INPUT_LEN),
     "--output-len", str(OUTPUT_LEN),
     "--context-length", str(INPUT_LEN + OUTPUT_LEN + 100),
     "--attention-backend", "hsa",
+    "--page-size", "64",  # HSA requires page_size == chunk_size; without it
+                          # page_size defaults to 1 and hsa_extend's tl.dot
+                          # gets K=BLOCK_M*1 < 16 → compile error.
     "--mem-fraction-static", "0.40",
     "--trust-remote-code",
 ]
+# HSA_HEADWISE=1 forces the softmax-topk (eval) prefill path. The default
+# maxpool path NaNs on very short prefills (separate lse_swa -inf bug); the
+# eval path the downstream team uses is headwise=True, which is clean.
+if os.environ.get("HSA_HEADWISE", "1") == "1":
+    sys.argv.append("--hsa-headwise-topk-softmax")
 if cg_on:
     sys.argv.extend(["--cuda-graph-max-bs", "1"])
 else:

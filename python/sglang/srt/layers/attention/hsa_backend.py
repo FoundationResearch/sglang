@@ -364,6 +364,23 @@ class HSAAttnBackend(AttentionBackend):
         # step in init_forward_metadata (R12).  No per-layer clone needed.
         page_table_1 = md.page_table_1
 
+        # CUDA-graph correctness: the per-step Python tensor caches below
+        # (hsa_per_step_*) are an eager-mode optimization that reuse
+        # layer-invariant scratch across the 16 HSA layers in one decode step.
+        # Under CUDA graph they are UNSAFE: capture does 2 dry-runs that fill
+        # the cache, then the real capture sees the cache populated and skips
+        # recomputation — so the candidate/slot/lmk_k device ops never enter
+        # the graph, and replay reads scratch frozen at capture time instead of
+        # recomputing from the refreshed _cg_* buffers. Detect CG metadata (its
+        # page_table_1 IS the persistent _cg_page_table_1 buffer) and recompute
+        # every layer so all the selection ops are captured and re-executed at
+        # replay. eager keeps the cache.
+        _cg_buf = getattr(self, "_cg_page_table_1", None)
+        is_cg_metadata = (
+            _cg_buf is not None
+            and page_table_1.data_ptr() == _cg_buf.data_ptr()
+        )
+
         # R29: effective_cands (= clamp(min(seq_lens // ps, (seq_lens - hsa_window) // ps)))
         # is now computed inline inside the selector kernel from cache_seqlens.
         # Per-layer host-side compute (4 small ops × 16 layers ≈ 200µs) is gone.
@@ -472,7 +489,8 @@ class HSAAttnBackend(AttentionBackend):
         cached_cm = getattr(md, "hsa_per_step_cand_mask", None)
         cached_window = getattr(md, "hsa_per_step_hsa_window", None)
         if (
-            cached_pi is not None
+            not is_cg_metadata
+            and cached_pi is not None
             and cached_cm is not None
             and cached_window == hsa_window
             and cached_pi.shape == (B, C_max)
@@ -491,26 +509,30 @@ class HSAAttnBackend(AttentionBackend):
             cand_page_ids = cand_range.unsqueeze(0).expand(B, C_max).contiguous()
             cand_mask = cand_page_ids < effective_cands.unsqueeze(1).to(torch.int32)
             cand_page_ids = cand_page_ids.masked_fill(~cand_mask, -1)
-            md.hsa_per_step_cand_page_ids = cand_page_ids
-            md.hsa_per_step_cand_mask = cand_mask
-            md.hsa_per_step_hsa_window = hsa_window
+            # eager only: stash for the other layers this step. Under CG we must
+            # not cache (see is_cg_metadata note above) — recompute every layer.
+            if not is_cg_metadata:
+                md.hsa_per_step_cand_page_ids = cand_page_ids
+                md.hsa_per_step_cand_mask = cand_mask
+                md.hsa_per_step_hsa_window = hsa_window
 
         if per_qhead_active:
             # R54a: slots = req_to_chunk_pool.gather_slots(req_pool_indices,
             # cand_page_ids) is layer-invariant (same req_pool_indices +
             # same cand_page_ids); cache it too.
             slots = getattr(md, "hsa_per_step_slots", None)
-            if slots is None or slots.shape != cand_page_ids.shape:
+            if is_cg_metadata or slots is None or slots.shape != cand_page_ids.shape:
                 slots = self.req_to_chunk_pool.gather_slots(
                     forward_batch.req_pool_indices, cand_page_ids
                 )
-                md.hsa_per_step_slots = slots
+                if not is_cg_metadata:
+                    md.hsa_per_step_slots = slots
             # R54c: batch the lmk_k + prior_b gathers across ALL layers in one
             # multi-layer index_select instead of per-layer (saves ~94 launches/
             # step for 16-layer 345M HSA). Lazily on the first per_qhead layer.
             all_lmk_k = getattr(md, "hsa_per_step_all_lmk_k", None)
             all_prior_b = getattr(md, "hsa_per_step_all_prior_b", None)
-            if all_lmk_k is None or all_prior_b is None:
+            if is_cg_metadata or all_lmk_k is None or all_prior_b is None:
                 # pool.pool: [L, num_chunk_slots+1, h_q, head_dim]
                 # prior_b_pool: [L, num_chunk_slots+1, h_q]
                 pool_pool = self.lmk_k_pool.pool
@@ -528,8 +550,9 @@ class HSAAttnBackend(AttentionBackend):
                 all_prior_b = gathered_pb.view(
                     pb_pool.shape[0], *slots.shape, pb_pool.shape[2]
                 )
-                md.hsa_per_step_all_lmk_k = all_lmk_k
-                md.hsa_per_step_all_prior_b = all_prior_b
+                if not is_cg_metadata:
+                    md.hsa_per_step_all_lmk_k = all_lmk_k
+                    md.hsa_per_step_all_prior_b = all_prior_b
             cand_repr = all_lmk_k[int(layer.layer_id)]
             # prior_b (entropy bias) per chunk per q-head, [B, C_max, h_q]
             self._per_qhead_prior_b = all_prior_b[int(layer.layer_id)]
