@@ -24,6 +24,7 @@ from sglang.srt.mem_cache.landmark_pool import LandmarkLmkKPool, ReqToChunkPool
 from sglang.srt.layers.attention.hsa.selector import (
     _online_topk_group,
     _online_topk_head_maxpool,
+    _online_softmax_topk_head,
     build_active_page_candidates,
     select_topk_pages_decode,
     select_topk_pages_decode_fused,
@@ -1805,8 +1806,45 @@ class HSAAttnBackend(AttentionBackend):
                 # + unsqueeze per layer (~80us CPU dispatch * 16 layers).
                 fused_scores = fused_indices
                 self._last_per_qhead_scores_extend = scores_hq_sel_t
+            elif (
+                _online_softmax_topk_head is not None
+                and self._last_swa_lse_hq_extend is not None
+                and os.environ.get("HSA_HEADWISE_EINSUM") != "1"
+            ):
+                # ---- Exact softmax-then-max-pool via the fused official kernel ----
+                # Replaces the torch einsum reference below: no [T, h_q, S] fp32
+                # materialization (no long-context OOM), fused on-GPU, and matches
+                # the official training/eval selection exactly (logaddexp(swa_lse,
+                # hsa_lse) softmax-normalized max-over-G topk, incl. prior_b bias).
+                self._softmax_kernel_call_count = (
+                    getattr(self, "_softmax_kernel_call_count", 0) + 1
+                )
+                prior_b_hw = self._per_qhead_prior_b_ext
+                idx_f, scr_f = _online_softmax_topk_head(
+                    q_sel_3.unsqueeze(0).contiguous(),          # [1, T, h_q, D] bf16
+                    lmk_full.unsqueeze(0).contiguous(),         # [1, S, h_q, D] per-q-head
+                    self._last_swa_lse_hq_extend.unsqueeze(0).contiguous(),  # [1, T, h_q]
+                    int(self.hsa_topk),
+                    page_size,
+                    hsa_window if hsa_window > 0 else 0,
+                    is_causal=True,
+                    q_offset=prefix_len,
+                    is_training=False,
+                    bias=(prior_b_hw.unsqueeze(0) if prior_b_hw is not None else None),  # [1, S, h_q]
+                    G=G_e,
+                )
+                # idx_f: [1, T, h_kv, K] int; scr_f: [1, T, h_q, K] raw scaled qk
+                K_sel = scr_f.shape[-1]
+                T_q = scr_f.shape[1]
+                fused_indices = idx_f.to(torch.int32)
+                # per-q-head scores for the fusion path: [T, h_q, K]
+                self._last_per_qhead_scores_extend = scr_f.squeeze(0).to(torch.float32)
+                # max-over-G -> kv-head selection scores: [1, T, h_kv, K]
+                fused_scores = (
+                    scr_f.view(1, T_q, h_kv_e, G_e, K_sel).amax(dim=3).to(torch.float32)
+                )
             else:
-                # ---- Pure-PyTorch fallback (default, headwise_topk_softmax=True) ----
+                # ---- Pure-PyTorch fallback (legacy reference / HSA_HEADWISE_EINSUM=1) ----
                 import math as _m
                 sm_scale_ref = 1.0 / _m.sqrt(D_e)
                 # q_sel_3 here is the full h_q query [T, h_q, D] (per_qhead path

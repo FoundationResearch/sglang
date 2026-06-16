@@ -133,6 +133,22 @@ except Exception as _e:
     _online_topk_head_maxpool = None
     print(f"[HSA] Failed to import fused online_topk_head_maxpool: {_e}")
 
+# Exact softmax-then-max-pool top-k (the official training/eval kernel: computes
+# hsa_lse + logaddexp(swa_lse) + softmax-normalized selection, supports per-q-head
+# landmarks via G and prior_b bias). Wired into the headwise_topk_softmax=True
+# prefill path to replace the torch einsum fallback (no [T,h_q,S] materialization
+# -> fused + no long-context OOM, matches official semantics incl. prior_b).
+try:
+    if _hsa_kernel_ops_dir not in sys.path:
+        sys.path.insert(0, _hsa_kernel_ops_dir)
+    from topk_head_softmax_official import (
+        online_softmax_topk_head as _online_softmax_topk_head,
+    )
+    print("[HSA] Fused online_softmax_topk_head (official) kernel loaded successfully.")
+except Exception as _e:
+    _online_softmax_topk_head = None
+    print(f"[HSA] Failed to import fused online_softmax_topk_head: {_e}")
+
 
 @dataclass
 class HSASelectionResult:
