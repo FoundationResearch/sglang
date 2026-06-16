@@ -127,7 +127,11 @@ def fused_internal_swa_decode_kernel(
         # Online softmax update
         block_max = tl.max(scores, axis=0)
         m_new = tl.maximum(m_i, block_max)
-        alpha = tl.exp(m_i - m_new)
+        # Guard the all-masked window case: if no valid KV so far, both m_i and
+        # block_max are -inf -> m_new=-inf -> exp(m_i - m_new)=exp(nan)=nan,
+        # which poisons acc. Treat the rescale factor as 1.0 in that case (acc
+        # is still 0). Short sequences / LMK-internal decode steps can hit this.
+        alpha = tl.where(m_new == float("-inf"), 1.0, tl.exp(m_i - m_new))
         exp_scores = tl.exp(scores - m_new)
         exp_scores = tl.where(w_valid, exp_scores, 0.0)
         block_sum = tl.sum(exp_scores, axis=0)
@@ -189,7 +193,11 @@ def fused_internal_swa_decode_reduce_kernel(
         out_off = ((b * HQ_hsa + hq) * SPLIT_W + s) * D + d_offs
         acc_s = tl.load(partial_o_ptr + out_off)
 
-        alpha = tl.exp(m_s - m_global)
+        # Guard the all-empty case: if every split saw no valid KV, m_global is
+        # -inf and exp(m_s - m_global)=exp(nan)=nan. An empty split contributes
+        # nothing, so use 0.0 there (a finite m_global gives the normal factor,
+        # and a single empty split among valid ones already yields exp(-inf)=0).
+        alpha = tl.where(m_global == float("-inf"), 0.0, tl.exp(m_s - m_global))
         l_global = l_global + l_s * alpha
         acc = acc + acc_s * alpha
 

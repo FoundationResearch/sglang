@@ -33,7 +33,7 @@ def main():
     print(f'[tok] vocab_size={tok.vocab_size}  eos={tok.eos_token_id}')
 
     print('[tok] loading wikitext-103-raw-v1 (train split)')
-    ds = load_dataset('Salesforce/wikitext', 'wikitext-103-raw-v1', split='train')
+    ds = load_dataset('wikitext', 'wikitext-103-raw-v1', split='train')  # old key hits offline cache
     print(f'[tok] {len(ds)} docs')
 
     file_idx = 0

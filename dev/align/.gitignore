@@ -1,2 +1,8 @@
 __pycache__/
 *.pyc
+
+# Large training/eval artifacts — kept on disk for G=1 alignment, not tracked
+ckpt_*/
+weights_*/
+wikitext103_tokenized/
+weights/g1.safetensors
