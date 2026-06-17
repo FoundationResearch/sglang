@@ -243,9 +243,22 @@ class HSAAttnBackend(AttentionBackend):
                         flush=True,
                     )
             except Exception as e:
-                logger.warning("Failed to initialize HSA lmk_k_pool: %s", e)
+                # HARD ERROR (was: warn + set pools None). The model has
+                # enable_prior_query + enable_lmk_q_proj, so the exact per-q-head
+                # selection path is REQUIRED for correctness. Silently dropping
+                # the pools here downgrades every forward to the groupwise/h_kv
+                # approximation — wrong outputs AND unrepresentative (too-fast)
+                # latency, with only a warning that benchmark/eval scripts miss.
+                # Fail loudly instead. Set SGLANG_HSA_DISABLE_AUTO_POOL_INIT=1 to
+                # opt into the legacy path on purpose.
                 self.lmk_k_pool = None
                 self.req_to_chunk_pool = None
+                raise RuntimeError(
+                    "HSA per-q-head pool init failed; refusing to silently fall "
+                    "back to the groupwise approximation (set "
+                    "SGLANG_HSA_DISABLE_AUTO_POOL_INIT=1 to force the legacy path "
+                    f"on purpose). Underlying error: {e!r}"
+                ) from e
         # When per_qhead is active, the selector also computes per-q-head
         # scores (gathered at the chunks selected by max-over-G) and the SWA
         # branch exposes per-q-head LSE.  These are consumed by the
