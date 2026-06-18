@@ -1,3 +1,6 @@
+# Local benchmark / sweep logs (not tracked)
+logs/
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
