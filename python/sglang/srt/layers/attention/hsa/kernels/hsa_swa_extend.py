@@ -65,12 +65,12 @@ def hsa_swa_extend_kernel(
     stride_ob: tl.constexpr, stride_oh: tl.constexpr, stride_od: tl.constexpr,
     stride_lse_b: tl.constexpr, stride_lse_h: tl.constexpr,
     sm_scale: tl.constexpr,
-    T: tl.constexpr,
+    T,  # runtime (P3): varlen downstream inputs must not trigger recompile
     HQ: tl.constexpr,
     H: tl.constexpr,
     D: tl.constexpr,
-    TOTAL_KV: tl.constexpr,
-    PREFIX_LEN: tl.constexpr,        # absolute Q start offset (Q[i] is at engine pos PREFIX_LEN+i)
+    TOTAL_KV,        # runtime (P3)
+    PREFIX_LEN,      # runtime (P3): absolute Q start offset (Q[i] is at engine pos PREFIX_LEN+i)
     SW: tl.constexpr,                # sliding window size (hsa_window)
     PAGE_SIZE: tl.constexpr,         # also LMK period
     BLOCK_M: tl.constexpr,

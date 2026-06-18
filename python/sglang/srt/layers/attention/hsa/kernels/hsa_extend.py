@@ -73,7 +73,7 @@ def hsa_extend_paged_fwd_kernel(
     stride_out_hq: tl.constexpr,
     stride_out_d: tl.constexpr,
     sm_scale: tl.constexpr,
-    T: tl.constexpr,
+    T,  # runtime (P3): not constexpr — varlen downstream inputs must not recompile
     HQ: tl.constexpr,
     H: tl.constexpr,
     D: tl.constexpr,
