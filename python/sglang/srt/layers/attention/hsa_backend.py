@@ -123,6 +123,19 @@ class HSAAttnBackend(AttentionBackend):
 
         self.hsa_layers = getattr(server_args, "hsa_layers", None)
         self._hsa_layer_ids: Optional[Set[int]] = self._resolve_hsa_layer_ids()
+        # P7 / CUDA-graph: deterministic "owner" of the per-step selection
+        # scratch (cand pages / slots / all-layer LMK gather). Exactly the
+        # first HSA layer computes it each step; the other layers read it.
+        # Gating on a static layer_id (not on `is None`) is what makes this
+        # CUDA-graph-safe: under CG the owner ALWAYS recomputes, so the gather
+        # ops are captured and re-executed against the refreshed buffers at
+        # replay — while still running only ONCE per step (not 16x). _hsa_layer_ids
+        # is None => every layer is HSA => first attention layer (id 0) is owner.
+        self._first_hsa_layer_id = (
+            min(self._hsa_layer_ids)
+            if self._hsa_layer_ids
+            else 0
+        )
 
         # LHSA merged softmax: enable_softmax1 adds a zero logit to the
         # denominator. R75: align fallback with FlashHSAConfig default
@@ -378,6 +391,19 @@ class HSAAttnBackend(AttentionBackend):
         # step in init_forward_metadata (R12).  No per-layer clone needed.
         page_table_1 = md.page_table_1
 
+        # P7 / CUDA-graph correctness + perf: the per-step scratch below
+        # (cand pages / slots / all-layer LMK gather) is layer-invariant, so we
+        # compute it ONCE per step and reuse it across the 16 HSA layers.
+        # The OWNER (first HSA layer) computes + stores it on `md`; the other
+        # layers read it. Gating the recompute on a static layer_id — not on
+        # `is None` — is what makes this CUDA-graph-safe: the old `is None` gate
+        # got polluted by the 2 capture dry-runs (the real capture saw the cache
+        # filled, skipped recompute, and the gather ops never entered the graph
+        # → replay read stale scratch). With owner-gating the owner ALWAYS
+        # recomputes at capture, so the ops ARE captured and re-execute against
+        # the refreshed buffers at replay, while still running only once/step.
+        is_owner = int(layer.layer_id) == self._first_hsa_layer_id
+
         # R29: effective_cands (= clamp(min(seq_lens // ps, (seq_lens - hsa_window) // ps)))
         # is now computed inline inside the selector kernel from cache_seqlens.
         # Per-layer host-side compute (4 small ops × 16 layers ≈ 200µs) is gone.
@@ -486,7 +512,8 @@ class HSAAttnBackend(AttentionBackend):
         cached_cm = getattr(md, "hsa_per_step_cand_mask", None)
         cached_window = getattr(md, "hsa_per_step_hsa_window", None)
         if (
-            cached_pi is not None
+            not is_owner
+            and cached_pi is not None
             and cached_cm is not None
             and cached_window == hsa_window
             and cached_pi.shape == (B, C_max)
@@ -505,6 +532,7 @@ class HSAAttnBackend(AttentionBackend):
             cand_page_ids = cand_range.unsqueeze(0).expand(B, C_max).contiguous()
             cand_mask = cand_page_ids < effective_cands.unsqueeze(1).to(torch.int32)
             cand_page_ids = cand_page_ids.masked_fill(~cand_mask, -1)
+            # Owner stashes for the other layers this step (CG-safe, see note above).
             md.hsa_per_step_cand_page_ids = cand_page_ids
             md.hsa_per_step_cand_mask = cand_mask
             md.hsa_per_step_hsa_window = hsa_window
@@ -514,7 +542,7 @@ class HSAAttnBackend(AttentionBackend):
             # cand_page_ids) is layer-invariant (same req_pool_indices +
             # same cand_page_ids); cache it too.
             slots = getattr(md, "hsa_per_step_slots", None)
-            if slots is None or slots.shape != cand_page_ids.shape:
+            if is_owner or slots is None or slots.shape != cand_page_ids.shape:
                 slots = self.req_to_chunk_pool.gather_slots(
                     forward_batch.req_pool_indices, cand_page_ids
                 )
@@ -524,7 +552,7 @@ class HSAAttnBackend(AttentionBackend):
             # step for 16-layer 345M HSA). Lazily on the first per_qhead layer.
             all_lmk_k = getattr(md, "hsa_per_step_all_lmk_k", None)
             all_prior_b = getattr(md, "hsa_per_step_all_prior_b", None)
-            if all_lmk_k is None or all_prior_b is None:
+            if is_owner or all_lmk_k is None or all_prior_b is None:
                 # pool.pool: [L, num_chunk_slots+1, h_q, head_dim]
                 # prior_b_pool: [L, num_chunk_slots+1, h_q]
                 pool_pool = self.lmk_k_pool.pool
