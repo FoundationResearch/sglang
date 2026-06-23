@@ -30,7 +30,16 @@ def run_sglang_inference(cfg: dict) -> Dict:
     sglang_chunked_prefill_size = cfg.get("sglang_chunked_prefill_size", 8192)
     top_k = cfg.get("top_k", 5)
 
-    print(f"[SGLang] Loading model with Engine: {checkpoint_path}")
+    # Raw-token-id mode: skip the engine tokenizer entirely (the checkpoint dir
+    # carries a mismatched Qwen tokenizer; our model is dolma2 vocab 100278). We
+    # feed/compare on ids, so skip_tokenizer_init=True is both correct and avoids
+    # out-of-range encodes.
+    raw_ids = list(cfg.get("input_ids") or [])
+    raw_mode = len(raw_ids) > 0
+    if prompt_tokens > 0 and raw_mode:
+        raw_ids = raw_ids[:prompt_tokens]
+
+    print(f"[SGLang] Loading model with Engine: {checkpoint_path}  raw_ids_mode={raw_mode}")
     print(f"[SGLang] chunked_prefill_size={sglang_chunked_prefill_size}")
     engine = sgl.Engine(
         model_path=checkpoint_path,
@@ -39,76 +48,64 @@ def run_sglang_inference(cfg: dict) -> Dict:
         page_size=sglang_page_size,
         max_total_tokens=sglang_max_total_tokens,
         chunked_prefill_size=sglang_chunked_prefill_size,
-        disable_cuda_graph=True,
+        disable_cuda_graph=cfg.get("disable_cuda_graph", True),
         disable_overlap_schedule=True,
+        skip_tokenizer_init=raw_mode,
+        log_level=cfg.get("log_level", "error"),
+        enable_nan_detection=cfg.get("enable_nan_detection", False),
+        **({"context_length": cfg["context_length"]} if cfg.get("context_length") else {}),
+        **({"mem_fraction_static": cfg["mem_fraction_static"]} if cfg.get("mem_fraction_static") else {}),
+        **({"max_running_requests": cfg["max_running_requests"]} if cfg.get("max_running_requests") else {}),
     )
+    print(f"[SGLang] disable_cuda_graph={cfg.get('disable_cuda_graph', True)} "
+          f"(CUDA graph {'OFF' if cfg.get('disable_cuda_graph', True) else 'ON'})")
 
-    # 支持 prompt_tokens：从长 prompt 截取前 N 个 token
-    if prompt_tokens > 0:
-        from transformers import AutoTokenizer
-        tokenizer = AutoTokenizer.from_pretrained(checkpoint_path)
-        full_ids = tokenizer.encode(prompt, add_special_tokens=False)
-        full_len = len(full_ids)
-        if prompt_tokens > full_len:
-            print(f"[SGLang] ⚠️ prompt_tokens={prompt_tokens} > full prompt length={full_len}, using full prompt")
-        else:
-            truncated_ids = full_ids[:prompt_tokens]
-            prompt = tokenizer.decode(truncated_ids)
-            # 验证 roundtrip 一致性
-            verify_ids = tokenizer.encode(prompt, add_special_tokens=False)
-            print(f"[SGLang] prompt_tokens={prompt_tokens}, truncated from {full_len} -> {len(verify_ids)} tokens")
-            if len(verify_ids) != prompt_tokens:
-                print(f"[SGLang] ⚠️ roundtrip mismatch: {len(verify_ids)} != {prompt_tokens}, diff={len(verify_ids)-prompt_tokens}")
-        del tokenizer
-
-    # ===== Warmup: 预热一次短推理，触发 TileLang JIT 编译 topk kernel =====
-    # warmup prompt 需要足够长（>page_size tokens）才能触发 HSA topk 路径
-    warmup_prompt = "Hello " * max(sglang_page_size * 2, 1024)  # 生成一个足够长的 warmup prompt
+    # ===== Warmup: 触发 TileLang JIT 编译 topk kernel（用 ids 切片，> page_size）=====
     warmup_tokens = 3
     print(f"[SGLang] Warmup: generating {warmup_tokens} tokens to trigger TileLang JIT compilation...")
     warmup_start = time.time()
-    _ = engine.generate(
-        prompt=warmup_prompt,
-        sampling_params={"max_new_tokens": warmup_tokens, "temperature": 0.0},
-    )
-    warmup_time = time.time() - warmup_start
-    print(f"[SGLang] Warmup done in {warmup_time:.2f}s (JIT compilation included)")
-    # ===== End Warmup =====
+    if raw_mode:
+        _wu = raw_ids[: max(sglang_page_size * 4, 1024)]
+        _ = engine.generate(input_ids=[_wu],
+                            sampling_params={"max_new_tokens": warmup_tokens, "temperature": 0.0})
+    else:
+        _ = engine.generate(prompt="Hello " * max(sglang_page_size * 2, 1024),
+                            sampling_params={"max_new_tokens": warmup_tokens, "temperature": 0.0})
+    print(f"[SGLang] Warmup done in {time.time()-warmup_start:.2f}s (JIT included)")
 
-    # ===== 多请求预热（复现 eval 场景下跨请求状态泄露）=====
+    # ===== 多请求预热（复现 eval 跨请求状态泄露，P5）=====
     num_prefill_requests = cfg.get("num_prefill_requests", 0)
-    if num_prefill_requests > 0:
-        print(f"[SGLang] Sending {num_prefill_requests} dummy requests (long prompts to trigger chunked prefill)...")
-        from transformers import AutoTokenizer as _AT
-        _tok = _AT.from_pretrained(checkpoint_path)
-        # 用 cfg 里的原始 prompt（未截取），确保 engine tokens > chunked_prefill_size
-        _full_ids = _tok.encode(cfg["prompt"], add_special_tokens=False)
-        print(f"  Full prompt length for dummy: {len(_full_ids)} tokens")
+    if num_prefill_requests > 0 and raw_mode:
+        print(f"[SGLang] Sending {num_prefill_requests} dummy requests (long, trigger chunked prefill)...")
         for ri in range(num_prefill_requests):
-            # 每个 dummy 截取不同长度，保证都够长触发 chunked prefill
-            dummy_len = len(_full_ids) - ri * 200
-            if dummy_len < 5000:
-                dummy_len = 5000 + ri * 100
-            dummy_len = min(dummy_len, len(_full_ids))
-            _ids = _full_ids[:dummy_len]
-            dummy_prompt = _tok.decode(_ids)
-            _ = engine.generate(
-                prompt=dummy_prompt,
-                sampling_params={"max_new_tokens": max_new_tokens, "temperature": 0.0},
-            )
+            dummy_len = max(len(raw_ids) - ri * 200, 5000 + ri * 100)
+            dummy_len = min(dummy_len, len(raw_ids))
+            _ = engine.generate(input_ids=[raw_ids[:dummy_len]],
+                                sampling_params={"max_new_tokens": max_new_tokens, "temperature": 0.0})
             print(f"  dummy request {ri+1}/{num_prefill_requests} done (tokens={dummy_len})")
-        del _tok
         print(f"[SGLang] Dummy requests done, now running the real one.")
 
     print(f"[SGLang] Generating with return_logprob=True, top_logprobs_num={top_k}")
-    decode_start = time.time()
-    result = engine.generate(
-        prompt=prompt,
+    # Raw-token-id path: feed cfg['input_ids'] directly (bypasses the Qwen-vs-dolma2
+    # tokenizer mismatch). Falls back to the prompt string if not provided.
+    gen_kwargs = dict(
         sampling_params={"max_new_tokens": max_new_tokens, "temperature": 0.0},
         return_logprob=True,
         logprob_start_len=0,
         top_logprobs_num=top_k,
     )
+    if cfg.get("input_ids"):
+        ids = list(cfg["input_ids"])
+        if prompt_tokens > 0:
+            ids = ids[:prompt_tokens]
+        gen_kwargs["input_ids"] = [ids]
+        print(f"[SGLang] Using raw input_ids: {len(ids)} tokens (max id={max(ids)})")
+    else:
+        gen_kwargs["prompt"] = prompt
+    decode_start = time.time()
+    result = engine.generate(**gen_kwargs)
+    if isinstance(result, list):
+        result = result[0]
 
     decode_time = time.time() - decode_start
 

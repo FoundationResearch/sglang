@@ -1,0 +1,19 @@
+{
+  "config_path": "dev/bench_models/hsa345m_real/config.json",
+  "config_sha256": "17f2d8a8241b8a6c024c6334a8c36cd0696dc4c8b33f094de1d5bbec42dcd47e",
+  "weights_path": "dev/align/ckpt_345m_bench_hf/model.safetensors",
+  "weights_sha256": "38d40a2e59d0c93223fd1582d7301a7aed1582d3d1b218e1ba7e4a57592411fe",
+  "weights_size_bytes": 893223840,
+  "weights_dtype": "float16",
+  "training": {
+    "steps": 5556,
+    "final_loss": 0.0,
+    "best_loss": 0.0
+  },
+  "env": {
+    "git_commit": "g1-align",
+    "git_dirty": true
+  },
+  "trained_at_utc": "2026-06-23T00:40:37.063228+00:00",
+  "_note": "345M qwen_lhsa G=1 MHA (hsa_heads=16,qk_ratio=1,kv=16) + prior_query, wikitext-103, for G=1 alignment repro"
+}

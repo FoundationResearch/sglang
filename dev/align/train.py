@@ -145,6 +145,12 @@ def main() -> int:
                         help='Dtype for saved weights (small file size).')
     parser.add_argument('--allow-dirty', action='store_true',
                         help='Skip the clean-tree check (manifest will note dirty=true).')
+    parser.add_argument('--overfit', action='store_true',
+                        help='Train on ONE fixed synthetic batch (reused every step) so '
+                             'the model memorises it and logits become sharply peaked. '
+                             'Required for a meaningful argmax-vs-official compare: fresh '
+                             'random tokens every step are unlearnable, so loss plateaus at '
+                             'the marginal entropy and argmax stays noise-dominated.')
     args = parser.parse_args()
 
     bootstrap.init_sglang_dist()  # not strictly needed for training, but cheap and consistent
@@ -192,12 +198,24 @@ def main() -> int:
 
     optim = torch.optim.AdamW(model.parameters(), lr=args.lr, betas=(0.9, 0.95), weight_decay=0.01)
 
-    losses: list[float] = []
-    for step in range(1, args.steps + 1):
-        input_ids, position_ids, labels = synthetic_batch(
+    # --overfit: draw ONE batch and reuse it every step (memorisation → sharp logits).
+    fixed_batch = None
+    if args.overfit:
+        fixed_batch = synthetic_batch(
             args.batch_size, args.seq_len, cfg.vocab_size, cfg.chunk_size,
             device=device, generator=gen,
         )
+        print('[train] --overfit: reusing one fixed batch every step')
+
+    losses: list[float] = []
+    for step in range(1, args.steps + 1):
+        if fixed_batch is not None:
+            input_ids, position_ids, labels = fixed_batch
+        else:
+            input_ids, position_ids, labels = synthetic_batch(
+                args.batch_size, args.seq_len, cfg.vocab_size, cfg.chunk_size,
+                device=device, generator=gen,
+            )
         out = model(input_ids=input_ids, position_ids=position_ids,
                     attention_mask=None, use_cache=False)
         loss = lm_loss(out.logits.float(), labels)

@@ -2101,6 +2101,26 @@ class HSAForCausalLM(nn.Module):
                 param.data.copy_(loaded_weight)
                 continue
 
+            # HSA attention projections: official checkpoints store these as
+            # `q_proj/k_proj/v_proj`, but the sglang model names them
+            # `hsa_q_proj/hsa_k_proj/hsa_v_proj` (a single projection shared by
+            # the SWA + HSA output heads, hsa_denom=1; see the lmk_q residual
+            # note above). The loader otherwise only reads q_proj as the lmk_q
+            # residual, so without this remap the 3 HSA projections per layer
+            # never load and stay at their NaN init -> the fused QKV built below
+            # is NaN -> every logit is NaN. Only fires when the direct name
+            # misses, so checkpoints already using hsa_*_proj names are unaffected.
+            if name not in params_dict and ".self_attn." in name:
+                for _old, _new in (
+                    ("q_proj", "hsa_q_proj"),
+                    ("k_proj", "hsa_k_proj"),
+                    ("v_proj", "hsa_v_proj"),
+                ):
+                    _cand = name.replace(f".self_attn.{_old}.", f".self_attn.{_new}.")
+                    if _cand in params_dict:
+                        name = _cand
+                        break
+
             # Direct load
             if name.endswith(".bias") and name not in params_dict:
                 continue

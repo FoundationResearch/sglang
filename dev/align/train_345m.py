@@ -152,6 +152,11 @@ def main():
     ap.add_argument("--wandb-project", default="ruler_pretrain_5per_345M")
     ap.add_argument("--wandb-name", default="hsa_8KA2K_HoPE-priorq-wloralmkq-loradim64")
     ap.add_argument("--no-wandb", action="store_true")
+    ap.add_argument("--overfit", action="store_true",
+                    help="Reuse ONE fixed batch every step so the model memorises it "
+                         "(loss->0, sharp/varied greedy output). For a non-trivial "
+                         "CG-vs-eager consistency test on a from-scratch model that "
+                         "would otherwise collapse to a high-frequency token.")
     args = ap.parse_args()
 
     rank, world, local_rank = setup_dist()
@@ -211,6 +216,18 @@ def main():
                            "model.hsa_qk_ratio": getattr(cfg, "hsa_qk_ratio", None),
                            "world_size": world})
 
+    # --overfit: one fixed batch (per rank), reused every step.
+    fixed_ids = None
+    if args.overfit:
+        fixed_ids = [stream.sample_batch(args.micro_bs).to(device) for _ in range(args.grad_accum)]
+        log0(f"[train] --overfit: memorising {args.grad_accum} fixed micro-batch(es) every step")
+        if is_main():
+            import json as _json
+            mem = fixed_ids[0][0].tolist()  # first sequence of the first micro-batch
+            os.makedirs(args.out, exist_ok=True)
+            _json.dump({"input_ids": mem}, open(os.path.join(args.out, "memorized_ids.json"), "w"))
+            log0(f"[train] dumped memorized sequence ({len(mem)} tokens) -> {args.out}/memorized_ids.json")
+
     t0 = time.time()
     loss_ema = None
     for step in range(1, args.steps + 1):
@@ -221,7 +238,8 @@ def main():
         optim.zero_grad(set_to_none=True)
         step_loss_sum = 0.0
         for accum in range(args.grad_accum):
-            ids = stream.sample_batch(args.micro_bs).to(device, non_blocking=True)
+            ids = (fixed_ids[accum] if fixed_ids is not None
+                   else stream.sample_batch(args.micro_bs).to(device, non_blocking=True))
             # input/label shift
             input_ids = ids[:, :-1].contiguous()
             labels = ids[:, 1:].contiguous()

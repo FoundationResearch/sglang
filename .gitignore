@@ -288,3 +288,8 @@ dev/_opt_review/
 
 wandb/
 
+
+# Local verify run artifacts (logs/pkls/cfgs; scripts kept)
+dev/_verify_run/*.log
+dev/_verify_run/*.pkl
+dev/_verify_run/*.json
