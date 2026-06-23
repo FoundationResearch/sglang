@@ -13,27 +13,37 @@ LENGTHS=(8192 16384 32768 65536 131072 262144 524288)
 OUT=/tmp/sweep_results.txt
 : > "$OUT"
 
+# A single bench request needs only ~L KV-cache tokens, but mem-fraction 0.85
+# reserves a multi-million-token KV cache (e.g. 7.4M at 512K) that starves the
+# HSA prefill activations (selection scores grow with L) -> spurious OOM/FAIL.
+# Drop the static fraction at long context so prefill has room; the KV cache is
+# still vastly larger than one request needs.  Override with MEM_FRAC=... .
+mem_frac_for() { # L
+  if [ -n "${MEM_FRAC:-}" ]; then echo "$MEM_FRAC"; return; fi
+  if [ "$1" -ge 262144 ]; then echo 0.5; else echo 0.85; fi
+}
+
 prefill_run() { # model backend len
-  local m=$1 b=$2 L=$3 ctx=$(($3+256))
+  local m=$1 b=$2 L=$3 ctx=$(($3+256)) mf=$(mem_frac_for "$3")
   local r
   r=$(CUDA_VISIBLE_DEVICES=$GPU timeout 2400 python -m sglang.bench_one_batch \
       --model-path "$m" --load-format dummy --tp 1 --batch-size 1 \
       --input-len "$L" --output-len 4 --max-running-requests 1 --context-length "$ctx" \
       --attention-backend "$b" --page-size 64 --disable-cuda-graph \
-      --mem-fraction-static 0.85 --trust-remote-code 2>&1)
+      --mem-fraction-static "$mf" --trust-remote-code 2>&1)
   local v=$(echo "$r" | grep -E "Prefill\. latency" | tail -1 | grep -oE "[0-9.]+ s" | head -1)
   local err=$(echo "$r" | grep -ciE "out of memory|OutOfMemory|refusing to silently|RuntimeError|CUDA error")
   echo "PREFILL  $b  L=$L  -> ${v:-FAIL}  (err_lines=$err)" | tee -a "$OUT"
 }
 
 decode_run() { # model backend len
-  local m=$1 b=$2 L=$3 ctx=$(($3+256))
+  local m=$1 b=$2 L=$3 ctx=$(($3+256)) mf=$(mem_frac_for "$3")
   local r
   r=$(CUDA_VISIBLE_DEVICES=$GPU timeout 2400 python -m sglang.bench_one_batch \
       --model-path "$m" --load-format dummy --tp 1 --batch-size 1 \
       --input-len "$L" --output-len 32 --max-running-requests 1 --context-length "$ctx" \
       --attention-backend "$b" --page-size 64 --cuda-graph-max-bs 1 \
-      --mem-fraction-static 0.85 --trust-remote-code 2>&1)
+      --mem-fraction-static "$mf" --trust-remote-code 2>&1)
   local v=$(echo "$r" | grep -E "Decode\.  median" | tail -1 | grep -oE "[0-9.]+ s" | head -1)
   local err=$(echo "$r" | grep -ciE "out of memory|OutOfMemory|refusing to silently|RuntimeError|CUDA error")
   echo "DECODE   $b  L=$L  -> ${v:-FAIL}  (err_lines=$err)" | tee -a "$OUT"
