@@ -125,34 +125,54 @@ def run_hf_inference(cfg: dict) -> Dict:
     orig_seq_len = input_ids.shape[1]
     print(f"[HF] Prompt tokens: {orig_seq_len}")
 
-    # ==================== Generate (greedy decode) ====================
-    # 使用 model.generate()，模型内部通过 prepare_inputs_for_generation 自动处理 LMK
-    print(f"[HF] Running model.generate() with max_new_tokens={max_new_tokens}...")
+    # ==================== Greedy decode via PREFILL-ROLLOUT ====================
+    # The official model's autoregressive generate-decode path is NOT implemented
+    # for the prior_query landmark scheme: lhsa_layer.py recomputes the per-chunk
+    # prior query ``mu_q`` from the CURRENT forward's lmk_q only (empty during
+    # 1-token decode) while ``k_chunked`` comes from the full KV cache, so
+    # chunk_attn_pool hits a (0 chunks vs N chunks) shape mismatch.  There is no
+    # per-chunk mu_q / lmk_k / prior_b decode cache in this layer.
+    #
+    # We therefore obtain an INDEPENDENT greedy reference the only way the
+    # official model supports correctly: re-run a full PREFILL over the growing
+    # real-token sequence each step (no KV cache), take the argmax of the last
+    # real token's logit, append, repeat.  This is numerically a greedy decode
+    # and uses ONLY the proven prefill path — exactly what compare.py forwards
+    # through (official_prefill_logits) and validated == sglang at 100% argmax.
+    print(f"[HF] Greedy decode via prefill-rollout, max_new_tokens={max_new_tokens} "
+          f"(official generate-decode unimplemented for prior_query; using prefill path)")
 
-    # 重置 generate 状态
-    model._gen_state.reset()
+    from utils.landmark_utils import (
+        insert_special_tokens as _insert_lmk,
+        create_position_ids_with_landmarks as _lmk_pos,
+    )
+
+    def _prefill_last_logit(real_tokens):
+        """Full prefill over real_tokens; return fp32 logit (V,) that predicts
+        the NEXT token (logit at the last real token position)."""
+        ids_t = _insert_lmk(torch.tensor([real_tokens]), model.lmk_id, chunk_size).to(device)
+        pos_t = _lmk_pos(None, len(real_tokens), chunk_size, device)
+        with torch.no_grad():
+            out = model(input_ids=ids_t, position_ids=pos_t,
+                        attention_mask=None, use_cache=False)
+        logits = out.logits[0, :, :vocab_size].float()  # (L_ext, V)
+        # insert_special_tokens appends a trailing LMK iff len % (chunk_size-1)==0,
+        # in which case the last real token sits one position before the end.
+        last_real_idx = -1 if (len(real_tokens) % (chunk_size - 1) != 0) else -2
+        return logits[last_real_idx].cpu()
+
+    real_tokens = input_ids[0].tolist()
+    generated_ids = []
+    decode_logits_list = []
 
     decode_start = time.time()
-    with torch.no_grad():
-        gen_output = model.generate(
-            input_ids,
-            max_new_tokens=max_new_tokens,
-            do_sample=False,  # greedy decode
-            output_scores=True,  # 返回每步的 logits
-            return_dict_in_generate=True,
-        )
-
-    # 重置 generate 状态
-    model._gen_state.reset()
-
+    for step in range(max_new_tokens):
+        next_logit = _prefill_last_logit(real_tokens)  # (V,)
+        next_id = int(next_logit.argmax().item())
+        generated_ids.append(next_id)
+        decode_logits_list.append(next_logit)
+        real_tokens.append(next_id)
     decode_time = time.time() - decode_start
-
-    # 提取生成结果
-    generated_ids = gen_output.sequences[0, orig_seq_len:].tolist()
-    # gen_output.scores 是 tuple，每个元素是 [batch_size, vocab_size] 的 logits
-    decode_logits_list = [
-        scores[0, :vocab_size].float().cpu() for scores in gen_output.scores
-    ]
 
     decode_text = tokenizer.decode(generated_ids)
     print(f"[HF] Decode done: {len(generated_ids)} tokens in {decode_time:.2f}s "
@@ -171,7 +191,7 @@ def run_hf_inference(cfg: dict) -> Dict:
     # ===== END DEBUG =====
 
     # 释放模型
-    del model, gen_output
+    del model
     gc.collect()
     torch.cuda.empty_cache()
     print("[HF] Model released, GPU memory freed.")
