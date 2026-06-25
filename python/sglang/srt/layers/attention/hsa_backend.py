@@ -1820,6 +1820,13 @@ class HSAAttnBackend(AttentionBackend):
                 q_4d_mp = q_sel_3.unsqueeze(0).contiguous()
                 lmk_4d_mp = lmk_full.unsqueeze(0).contiguous()
                 lse_swa_arg = self._last_swa_lse_hq_extend.unsqueeze(0).contiguous()
+                # prior_b (entropy bias from chunk_attn_pool) must enter the
+                # selection argmax-over-G the same way the softmax-topk sibling
+                # path passes it (bias=). online_topk_head adds it as
+                # `sm_scale*qk + bias - lse_swa`; returned scores stay raw qk.
+                # Omitting it diverges selection from the official prior_query
+                # path. Shape [S, h_q] -> [1, S, h_q] = [B, S, h_kv*G].
+                prior_b_mp = getattr(self, "_per_qhead_prior_b_ext", None)
                 # Returns indices [1, T, h_kv, K] int32, scores [1, T, h_q, K] raw scaled qk.
                 fused_indices_mp, scores_hq_mp = _online_topk_head_maxpool(
                     q_4d_mp,
@@ -1828,6 +1835,7 @@ class HSAAttnBackend(AttentionBackend):
                     block_size=page_size,
                     window_size=hsa_window if hsa_window > 0 else 0,
                     is_causal=True,
+                    bias=(prior_b_mp.unsqueeze(0) if prior_b_mp is not None else None),
                     G=G_e,
                     lse_swa=lse_swa_arg,
                     q_offset=prefix_len,

@@ -79,7 +79,9 @@ def hsa_extend_paged_fwd_kernel(
     D: tl.constexpr,
     TOPK: tl.constexpr,
     PAGE_SIZE: tl.constexpr,
-    MAX_T: tl.constexpr,
+    MAX_T,  # runtime: = page_table_1.shape[1] = batch max_seqlen_k, varies per
+            # prefill -> must NOT be constexpr or every new length recompiles.
+            # Only used as the `tok < MAX_T` bounds check (no compile-time use).
     mask_last_token: tl.constexpr,
     BLEND_SWA: tl.constexpr,
     BLOCK_M: tl.constexpr,
