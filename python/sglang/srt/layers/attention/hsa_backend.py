@@ -168,6 +168,19 @@ class HSAAttnBackend(AttentionBackend):
         self._dense_backend = TritonAttnBackend(model_runner, **kwargs)
         self.forward_metadata: Optional[HSAMetadata] = None
 
+        # Decode never reads the dense backend's kv_indptr/kv_indices/
+        # window_kv_indices: the HSA internal-SWA + sparse-attn kernels index
+        # the paged cache through page_table_1 directly, and the upper-SWA
+        # decode heads (HQ_swa>0) gather K/V by position via SDPA (see
+        # forward_decode).  The dense metadata is consumed ONLY by (a) non-HSA
+        # decode layers that delegate to TritonAttnBackend.forward_decode, and
+        # (b) the extend SWA-upper-head path (forward_extend, HQ_swa>0).  When
+        # every layer is HSA, building those indices each decode step
+        # (create_flashinfer_kv_indices_triton launches with grid (bs,) — a
+        # single block walking O(seqlen) tokens; ~9% of long-context decode)
+        # is pure waste.  Gate it off when no decode layer can consume it.
+        self._needs_dense_decode_metadata = self._compute_needs_dense_decode_metadata()
+
         # R52: auto-init per-q-head lmk_k pools when the config asks for the
         # chunk_attn_pool path. Previously these stayed None in production
         # sglang and `_maybe_write_chunk_lmk_k` returned early — silently
@@ -319,6 +332,22 @@ class HSAAttnBackend(AttentionBackend):
         if self._hsa_layer_ids is None:
             return True
         return int(layer_id) in self._hsa_layer_ids
+
+    def _compute_needs_dense_decode_metadata(self) -> bool:
+        """True iff some decode layer delegates to the dense backend.
+
+        Decode reads dense kv_indices only via non-HSA layers (which call
+        TritonAttnBackend.forward_decode).  If every layer is HSA, the dense
+        per-step metadata build is never consumed in decode and can be skipped.
+        Conservative default (keep the build) when the layer count is unknown.
+        """
+        if self._hsa_layer_ids is None:
+            # None => every layer is HSA (see _is_hsa_layer).
+            return False
+        n = getattr(self.model_runner.model_config, "num_hidden_layers", None)
+        if n is None:
+            return True
+        return not set(self._hsa_layer_ids) >= set(range(int(n)))
 
     # R64: shared scalar cache for prefill hot paths (selection + internal SWA +
     # chunk_attn_pool write all want the same (req_idx, prefix_len, extend_len)
@@ -775,8 +804,12 @@ class HSAAttnBackend(AttentionBackend):
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         # First, initialize dense backend metadata (standard indices, no LMK exclusion).
-        # SWA layers will use these indices directly.
-        self._dense_backend.init_forward_metadata(forward_batch)
+        # SWA layers will use these indices directly.  Skip the dense build during
+        # decode when no layer delegates to the dense backend (all-HSA model): the
+        # dense kv_indices are unused there, and their per-step construction
+        # (single-block O(seqlen) create_flashinfer_kv_indices) is the bottleneck.
+        if self._needs_dense_decode_metadata or not forward_batch.forward_mode.is_decode_or_idle():
+            self._dense_backend.init_forward_metadata(forward_batch)
 
         # R15: cuda-graph buffer path.  When persistent buffers are allocated
         # AND we're in decode-or-idle (the only mode cuda graph captures),
@@ -1010,16 +1043,22 @@ class HSAAttnBackend(AttentionBackend):
         spec_info: Optional[SpecInput],
         seq_lens_cpu: Optional[torch.Tensor],
     ):
-        self._dense_backend.init_forward_metadata_replay_cuda_graph(
-            bs,
-            req_pool_indices,
-            seq_lens,
-            seq_lens_sum,
-            encoder_lens,
-            forward_mode,
-            spec_info,
-            seq_lens_cpu,
-        )
+        # Skip the dense per-step index rebuild for all-HSA models: no dense
+        # kernels were captured into the graph (forward_decode never delegates),
+        # so the dense kv_indices are never read at replay.  This rebuild
+        # (create_flashinfer_kv_indices, single-block O(seqlen)) is ~9% of
+        # long-context CG decode.
+        if self._needs_dense_decode_metadata:
+            self._dense_backend.init_forward_metadata_replay_cuda_graph(
+                bs,
+                req_pool_indices,
+                seq_lens,
+                seq_lens_sum,
+                encoder_lens,
+                forward_mode,
+                spec_info,
+                seq_lens_cpu,
+            )
         # Update HSA buffers in place (so captured kernels see fresh data).
         # Note: must use the SAME buffer pointers as capture, otherwise the
         # captured graph reads from stale addresses.  Also re-publish
