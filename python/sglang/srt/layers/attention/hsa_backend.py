@@ -2520,6 +2520,17 @@ class HSAAttnBackend(AttentionBackend):
             swa_w_q=swa_w_q_for_kernel if blend_swa_in_kernel else None,
         )  # [T, HQ_hsa, D] bf16, SWA blend already applied if requested
 
+        # S==0 (whole sequence shorter than one page -> zero selectable chunks):
+        # the official model SKIPS its entire HSA chunk/blend block when
+        # full_seq_len < chunk_size and returns the SWA output at FULL weight.
+        # Our blend path instead still applies the softmax1 (+1) offset, which
+        # down-weights SWA by exp(lse)/(exp(lse)+1) (~0.78 at 10 tokens) -> the
+        # SHORT-<64-token misalignment. Mirror the official: at S==0 the HSA
+        # heads are pure SWA. Guarded on S==0 so the >=1-chunk path is untouched.
+        _, _pl_s0, _el_s0 = self._get_prefill_scalars(forward_batch)
+        if hsa_window > 0 and (_pl_s0 + _el_s0) // int(self.page_size) == 0:
+            out_hsa = swa_o_inner.to(out_hsa.dtype)
+
         # Step 8: Write HSA heads into the pre-allocated output tensor.
         # R83: when HQ_swa==0, out_hsa already covers all heads — return
         # directly without the empty+slice-write.
