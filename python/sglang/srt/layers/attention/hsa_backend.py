@@ -2274,6 +2274,37 @@ class HSAAttnBackend(AttentionBackend):
 
         return out.to(torch.bfloat16)
 
+    def _add_prior_b_extend_scores(self, scores, selected_page_ids, prior_b):
+        """Add the entropy bias prior_b, gathered at the SELECTED chunk indices,
+        onto the per-q-head chunk scores before the chunk-weight softmax.
+
+        Mirrors the official Qwen3-LHSA enable_prior_query path
+        (lhsa_layer.py: `scores = scores + gathered`, where
+        `gathered[b,l,h,k] = prior_b[b, indices[b,l,h,k], h]`).  The extend
+        maxpool / softmax-topk kernels return RAW qk scores (prior_b only steers
+        the selection argmax internally), so it must be re-added here for the
+        WEIGHTS.  Decode already does this inside `_pqh_score_maxpool_kernel`
+        (R48).  Without it the chunk weights diverge from official — argmax
+        survives at long context but short sequences (few chunks) flip.
+
+        scores            [T, HQ, K]  per-q-head raw chunk scores
+        selected_page_ids [T, H,  K]  selected chunk ids (kv-head granularity)
+        prior_b           [S, HQ]     per-chunk per-q-head entropy bias
+        """
+        T, HQ, K = scores.shape
+        H = selected_page_ids.shape[1]
+        # GQA broadcast indices h_kv -> h_q so they line up with prior_b's h_q.
+        idx_hq = (
+            selected_page_ids
+            if H == HQ
+            else selected_page_ids.repeat_interleave(HQ // H, dim=1)
+        )
+        idx = idx_hq.clamp_min(0).long().unsqueeze(0)            # [1, T, HQ, K]
+        S = prior_b.shape[0]
+        src = prior_b.unsqueeze(0).unsqueeze(-1).expand(1, S, HQ, K)  # [1, S, HQ, K]
+        gathered = torch.gather(src, dim=1, index=idx).squeeze(0)     # [T, HQ, K]
+        return scores + gathered.to(scores.dtype)
+
     def forward_extend(
         self,
         q: torch.Tensor,
@@ -2451,6 +2482,15 @@ class HSAAttnBackend(AttentionBackend):
             and per_qhead_scores.shape == (T, HQ_hsa, TOPK)
             and per_qhead_lse.shape == (T, HQ_hsa)
         )
+
+        # Official enable_prior_query: re-add prior_b (gathered at the selected
+        # chunk indices) onto the per-q-head scores before the chunk-weight
+        # softmax. The extend kernels return RAW qk; decode already adds it.
+        prior_b_ext = getattr(self, "_per_qhead_prior_b_ext", None)
+        if per_qhead_fusion and prior_b_ext is not None:
+            per_qhead_scores = self._add_prior_b_extend_scores(
+                per_qhead_scores, selected_page_ids, prior_b_ext
+            )
 
         if per_qhead_fusion and hsa_window > 0:
             # R76: reuse the existing fused_chunk_weight_per_qhead_decode kernel
