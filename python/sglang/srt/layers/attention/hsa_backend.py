@@ -1366,6 +1366,25 @@ class HSAAttnBackend(AttentionBackend):
                     swa_w_q=swa_w_q,
                 )  # [B, HQ_hsa, D] bf16 (blend already applied inside kernel)
 
+            # S==0 (per request, seq_len < one page -> zero selectable chunks):
+            # mirror the official model, which skips the entire HSA chunk/blend
+            # block when full_seq_len < chunk_size and returns SWA at FULL weight.
+            # Our blend still applied softmax1 (+1) -> SWA down-weighted by
+            # exp(lse)/(exp(lse)+1) (~0.78 at 10 tokens) -> the SHORT-<64-token
+            # decode misalignment (KL ~0.095 WARN; argmax already matched). This
+            # is the decode analog of the prefill fix (ce0c81f44). Decode batches
+            # mix lengths, so it's a PER-REQUEST mask, not a scalar guard; and it
+            # must replay under the decode CUDA graph, so use torch.where (pure
+            # tensor op, no .item()/.any() host sync) keyed on seq_lens (a
+            # CG-stable input buffer refreshed each step).
+            if hsa_window > 0:
+                _s0 = (
+                    forward_batch.seq_lens[:B].to(torch.int64) // int(self.page_size)
+                ) == 0  # [B]
+                out_hsa = torch.where(
+                    _s0.view(B, 1, 1), swa_o_inner.to(out_hsa.dtype), out_hsa
+                )
+
             # R34: HSA-345M has HQ_swa == 0 — skip the empty+slice-write that
             # otherwise copies out_hsa into a fresh out_all (≈2KB/layer × 16
             # layers under CG = ~30µs/step that's pure data motion for nothing).
