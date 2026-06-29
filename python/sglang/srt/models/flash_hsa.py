@@ -374,6 +374,7 @@ class FlashHSAInnerXAttention(nn.Module):
     def __init__(
         self,
         *,
+        config,
         hidden_size: int,
         num_heads: int,
         num_kv_heads: int,
@@ -733,11 +734,20 @@ class FlashHSAInnerXHierarchicalSparseAttention(nn.Module):
         # a single ColumnParallelLinear via `W = W1@W0 + W_hsa_q`. Real
         # production loading should add a similar weight loader hook.
         self.lmk_q_lora_dim = int(getattr(config, "lmk_q_lora_dim", -1))
+        # v3 md #7: layerwise_lmkq_norm — when True the landmark query is RMSNorm'd
+        # over the FULL projected width (hq_hsa_total * head_dim) instead of
+        # per-head (head_dim). Mirrors the official prior-query checkpoints that
+        # set this flag. Default False keeps the existing per-head fast path
+        # (so G>1 / non-layerwise checkpoints are unaffected).
+        self.layerwise_lmkq_norm = bool(getattr(config, "layerwise_lmkq_norm", False))
         if self.enable_lmk_q_proj:
             if self.lmk_q_full_dim:
                 # New-arch lmk_q_proj: one head_dim per q-head, no GQA broadcast in forward.
                 _lmk_q_out_dim_total = self.hq_hsa_total * self.head_dim
-                self.lmk_q_norm = RMSNorm(self.head_dim, eps=rms_norm_eps, **norm_kwargs)
+                _lmk_q_norm_dim = (
+                    _lmk_q_out_dim_total if self.layerwise_lmkq_norm else self.head_dim
+                )
+                self.lmk_q_norm = RMSNorm(_lmk_q_norm_dim, eps=rms_norm_eps, **norm_kwargs)
             else:
                 _lmk_q_out_dim_total = self.retrieval_dim
                 self.lmk_q_norm = RMSNorm(self.lmk_q_norm_dim, eps=rms_norm_eps, **norm_kwargs)
@@ -806,10 +816,16 @@ class FlashHSAInnerXHierarchicalSparseAttention(nn.Module):
         # h_q-headed lmk_k once per chunk and stores it in the backend's
         # LandmarkLmkKPool; the selector reads it at decode time and passes
         # G = hq_hsa // hk_hsa to the topk kernel.
+        # v3 md #2: writer activation must follow enable_prior_query, NOT
+        # (hq_hsa > hk_hsa). The latter only covers G>1 GQA; a G=1 MHA
+        # prior-query checkpoint (hq_hsa == hk_hsa) still requires chunk-level
+        # per-q-head lmk_k/prior_b to be written, else LandmarkLmkKPool stays
+        # zero-padded and selection reads slot-0 garbage. G>1 prior-query is
+        # unaffected (both old and new conditions are True there).
         self._per_qhead_lmk_k_active = bool(
             self.enable_lmk_q_proj
             and self.lmk_q_full_dim
-            and (self.hq_hsa > self.hk_hsa)
+            and bool(getattr(config, "enable_prior_query", False))
         )
         self.chunk_size = int(getattr(config, "chunk_size", 64))
 
@@ -1063,20 +1079,31 @@ class FlashHSAInnerXHierarchicalSparseAttention(nn.Module):
                 if attn_tp_size > 1:
                     lmk_q = tensor_model_parallel_all_gather(lmk_q.contiguous())
                 # After all-gather lmk_q has hq_hsa_total heads' worth.
-                lmk_q_h = lmk_q.view(-1, self.hq_hsa_total, self.head_dim).contiguous()
-                # Fast path: use the fused QK-Norm kernel (10x faster on
-                # head_dim=64 at long context) via in-place half-split.
-                if _try_fused_per_head_rmsnorm_3d_inplace(
-                    lmk_q_h,
-                    self.lmk_q_norm.weight,
-                    self.lmk_q_norm.variance_epsilon,
-                    self.head_dim,
-                ):
-                    lmk_q_h_norm = lmk_q_h
+                if self.layerwise_lmkq_norm:
+                    # v3 md #7: RMSNorm over the FULL projected width (norm
+                    # weight is hq_hsa_total*head_dim), then split per-head. The
+                    # per-head fused kernel below is only valid for head_dim-wide
+                    # norm, so layerwise takes this explicit path.
+                    lmk_q_h_norm = (
+                        self.lmk_q_norm(lmk_q)
+                        .view(-1, self.hq_hsa_total, self.head_dim)
+                        .contiguous()
+                    )
                 else:
-                    lmk_q_h_norm = self.lmk_q_norm(
-                        lmk_q_h.reshape(-1, self.head_dim)
-                    ).reshape(lmk_q_h.shape)
+                    lmk_q_h = lmk_q.view(-1, self.hq_hsa_total, self.head_dim).contiguous()
+                    # Fast path: use the fused QK-Norm kernel (10x faster on
+                    # head_dim=64 at long context) via in-place half-split.
+                    if _try_fused_per_head_rmsnorm_3d_inplace(
+                        lmk_q_h,
+                        self.lmk_q_norm.weight,
+                        self.lmk_q_norm.variance_epsilon,
+                        self.head_dim,
+                    ):
+                        lmk_q_h_norm = lmk_q_h
+                    else:
+                        lmk_q_h_norm = self.lmk_q_norm(
+                            lmk_q_h.reshape(-1, self.head_dim)
+                        ).reshape(lmk_q_h.shape)
                 if attn_tp_size > 1:
                     # Slice to local q heads.
                     tp_rank = get_attention_tp_rank()
@@ -1666,6 +1693,7 @@ class FlashHSAInnerXDecoderLayer(nn.Module):
                     getattr(config, "sliding_window_attention_size") or -1
                 )
             self.self_attn = FlashHSAInnerXAttention(
+                config=config,
                 hidden_size=self.hidden_size,
                 num_heads=int(getattr(config, "num_attention_heads")),
                 num_kv_heads=int(getattr(config, "num_key_value_heads")),

@@ -117,9 +117,21 @@ class HSAAttnBackend(AttentionBackend):
         # `headwise_topk_softmax=True` in config.json.
         default_headwise = bool(getattr(cfg, "headwise_topk_softmax", False))
         override_headwise = getattr(server_args, "hsa_headwise_topk_softmax", None)
-        self.headwise_topk_softmax = (
-            bool(override_headwise) if override_headwise is not None else default_headwise
-        )
+        # v3 md #1 (plan A): env override has highest priority so consistency
+        # tests can force the exact TRM softmax-topk path (=1) or the maxpool
+        # fast path (=0) without touching config/CLI. Priority:
+        #   env > server_args > config.json > default(False).
+        # We deliberately KEEP the default False (maxpool) — flipping it to True
+        # as the md proposes would slow every checkpoint's prefill (incl. the
+        # G=8 paper path). Prior-query checkpoints that need the exact path set
+        # SGLANG_HSA_HEADWISE_TOPK_SOFTMAX=1 (or headwise_topk_softmax in config).
+        env_headwise = os.environ.get("SGLANG_HSA_HEADWISE_TOPK_SOFTMAX", None)
+        if env_headwise is not None:
+            self.headwise_topk_softmax = env_headwise == "1"
+        elif override_headwise is not None:
+            self.headwise_topk_softmax = bool(override_headwise)
+        else:
+            self.headwise_topk_softmax = default_headwise
 
         self.hsa_layers = getattr(server_args, "hsa_layers", None)
         self._hsa_layer_ids: Optional[Set[int]] = self._resolve_hsa_layer_ids()
@@ -195,6 +207,11 @@ class HSAAttnBackend(AttentionBackend):
         if _hsa_cfg is None:
             _mc = getattr(model_runner, "model_config", None)
             _hsa_cfg = getattr(_mc, "hf_text_config", _mc)
+        # v3 md #5: surface enable_prior_query so the extend pure-PyTorch
+        # selection fallback can re-add prior_b (the maxpool + softmax-kernel
+        # siblings already pass it via bias=). TRM selection score is
+        # `q·lmk_k + prior_b`; without this the fallback drops the bias.
+        self.enable_prior_query = bool(getattr(_hsa_cfg, "enable_prior_query", False))
         # Env knob — used by dev/test_engine_alignment.py to reproduce the
         # pre-R52 silent disable state on demand. Set to "1" to skip auto-init
         # and force pools to stay None (matches pre-R52 production behaviour).
@@ -462,11 +479,17 @@ class HSAAttnBackend(AttentionBackend):
         # chunk_attn_pool default MHA mode), gather from there instead of
         # synthesising lmk_k from the last-token K in the paged KV cache.
         # The split_info carries hq_hsa / h_hsa so we know G = hq_hsa / h_hsa.
+        # v3 md #3: >= (not >) so a G=1 MHA prior-query checkpoint
+        # (hq_hsa == h_hsa) also uses the per-q-head pool path; with > it would
+        # fall back to shared-K/topk_group and silently drop prior_b. G>1 is
+        # unaffected (hq_hsa > h_hsa makes both forms True). When the pool is
+        # absent (non-prior_query models) per_qhead_active is False via the
+        # pool-None checks above, so this never spuriously activates.
         per_qhead_active = (
             getattr(self, "lmk_k_pool", None) is not None
             and getattr(self, "req_to_chunk_pool", None) is not None
             and split_info is not None
-            and int(split_info.get("hq_hsa", 0)) > int(split_info.get("h_hsa", 0))
+            and int(split_info.get("hq_hsa", 0)) >= int(split_info.get("h_hsa", 0))
         )
 
         # R24+R26: legacy h_kv fast path — fused_selector_score_kernel internalises
@@ -1766,11 +1789,14 @@ class HSAAttnBackend(AttentionBackend):
         # writer runs BEFORE this call (attn() comes after the write hook in
         # the layer's forward), so all S chunks of the current prefill are
         # already in the pool.
+        # v3 md #3: >= (not >) — G=1 MHA prior-query (hq_hsa == h_hsa) also
+        # takes the per-q-head pool path. G>1 unaffected; pool-None guards above
+        # keep non-prior_query models off this path.
         per_qhead_ext_active = (
             getattr(self, "lmk_k_pool", None) is not None
             and getattr(self, "req_to_chunk_pool", None) is not None
             and split_info is not None
-            and int(split_info.get("hq_hsa", 0)) > int(split_info.get("h_hsa", 0))
+            and int(split_info.get("hq_hsa", 0)) >= int(split_info.get("h_hsa", 0))
         )
         self._per_qhead_G_ext = None
         self._per_qhead_lmk_keys_full = None  # cache for the per-token-aware pytorch path
@@ -1834,10 +1860,20 @@ class HSAAttnBackend(AttentionBackend):
             D_kernel = D
 
         # --- 3. 调用 online_topk_group（跟 training 一致）---
-        assert _online_topk_group is not None, (
-            "Fused online_topk_group kernel 未加载，无法执行 extend selection。"
-            "请确保 hsa-kernel-main/ops/topk_group.py 可正常导入。"
+        # v3 md #6: the G=1/prior-query per-q-head exact path (below) runs in
+        # pure PyTorch (or the maxpool kernel) and does NOT use
+        # _online_topk_group. Only require that kernel for the non-per-q-head
+        # (shared-K group) path, so a missing group kernel doesn't block the
+        # per-q-head path.
+        _on_per_qhead_path = (
+            self._per_qhead_G_ext is not None
+            and self._per_qhead_lmk_keys_full is not None
         )
+        if not _on_per_qhead_path:
+            assert _online_topk_group is not None, (
+                "Fused online_topk_group kernel 未加载，无法执行 extend selection。"
+                "请确保 hsa-kernel-main/ops/topk_group.py 可正常导入。"
+            )
 
         # Q: [T, HQ_sel, D] → [1, T, HQ_sel, D]
         # 对于 unified_retrieval，HQ_sel=1, D=retrieval_dim
@@ -1856,10 +1892,17 @@ class HSAAttnBackend(AttentionBackend):
             #       and takes swa_lse directly. ~2x faster prefill topk per upstream.
             #       Uses _last_swa_lse_hq_extend that the SWA branch (step 3 in
             #       forward_extend) just produced.
+            # v3 md (robustness): the maxpool tilelang kernel tiles with
+            # GEMM_M = BLOCK_L * G, which violates its M % 16 == 0 requirement
+            # when G == 1 (GEMM_M = BLOCK_L = 8 -> hard tvm crash), independent
+            # of head count. A G=1 MHA prior-query checkpoint therefore cannot
+            # use the maxpool fast path; route it to the softmax-topk kernel
+            # (validated to align at G=1) instead. G>1 is unchanged.
             use_maxpool = (
                 not self.headwise_topk_softmax
                 and _online_topk_head_maxpool is not None
                 and self._last_swa_lse_hq_extend is not None
+                and int(self._per_qhead_G_ext or 0) > 1
             )
 
             G_e = int(self._per_qhead_G_ext)
@@ -1960,9 +2003,18 @@ class HSAAttnBackend(AttentionBackend):
                 lmk_full_f = lmk_full.float()                              # [S, h_q, D]
                 # Per-q-head scores: einsum(t,h,d ; s,h,d -> t,h,s)
                 scores_pqh = torch.einsum("thd,shd->ths", q_full, lmk_full_f) * sm_scale_ref
-                # NOTE: prior_b deliberately not added (see selector.py for the
-                # rationale — adding entropy bias hurts alignment until the
-                # chunk_attn_pool intermediate matches the official exactly).
+                # v3 md #5: re-add prior_b (entropy bias from chunk_attn_pool),
+                # mirroring the maxpool / softmax-kernel siblings which pass it
+                # via bias=. TRM selection score is `q·lmk_k + prior_b`. The
+                # chunk_attn_pool intermediate now matches official, so this is
+                # correct (and required for G=1 prior-query alignment).
+                # prior_b_ext: [S, h_q] -> [1, h_q, S] to broadcast onto
+                # scores_pqh [T, h_q, S].
+                prior_b_ext = getattr(self, "_per_qhead_prior_b_ext", None)
+                if self.enable_prior_query and prior_b_ext is not None:
+                    scores_pqh = scores_pqh + prior_b_ext.transpose(0, 1).unsqueeze(0).to(
+                        scores_pqh.dtype
+                    )
                 # Causal: query at global pos p sees chunks with end_pos < p.
                 # chunk c's end_pos = (c+1)*page_size - 1.  Visible iff end_pos < p
                 # i.e. c < p // page_size.  When sliding window, also exclude chunks

@@ -401,15 +401,18 @@ def select_topk_pages_decode_fused(
 
     # cand_repr: [B, C_max, H_sel, D].
     #
-    # Per-q-head path (G > 1): cand_repr arrives with H_sel == h_q.  sglang's
-    # fused online_topk_group does ``q.sum(over G)`` when h_q > h_kv (kernel
-    # semantics), which is NOT what the official wants for per-q-head lmks.
-    # The official's online_softmax_topk_head with explicit G uses
+    # Per-q-head path (including G == 1): cand_repr arrives with H_sel == h_q.
+    # Use this whenever G is provided so prior_b is applied for prior-query
+    # checkpoints. Falling through to topk_group would silently skip prior_b.
+    # sglang's fused online_topk_group does ``q.sum(over G)`` when h_q > h_kv
+    # (kernel semantics), which is NOT what the official wants for per-q-head
+    # lmks.  The official's online_softmax_topk_head with explicit G uses
     # ``max(over G) of per-q-head scores`` then topk.  We replicate that in
     # pure PyTorch — slower but algorithmically faithful, which is what
-    # alignment needs.  Fused kernel still handles the H_sel == h_kv (shared K)
-    # case, which is the existing default.
-    if G is not None and G > 1:
+    # alignment needs.  At G == 1 the max-over-G is identity (h_kv == h_q) but
+    # the prior_b add still matters.  Fused kernel still handles the
+    # H_sel == h_kv (shared K) case, which is the existing default.
+    if G is not None and G >= 1:
         # NOTE on R54b experiment: tried calling _online_topk_head_maxpool here
         # for the L=1 decode case — verified topk indices match the pure-pytorch
         # path (100% set overlap), but the tilelang kernel under-utilises the GPU
