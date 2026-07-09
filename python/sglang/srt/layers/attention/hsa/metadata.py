@@ -1,0 +1,90 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Optional
+
+import torch
+
+
+@dataclass
+class HSAMetadata:
+    """
+    Minimal HSA metadata scaffold.
+
+    This is intentionally small and aligned with SGLang's paged KV semantics.
+    As HSA implementation progresses, we can extend this dataclass similarly to
+    `NSAMetadata` (see `python/sglang/srt/layers/attention/nsa_backend.py`).
+    """
+
+    page_size: int
+
+    # token-level KV length per sequence (int32)
+    cache_seqlens_int32: torch.Tensor
+    # max KV length in this batch (token-level)
+    max_seqlen_k: int
+
+    # token->slot mapping table (page_size=1 semantics; token_loc in global pool)
+    page_table_1: torch.Tensor
+    # page_id table (page_size>1); for page_size==1, this may alias page_table_1
+    real_page_table: torch.Tensor
+
+    # Paged attention indices from the dense backend (standard, no LMK exclusion).
+    # Used by non-HSA (SWA) layers when delegated to the dense backend.
+    kv_indptr: Optional[torch.Tensor] = None
+    kv_indices: Optional[torch.Tensor] = None
+
+    # Sliding-window variants from dense backend (standard, no LMK exclusion)
+    window_kv_indptr: Optional[torch.Tensor] = None
+    window_kv_indices: Optional[torch.Tensor] = None
+
+    # HSA-specific decode indices with LMK positions excluded.
+    # Used by HSA layers only. Built by HSAAttnBackend.init_forward_metadata.
+    hsa_kv_indptr: Optional[torch.Tensor] = None
+    hsa_kv_indices: Optional[torch.Tensor] = None
+    hsa_kv_lens: Optional[torch.Tensor] = None  # [B] int32, per-seq non-LMK length
+    hsa_num_kv_splits: Optional[torch.Tensor] = None
+
+    # ---- Step 4+ (selection) optional debug fields (decode path) ----
+    # These are populated by HSAAttnBackend for observability and unit tests.
+    hsa_cand_page_ids: Optional[torch.Tensor] = None  # [B, C] int32 padded -1
+    hsa_cand_mask: Optional[torch.Tensor] = None  # [B, C] bool
+    hsa_selected_page_ids: Optional[torch.Tensor] = None  # [B, H, K] int32 padded -1
+    hsa_selected_scores: Optional[torch.Tensor] = None  # [B, H, K] float32
+
+    # R29: per-step (not per-layer) precomputed effective_cands[B] int32 —
+    # depends only on cache_seqlens + hsa_window, identical across HSA layers.
+    hsa_effective_cands: Optional[torch.Tensor] = None
+
+    # R54a: layer-invariant per-step selector scratch — only built when
+    # per_qhead path is active (HSA chunk_attn_pool config). cand_page_ids /
+    # cand_mask depend only on cache_seqlens + page_size + hsa_window;
+    # per_qhead_slots depends only on those + req_pool_indices via
+    # req_to_chunk_pool. All identical across HSA layers; this kills ~96
+    # redundant launches per decode step (~6 ops × 16 layers).
+    hsa_per_step_cand_page_ids: Optional[torch.Tensor] = None  # [B, C_max] int32
+    hsa_per_step_cand_mask: Optional[torch.Tensor] = None  # [B, C_max] bool
+    hsa_per_step_slots: Optional[torch.Tensor] = None  # [B, C_max] int32 lmk slot ids
+    hsa_per_step_hsa_window: Optional[int] = None  # cache for sanity check
+
+    # R54c: per-step pre-gathered lmk_k + prior_b across ALL layers — collapses
+    # 16x (lmk_k_pool.get + get_prior_b) ≈ 96 launches into 2 multi-layer
+    # index_selects. Shapes: [num_layers, B, C, h_q, D] and [num_layers, B, C, h_q].
+    hsa_per_step_all_lmk_k: Optional[torch.Tensor] = None
+    hsa_per_step_all_prior_b: Optional[torch.Tensor] = None
+
+    # ---- Extend-specific fields ----
+    token_positions: Optional[torch.Tensor] = None  # [total_extend_tokens] global pos
+    token_to_seq_id: Optional[torch.Tensor] = None  # [total_extend_tokens] -> batch idx
+    extend_seq_lens: Optional[torch.Tensor] = None  # [B] extend lengths
+    extend_prefix_lens: Optional[torch.Tensor] = None  # [B] prefix lengths
+
+    # Engine indices: engine-visible token index for each extend token.
+    # Unlike token_positions (which are position_ids with LMK sharing),
+    # engine_indices are monotonically increasing and unique per token.
+    engine_indices: Optional[torch.Tensor] = None  # [total_extend_tokens] int64
+
+    # Per-token selection results (extend path)
+    hsa_ext_selected_page_ids: Optional[torch.Tensor] = None  # [T, H, K] int32
+    hsa_ext_selected_scores: Optional[torch.Tensor] = None  # [T, H, K] float32
+
+
