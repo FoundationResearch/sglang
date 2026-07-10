@@ -22,6 +22,12 @@ as `O(N · topk · page_size)` instead of dense `O(N²)`, while staying numerica
 aligned with the reference model. At 345M / 512K context it is **~13.5× faster
 prefill and ~15.7× faster decode** than full attention, with parity around 16K.
 
+HSA is the SGLang serving backend for **HiLS-Attention** — see the paper
+[HiLS-Attention (arXiv:2607.02980)](https://arxiv.org/pdf/2607.02980) and the main
+repository [Tencent-Hunyuan/HiLS-Attention](https://github.com/Tencent-Hunyuan/HiLS-Attention)
+for the method, training code, and reference implementation. This fork ports it
+into SGLang for inference.
+
 Full details, config fields, and the benchmark table:
 [`python/sglang/srt/layers/attention/hsa/README.md`](python/sglang/srt/layers/attention/hsa/README.md).
 

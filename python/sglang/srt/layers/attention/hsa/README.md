@@ -8,6 +8,11 @@ those, plus a local **sliding window**. Cost grows as `O(N · topk · page_size)
 instead of dense `O(N²)`, so it crosses over dense attention at long context
 while staying numerically aligned with the reference model.
 
+This is the SGLang serving backend for **HiLS-Attention**. For the method,
+training code, and reference implementation see the paper
+[arXiv:2607.02980](https://arxiv.org/pdf/2607.02980) and the main repository
+[Tencent-Hunyuan/HiLS-Attention](https://github.com/Tencent-Hunyuan/HiLS-Attention).
+
 ## Enabling it
 
 Launch with the `hsa` attention backend and a page size equal to the model's
