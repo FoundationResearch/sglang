@@ -18,9 +18,14 @@ This is a fork of SGLang that adds an **HSA (Hierarchical Sparse Attention)**
 backend for **long-context** inference. HSA splits each sequence into fixed-size
 chunks, uses per-chunk *landmark* keys to select the top-`k` most relevant chunks
 per query (plus a local sliding window), and attends only to those — cost grows
-as `O(N · topk · page_size)` instead of dense `O(N²)`, while staying numerically
+as `O(N · topk · page_size)` instead of dense `O(N²)`, while staying closely
 aligned with the reference model. At 345M / 512K context it is **~13.5× faster
 prefill and ~15.7× faster decode** than full attention, with parity around 16K.
+
+> **Note:** this fork is intended for **speed benchmarking** of HiLS-Attention, not
+> fully-aligned production serving. Its alignment with the reference model is close
+> but not exact — the reference masks the inserted landmark (LMK) tokens in its
+> sliding-window (SWA) layers, which this backend does not yet replicate.
 
 HSA is the SGLang serving backend for **HiLS-Attention** — see the paper
 [HiLS-Attention (arXiv:2607.02980)](https://arxiv.org/pdf/2607.02980) and the main
@@ -65,7 +70,22 @@ python -m sglang.launch_server \
 # then query the OpenAI-compatible endpoint at http://localhost:30000
 ```
 
-Offline / single batch:
+Your own prompts (offline, no server) — `scripts/run_hsa_infer.py` wraps the
+offline engine and sets the HSA knobs for you. Prompts come from positional args,
+`--prompt`, a `--prompt-file` (one per line), or stdin:
+
+```bash
+python scripts/run_hsa_infer.py --model-path ./HiLS-Attention-7B-sglang \
+    "The capital of France is" "Water is made of hydrogen and"
+
+python scripts/run_hsa_infer.py --model-path ./HiLS-Attention-7B-sglang \
+    --prompt-file prompts.txt --max-new-tokens 128
+```
+
+It auto-sizes `context_length` to your prompts (override with `--context-length`
+for very long inputs).
+
+Offline / single batch (benchmarking):
 
 ```bash
 python -m sglang.bench_one_batch \
