@@ -567,12 +567,12 @@ class PrefillAdder:
         truncated = req.extend_input_len > _rem_tokens
         req.set_extend_input_len(min(req.extend_input_len, _rem_tokens))
 
-        # 当 extend_input_len 为 0 时（所有 token 已被 prefix 匹配），
-        # 强制至少 extend 1 个 token，避免 extend_len=0 导致下游
-        # RoPE crash 和 logits_processor 越界。
-        # 通过回退 prefix_indices 最后一个 token 来实现。
-        # 同时设置 extend_logprob_start_len = extend_input_len，
-        # 避免对已在前一个 chunk 中计算过 logprob 的 token 重复计算。
+        # When extend_input_len is 0 (all tokens matched by the prefix), force at
+        # least 1 extend token: extend_len=0 otherwise causes a downstream RoPE
+        # crash and a logits_processor out-of-bounds. We do this by rolling back
+        # the last prefix token. We also set extend_logprob_start_len =
+        # extend_input_len to avoid recomputing logprobs for tokens already
+        # scored in the previous chunk.
         if req.extend_input_len == 0:
             if len(req.prefix_indices) > 0:
                 req.prefix_indices = req.prefix_indices[:-1]

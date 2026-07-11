@@ -81,6 +81,23 @@ python -m sglang.bench_one_batch \
 > bit-exact selection (consistency testing) set `SGLANG_HSA_HEADWISE_TOPK_SOFTMAX=1`;
 > the default is the faster max-pool selection path.
 
+#### Runtime behavior specific to HSA
+
+The backend auto-configures two things at launch (you'll see a log line for each);
+you don't need to set any flags:
+
+- **Single-sequence prefill.** The HSA prefill kernels process one sequence at a
+  time, so the backend sets `prefill_max_requests=1` — requests are prefilled one
+  at a time. **Decode is unaffected and stays fully batched**, so throughput for
+  many concurrent generations is not impacted.
+- **Overlap scheduler disabled.** HSA decode interleaves virtual *landmark* (LMK)
+  tokens whose next input must be chosen synchronously from the current sequence
+  length; the overlap scheduler launches the next forward before that decision is
+  made. The backend therefore sets `disable_overlap_schedule=True`. This does not
+  change single-batch latency (the benchmark numbers above are unaffected); it can
+  slightly reduce online-serving decode throughput because per-step CPU overhead is
+  no longer hidden behind GPU compute.
+
 ### Reproduce the speed benchmark
 
 The sweep benches HSA vs dense (full) attention across 8K–512K context on a

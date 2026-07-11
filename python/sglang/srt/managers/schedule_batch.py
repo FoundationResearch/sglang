@@ -875,11 +875,11 @@ class Req:
         return out
 
     def _hsa_origin_to_fill_pos(self, origin_pos: int) -> int:
-        """将 origin_input_ids 空间的位置转换为 fill_ids 空间（含 LMK）。
+        """Map a position in origin_input_ids space to fill_ids space (with LMK).
 
-        HSA 每 (page_size-1) 个 token 后插入一个 LMK，
-        所以 origin 位置 pos 对应 fill 位置 = pos + pos // (page_size - 1)。
-        非 HSA 模型直接返回原值。
+        HSA inserts one LMK after every (page_size-1) tokens, so origin position
+        pos maps to fill position = pos + pos // (page_size - 1). For non-HSA
+        models this returns the value unchanged.
         """
         if origin_pos <= 0 or not self.hsa_lmk_enabled:
             return origin_pos
@@ -1715,16 +1715,20 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 logprob_token_ids = req.fill_ids[
                     global_start_idx + 1 : global_end_idx + 1
                 ]
-                # Bug 3 + Bug 7 修复：HSA 的 fill_ids 中包含 LMK token（id = vocab_size）。
+                # HSA fill_ids contain LMK tokens (id = vocab_size). Two things
+                # must be handled here:
                 #
-                # Bug 3: LMK token id 会越界 input_logprobs 的 vocab 维度，需 clamp。
+                # (1) The LMK token id would index out of the input_logprobs vocab
+                #     dimension, so it must be clamped.
                 #
-                # Bug 7 (PPL correctness): logprob_token_ids[k] 是 fill position
-                # (global_start_idx + k) 的 label（即下一个 token）。当 fill_ids[pos+1]
-                # 是 LMK 时，label 被错误地设为 0，但该 position 是 real token（不会被
-                # LMK mask 过滤），导致 logprob = log P(token_0) 而非 log P(next_real_token)。
-                # 修复：LMK 位置的 label 替换为 LMK 后面的 real token（fill_ids[pos+2]）；
-                #       LMK 自身位置的 label 保持 clamp 到 0（反正会被 mask 过滤掉）。
+                # (2) PPL correctness: logprob_token_ids[k] is the label (next
+                #     token) for fill position (global_start_idx + k). When
+                #     fill_ids[pos+1] is an LMK, the label is wrongly set to 0, but
+                #     that position is a real token (not filtered by the LMK mask),
+                #     yielding logprob = log P(token_0) instead of
+                #     log P(next_real_token). Fix: replace an LMK-position label with
+                #     the real token after the LMK (fill_ids[pos+2]); the LMK's own
+                #     position keeps its label clamped to 0 (it is masked out anyway).
                 if getattr(req, "hsa_lmk_enabled", False):
                     lmk_id = req.hsa_lmk_id
                     fill_ids = req.fill_ids

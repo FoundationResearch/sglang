@@ -58,6 +58,21 @@ python -m sglang.launch_server \
 > The default page size of 1 runs but is numerically wrong for HSA — the
 > landmark chunking assumes one page == one chunk.
 
+### Runtime behavior specific to HSA
+
+The backend auto-configures two things at launch (each logs a warning); no flags
+are needed:
+
+- **`prefill_max_requests=1`** — the HSA prefill (extend) kernels handle a single
+  sequence at a time, so prefill batches are capped to one request. **Decode stays
+  fully batched**, so concurrent-generation throughput is unaffected.
+- **`disable_overlap_schedule=True`** — HSA decode interleaves virtual landmark
+  (LMK) tokens whose next input is chosen synchronously from the current sequence
+  length, which the overlap scheduler cannot support (it launches the next forward
+  before that decision). Single-batch latency (the benchmark table above) is
+  unaffected; only online-serving decode throughput may drop slightly, since
+  per-step CPU overhead is no longer hidden behind GPU compute.
+
 The model config (`config.json`) drives the HSA geometry:
 
 | field | meaning |

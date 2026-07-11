@@ -529,22 +529,23 @@ class SchedulerOutputProcessorMixin:
                     )
 
     def _get_hsa_lmk_mask(self, req: Req, num_logprobs: int) -> list:
-        """[debug] 构建 HSA LMK 位置的 mask，用于过滤 input logprobs 中 LMK 位置的值。
+        """Build a mask over HSA LMK positions to filter LMK values out of input logprobs.
 
-        返回一个 bool 列表，长度 = num_logprobs，True 表示该位置是 real token（保留），
-        False 表示该位置是 LMK token（过滤掉）。
+        Returns a bool list of length num_logprobs; True means the position is a
+        real token (keep), False means it is an LMK token (drop).
 
-        LMK 在 fill_ids 中的位置规律：每 page_size 个 token 中，最后一个是 LMK。
-        即 fill_ids[k] == lmk_id 当且仅当 (k+1) % page_size == 0。
-        logprob 从 fill_ids 的 logprob_start_len 位置开始，所以需要加上偏移。
+        LMK positions in fill_ids follow a fixed pattern: the last token of every
+        page_size tokens is an LMK, i.e. fill_ids[k] == lmk_id iff
+        (k+1) % page_size == 0. Logprobs start at logprob_start_len in fill_ids,
+        so an offset is applied.
         """
         if not getattr(req, "hsa_lmk_enabled", False):
             return [True] * num_logprobs
         lmk_id = req.hsa_lmk_id
-        # logprob 对应的 fill_ids 区间：从 logprob_start_len 开始
-        # 但 fill_ids 中的 logprob_start_len 是基于含 LMK 的序列的
-        # 实际上 input_token_logprobs 对应 fill_ids 中最后 num_logprobs 个 token
-        # （因为 logprob_start_len=0 时，对应整个 fill_ids）
+        # The fill_ids range the logprobs cover starts at logprob_start_len, but
+        # that index is relative to the LMK-inclusive sequence. In practice
+        # input_token_logprobs corresponds to the last num_logprobs tokens of
+        # fill_ids (when logprob_start_len=0 it covers all of fill_ids).
         fill_ids = req.fill_ids
         start = len(fill_ids) - num_logprobs
         mask = []
@@ -559,8 +560,9 @@ class SchedulerOutputProcessorMixin:
         """Process input token logprobs values and indices."""
         is_multi_item_scoring = self._is_multi_item_scoring(req)
 
-        # [debug] HSA LMK 过滤：input_token_logprobs 包含 LMK 位置的 logprob，
-        # 但 origin_input_ids 不含 LMK，需要过滤掉 LMK 位置使两者对齐
+        # HSA LMK filtering: input_token_logprobs includes logprobs at LMK
+        # positions, but origin_input_ids has no LMKs — drop the LMK positions so
+        # the two line up.
         if getattr(req, "hsa_lmk_enabled", False):
             mask = self._get_hsa_lmk_mask(req, len(input_token_logprobs))
             input_token_logprobs = [
@@ -619,22 +621,23 @@ class SchedulerOutputProcessorMixin:
             req.input_top_logprobs_val.pop()
             req.input_top_logprobs_idx.pop()
 
-        # [debug] HSA LMK 过滤：top logprobs 也包含 LMK 位置的数据，需要过滤
+        # HSA LMK filtering: top logprobs also carry data at LMK positions — drop them.
         if getattr(req, "hsa_lmk_enabled", False):
-            # top logprobs 的长度与 input_token_logprobs_val 对齐前的长度一致
-            # 此时 input_top_logprobs_val 已经是 [None] + data[:-1] 的形式
-            # 需要用 fill_ids 来判断 LMK 位置
-            # 注意：第一个元素是 None（对应第一个 token 没有前驱），最后一个已被 pop
-            # 所以对应的 fill_ids 区间与 input_token_logprobs_val 相同
+            # The top-logprobs length matches input_token_logprobs_val before its
+            # own filtering. By this point input_top_logprobs_val is already in
+            # [None] + data[:-1] form, so LMK positions are identified via fill_ids.
+            # Note: the first element is None (the first token has no predecessor)
+            # and the last has been popped, so the covered fill_ids range matches
+            # input_token_logprobs_val.
             total_with_lmk = len(req.input_top_logprobs_val)
             if total_with_lmk > 0:
                 fill_ids = req.fill_ids
-                # input_top_logprobs_val[0] = None (第一个 token)
-                # input_top_logprobs_val[i] 对应 fill_ids 中从 logprob_start_len 开始的第 i 个 token
-                # 但由于 [None] + data[:-1] 的偏移，实际对应关系是：
-                # val[i] 对应 fill_ids[logprob_start_offset + i] 的 logprob
-                # 其中 logprob_start_offset 是 fill_ids 中 logprob 开始的位置
-                # 简化处理：直接用 fill_ids 中对应位置的 token id 判断
+                # input_top_logprobs_val[0] = None (first token); val[i] corresponds
+                # to the i-th token from logprob_start_len in fill_ids. Because of
+                # the [None] + data[:-1] shift, val[i] is the logprob at
+                # fill_ids[logprob_start_offset + i], where logprob_start_offset is
+                # where logprobs begin in fill_ids. Simplest: check the token id at
+                # the corresponding fill_ids position directly.
                 logprob_start_offset = len(fill_ids) - total_with_lmk
                 filtered_val = []
                 filtered_idx = []
@@ -678,7 +681,7 @@ class SchedulerOutputProcessorMixin:
             req.input_token_ids_logprobs_val.pop()
             req.input_token_ids_logprobs_idx.pop()
 
-        # [debug] HSA LMK 过滤：token_ids logprobs 也包含 LMK 位置的数据，需要过滤
+        # HSA LMK filtering: token_ids logprobs also carry data at LMK positions — drop them.
         if getattr(req, "hsa_lmk_enabled", False):
             total_with_lmk = len(req.input_token_ids_logprobs_val)
             if total_with_lmk > 0:

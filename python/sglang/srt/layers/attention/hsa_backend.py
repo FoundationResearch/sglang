@@ -1467,7 +1467,8 @@ class HSAAttnBackend(AttentionBackend):
           * Causal between extend Q and extend K (q_abs >= k_abs):
             (kernel: IS_CAUSAL with prefix_lens passed through)
 
-        Only supports batch=1 (SGLang continuous batching guarantee).
+        Only supports batch=1; the HSA backend enforces this by auto-setting
+        prefill_max_requests=1 (see ServerArgs). Decode stays batched.
 
         Returns
         -------
@@ -1496,8 +1497,9 @@ class HSAAttnBackend(AttentionBackend):
         assert extend_seq_lens is not None and extend_prefix_lens is not None
         B = int(extend_seq_lens.shape[0])
         assert B == 1, (
-            f"_compute_internal_swa_extend_batched currently supports batch=1 only, "
-            f"but got B={B}."
+            f"HSA extend (prefill) supports a single sequence per batch, but got B={B}. "
+            f"The HSA backend sets prefill_max_requests=1 automatically; do not override "
+            f"it with a larger value. Decode is unaffected and stays batched."
         )
 
         assert HQ_hsa % H_hsa == 0
@@ -1620,8 +1622,9 @@ class HSAAttnBackend(AttentionBackend):
             "extend_seq_lens and extend_prefix_lens must be set for extend mode"
         B = int(extend_seq_lens.shape[0])
         assert B == 1, (
-            f"_run_selection_extend_batched currently supports batch=1 only, "
-            f"but got B={B}. SGLang continuous batching should guarantee B=1 in the extend phase."
+            f"HSA extend (prefill) supports a single sequence per batch, but got B={B}. "
+            f"The HSA backend sets prefill_max_requests=1 automatically; do not override "
+            f"it with a larger value. Decode is unaffected and stays batched."
         )
 
         T = int(md.token_positions.shape[0])
