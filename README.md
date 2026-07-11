@@ -33,12 +33,32 @@ Full details, config fields, and the benchmark table:
 
 ### Run inference with HSA
 
-Enable the `hsa` attention backend and set the page size to the model's chunk
-size (**64**). Server:
+**Step 1 — Download the weights.** Grab the released HiLS-Attention checkpoint
+from the Hub:
+
+```bash
+huggingface-cli download tencent/HiLS-Attention-7B \
+    --local-dir ./HiLS-Attention-7B
+```
+
+**Step 2 — Transform the checkpoint.** The released weights use the upstream
+`HiLS*` / `hils_*` naming; the SGLang HSA backend expects the `HSAForCausalLM` /
+`FlashHSAConfig` schema. The weight tensors are already compatible — only
+`config.json` needs translating — so the converter just rewrites the config and
+symlinks the weights (pass `--copy` for a self-contained copy):
+
+```bash
+python scripts/convert_hils_checkpoint.py \
+    --src ./HiLS-Attention-7B \
+    --dst ./HiLS-Attention-7B-sglang
+```
+
+**Step 3 — Run inference.** Point the `hsa` backend at the converted directory
+and set the page size to the model's chunk size (**64**). Server:
 
 ```bash
 python -m sglang.launch_server \
-    --model-path <hsa-checkpoint> \
+    --model-path ./HiLS-Attention-7B-sglang \
     --attention-backend hsa \
     --page-size 64 \
     --trust-remote-code
@@ -49,7 +69,7 @@ Offline / single batch:
 
 ```bash
 python -m sglang.bench_one_batch \
-    --model-path <hsa-checkpoint> \
+    --model-path ./HiLS-Attention-7B-sglang \
     --attention-backend hsa \
     --page-size 64 \
     --input-len 131072 --output-len 32 --batch-size 1 \
@@ -57,9 +77,9 @@ python -m sglang.bench_one_batch \
 ```
 
 > `--page-size` **must** equal the model's `chunk_size` (64). Both GQA (`G>1`) and
-> MHA (`G=1`) prior-query checkpoints are supported. For bit-exact
-> selection (consistency testing) set `SGLANG_HSA_HEADWISE_TOPK_SOFTMAX=1`; the
-> default is the faster max-pool selection path.
+> MHA (`G=1`, e.g. the 7B checkpoint) prior-query checkpoints are supported. For
+> bit-exact selection (consistency testing) set `SGLANG_HSA_HEADWISE_TOPK_SOFTMAX=1`;
+> the default is the faster max-pool selection path.
 
 ### Reproduce the speed benchmark
 

@@ -15,12 +15,40 @@ training code, and reference implementation see the paper
 
 ## Enabling it
 
+### 1. Download the released weights
+
+```bash
+huggingface-cli download tencent/HiLS-Attention-7B --local-dir ./HiLS-Attention-7B
+```
+
+### 2. Transform the checkpoint for SGLang
+
+The released weights use the upstream `HiLS*` / `hils_*` naming, while this
+backend expects the `HSAForCausalLM` / `FlashHSAConfig` schema (`hsa_*` keys).
+**The weight tensors are already compatible — only `config.json` needs
+translating.** The converter rewrites the config and symlinks the weights
+(add `--copy` to make a standalone copy):
+
+```bash
+python scripts/convert_hils_checkpoint.py \
+    --src ./HiLS-Attention-7B --dst ./HiLS-Attention-7B-sglang
+```
+
+It derives the `hsa_*` geometry from the source config
+(`hsa_heads`, `hsa_qk_ratio`, `hsa_topk`, `hsa_sliding_window`, `apply_hsa_rope`,
+`head_dim`), sets `architectures=["HSAForCausalLM"]` and the matching
+`model_type` (`olmo_lhsa` post-norm / `qwen_lhsa` pre-norm), audits that every
+weight tensor matches the HSA schema, and validates the result through
+`FlashHSAConfig`.
+
+### 3. Serve
+
 Launch with the `hsa` attention backend and a page size equal to the model's
 chunk size (default **64**):
 
 ```bash
 python -m sglang.launch_server \
-    --model-path <hsa-checkpoint> \
+    --model-path ./HiLS-Attention-7B-sglang \
     --attention-backend hsa \
     --page-size 64 \
     --trust-remote-code
