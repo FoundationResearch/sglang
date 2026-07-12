@@ -1,12 +1,13 @@
-# HSA — Hierarchical Sparse Attention backend for SGLang
+# HiLS-Attention (HSA) backend for SGLang
 
-HSA (Hierarchical Sparse Attention, a.k.a. HiLS-Attention) is a landmark-based
-sparse-attention backend for long-context inference. Each key/value sequence is
-split into fixed-size **chunks** (pages); a small set of per-chunk **landmark**
-keys lets every query select only the top-`k` most relevant chunks and attend to
-those, plus a local **sliding window**. Cost grows as `O(N · topk · page_size)`
-instead of dense `O(N²)`, so it crosses over dense attention at long context
-while staying numerically aligned with the reference model.
+HiLS-Attention — a hierarchical sparse attention (HSA) mechanism — is a
+landmark-based sparse-attention backend for long-context inference, invoked as
+`--attention-backend hsa`. Each key/value sequence is split into fixed-size
+**chunks** (pages); a small set of per-chunk **landmark** keys lets every query
+select only the top-`k` most relevant chunks and attend to those, plus a local
+**sliding window**. Cost grows as `O(N · topk · page_size)` instead of dense
+`O(N²)`, so it crosses over dense attention at long context while staying closely
+aligned with the reference model.
 
 This is the SGLang serving backend for **HiLS-Attention**. For the method,
 training code, and reference implementation see the paper
@@ -38,7 +39,7 @@ It derives the `hsa_*` geometry from the source config
 (`hsa_heads`, `hsa_qk_ratio`, `hsa_topk`, `hsa_sliding_window`, `apply_hsa_rope`,
 `head_dim`), sets `architectures=["HSAForCausalLM"]` and the matching
 `model_type` (`olmo_lhsa` post-norm / `qwen_lhsa` pre-norm), audits that every
-weight tensor matches the HSA schema, and validates the result through
+weight tensor matches the HiLS-Attention schema, and validates the result through
 `FlashHSAConfig`.
 
 ### 3. Serve
@@ -55,36 +56,36 @@ python -m sglang.launch_server \
 ```
 
 > **`--page-size` must equal `chunk_size`** (64 for the released checkpoints).
-> The default page size of 1 runs but is numerically wrong for HSA — the
+> The default page size of 1 runs but is numerically wrong for HiLS-Attention — the
 > landmark chunking assumes one page == one chunk.
 
-### Runtime behavior specific to HSA
+### Runtime behavior specific to the HiLS-Attention backend
 
 The backend auto-configures two things at launch (each logs a warning); no flags
 are needed:
 
-- **`prefill_max_requests=1`** — the HSA prefill (extend) kernels handle a single
-  sequence at a time, so prefill batches are capped to one request. **Decode stays
-  fully batched**, so concurrent-generation throughput is unaffected.
-- **`disable_overlap_schedule=True`** — HSA decode interleaves virtual landmark
+- **`prefill_max_requests=1`** — the HiLS-Attention prefill (extend) kernels handle
+  a single sequence at a time, so prefill batches are capped to one request. **Decode
+  stays fully batched**, so concurrent-generation throughput is unaffected.
+- **`disable_overlap_schedule=True`** — HiLS-Attention decode interleaves virtual landmark
   (LMK) tokens whose next input is chosen synchronously from the current sequence
   length, which the overlap scheduler cannot support (it launches the next forward
   before that decision). Single-batch latency (the benchmark table above) is
   unaffected; only online-serving decode throughput may drop slightly, since
   per-step CPU overhead is no longer hidden behind GPU compute.
 
-The model config (`config.json`) drives the HSA geometry:
+The model config (`config.json`) drives the HiLS-Attention geometry:
 
 | field | meaning |
 |---|---|
-| `hsa_heads` | number of attention heads routed through HSA (== `num_attention_heads` for an all-HSA / `hsa_denom=1` model) |
+| `hsa_heads` | number of attention heads routed through HiLS-Attention (== `num_attention_heads` for an all-sparse / `hsa_denom=1` model) |
 | `hsa_topk` | chunks selected per query (e.g. 32) |
 | `chunk_size` | tokens per chunk/page (64) |
 | `hsa_sliding_window` / `sliding_window` | local window width (e.g. 512) |
 | `enable_prior_query` | use per-chunk landmark queries + entropy-bias (`prior_b`) selection |
 | `enable_lmk_q_proj`, `lmk_q_lora_dim` | landmark-query projection |
 | `layerwise_lmkq_norm` | RMSNorm the landmark query over the full projected width instead of per-head |
-| `apply_hsa_rope`, `enable_inrange_rope`, `use_hope` | RoPE variants applied to the HSA branch |
+| `apply_hsa_rope`, `enable_inrange_rope`, `use_hope` | RoPE variants applied to the HiLS-Attention branch |
 
 Both GQA (`G = h_q / h_kv > 1`) and MHA (`G = 1`) prior-query checkpoints are
 supported.
@@ -110,9 +111,9 @@ bundled TVM must import cleanly in your environment.
 ## Performance (345M, H200, bf16, chunk 64, top-k 32, 512-window, batch 1)
 
 Prefill is warm full-input latency; decode is median per-token with CUDA graphs.
-Speedup = full-attention / HSA.
+Speedup = full-attention / HiLS-Attention.
 
-| Context | HSA prefill | Full prefill | Pf speedup | HSA decode | Full decode | Dc speedup |
+| Context | HiLS prefill | Full prefill | Pf speedup | HiLS decode | Full decode | Dc speedup |
 |---:|---:|---:|---:|---:|---:|---:|
 | 8K   | 47 ms   | 29 ms   | 0.62× | 3.87 ms | 2.83 ms | 0.73× |
 | 16K  | 81 ms   | 85 ms   | 1.05× | 3.87 ms | 4.21 ms | 1.09× |

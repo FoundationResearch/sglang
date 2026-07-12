@@ -12,31 +12,32 @@
 
 --------------------------------------------------------------------------------
 
-## 🔍 This fork: HSA — Hierarchical Sparse Attention
+## 🔍 This fork: HiLS-Attention — long-context serving in SGLang
 
-This is a fork of SGLang that adds an **HSA (Hierarchical Sparse Attention)**
-backend for **long-context** inference. HSA splits each sequence into fixed-size
-chunks, uses per-chunk *landmark* keys to select the top-`k` most relevant chunks
-per query (plus a local sliding window), and attends only to those — cost grows
-as `O(N · topk · page_size)` instead of dense `O(N²)`, while staying closely
-aligned with the reference model. At 345M / 512K context it is **~13.5× faster
-prefill and ~15.7× faster decode** than full attention, with parity around 16K.
+This is a fork of SGLang that adds a serving backend for **HiLS-Attention**, a
+hierarchical sparse attention (HSA) mechanism for **long-context** inference. The
+backend is invoked as `--attention-backend hsa`. HiLS-Attention splits each
+sequence into fixed-size chunks, uses per-chunk *landmark* keys to select the
+top-`k` most relevant chunks per query (plus a local sliding window), and attends
+only to those — cost grows as `O(N · topk · page_size)` instead of dense `O(N²)`,
+while staying closely aligned with the reference model. At 345M / 512K context it
+is **~13.5× faster prefill and ~15.7× faster decode** than full attention, with
+parity around 16K.
 
 > **Note:** this fork is intended for **speed benchmarking** of HiLS-Attention, not
 > fully-aligned production serving. Its alignment with the reference model is close
 > but not exact — the reference masks the inserted landmark (LMK) tokens in its
 > sliding-window (SWA) layers, which this backend does not yet replicate.
 
-HSA is the SGLang serving backend for **HiLS-Attention** — see the paper
+This fork ports **HiLS-Attention** into SGLang for inference — see the paper
 [HiLS-Attention (arXiv:2607.02980)](https://arxiv.org/pdf/2607.02980) and the main
 repository [Tencent-Hunyuan/HiLS-Attention](https://github.com/Tencent-Hunyuan/HiLS-Attention)
-for the method, training code, and reference implementation. This fork ports it
-into SGLang for inference.
+for the method, training code, and reference implementation.
 
 Full details, config fields, and the benchmark table:
 [`python/sglang/srt/layers/attention/hsa/README.md`](python/sglang/srt/layers/attention/hsa/README.md).
 
-### Run inference with HSA
+### Run inference with HiLS-Attention
 
 **Step 1 — Download the weights.** Grab the released HiLS-Attention checkpoint
 from the Hub:
@@ -47,7 +48,7 @@ huggingface-cli download tencent/HiLS-Attention-7B \
 ```
 
 **Step 2 — Transform the checkpoint.** The released weights use the upstream
-`HiLS*` / `hils_*` naming; the SGLang HSA backend expects the `HSAForCausalLM` /
+`HiLS*` / `hils_*` naming; the SGLang HiLS-Attention backend expects the `HSAForCausalLM` /
 `FlashHSAConfig` schema. The weight tensors are already compatible — only
 `config.json` needs translating — so the converter just rewrites the config and
 symlinks the weights (pass `--copy` for a self-contained copy):
@@ -71,7 +72,8 @@ python -m sglang.launch_server \
 ```
 
 Your own prompts (offline, no server) — `scripts/run_hsa_infer.py` wraps the
-offline engine and sets the HSA knobs for you. Prompts come from positional args,
+offline engine and sets the backend knobs (`--attention-backend hsa`,
+`--page-size 64`) for you. Prompts come from positional args,
 `--prompt`, a `--prompt-file` (one per line), or stdin:
 
 ```bash
@@ -101,16 +103,16 @@ python -m sglang.bench_one_batch \
 > bit-exact selection (consistency testing) set `SGLANG_HSA_HEADWISE_TOPK_SOFTMAX=1`;
 > the default is the faster max-pool selection path.
 
-#### Runtime behavior specific to HSA
+#### Runtime behavior specific to the HiLS-Attention backend
 
 The backend auto-configures two things at launch (you'll see a log line for each);
 you don't need to set any flags:
 
-- **Single-sequence prefill.** The HSA prefill kernels process one sequence at a
-  time, so the backend sets `prefill_max_requests=1` — requests are prefilled one
-  at a time. **Decode is unaffected and stays fully batched**, so throughput for
-  many concurrent generations is not impacted.
-- **Overlap scheduler disabled.** HSA decode interleaves virtual *landmark* (LMK)
+- **Single-sequence prefill.** The HiLS-Attention prefill kernels process one
+  sequence at a time, so the backend sets `prefill_max_requests=1` — requests are
+  prefilled one at a time. **Decode is unaffected and stays fully batched**, so
+  throughput for many concurrent generations is not impacted.
+- **Overlap scheduler disabled.** HiLS-Attention decode interleaves virtual *landmark* (LMK)
   tokens whose next input must be chosen synchronously from the current sequence
   length; the overlap scheduler launches the next forward before that decision is
   made. The backend therefore sets `disable_overlap_schedule=True`. This does not
@@ -120,8 +122,8 @@ you don't need to set any flags:
 
 ### Reproduce the speed benchmark
 
-The sweep benches HSA vs dense (full) attention across 8K–512K context on a
-single GPU with dummy weights (no checkpoint needed):
+The sweep benches HiLS-Attention vs dense (full) attention across 8K–512K context
+on a single GPU with dummy weights (no checkpoint needed):
 
 ```bash
 GPU=0 bash dev/sweep_8k_512k.sh   # writes /tmp/sweep_results.txt
