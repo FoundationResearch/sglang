@@ -223,9 +223,59 @@ The released 7B is MHA — 32 layers × 32 KV heads × head_dim 128 = 512 KB per
 token, **32× more**. At 64K that is 1 GB/step for the 345M against ~32 GB/step
 for the 7B: the 345M's dense baseline sits ~33× off its bandwidth roofline at
 bs=1 and therefore absorbs batch almost for free, which is precisely why HSA's
-advantage erodes with batch here. A 7B dense baseline would already be
-bandwidth-bound at bs=1 and could not do that. Not measured — the 7B has no
-dense twin config yet.
+advantage erodes with batch here.
+
+## MHA vs GQA at the same model size
+
+To isolate the head-count factor, `dev/bench_models/{hsa,dense}345m_mha_hd128`
+are the same 345M configs with `num_key_value_heads` 2 → 16 (G=1, the layout
+the released 7B uses) and nothing else changed. Decode ms, HSA / dense →
+speedup, dummy weights, idle H200:
+
+| L | bs=1 | bs=4 | bs=16 |
+|---|---|---|---|
+| 8K  | 3.08 / 3.65 → 1.19× | 3.93 / 3.84 → 0.98× | 5.61 / 10.18 → 1.81× |
+| 16K | 3.17 / 5.61 → 1.77× | 3.98 / 5.92 → 1.49× | 5.68 / 15.82 → 2.79× |
+| 32K | 3.27 / 9.46 → 2.89× | 4.12 / 10.08 → 2.45× | 5.86 / 30.50 → 5.20× |
+| 64K | 3.34 / 17.12 → 5.13× | 4.29 / 18.37 → 4.28× | KV capacity, see below |
+
+Against the GQA pair at bs=16 (0.57× / 0.81× / 1.31× / 2.20×) the picture
+inverts. HSA's own latency barely moves — 5.00 → 5.61 ms at 8K, 5.25 → 5.86 at
+32K, about +10% — because it reads `topk*64 + window` tokens and had ~10× of
+bandwidth headroom to absorb the extra heads. Dense is what changes: 2.87 →
+10.18 ms at 8K/bs=16, 6.88 → 30.50 at 32K/bs=16. Crucially it stops absorbing
+batch for free (32K dense, bs 1/4/16: GQA 6.69/6.49/6.88 flat, MHA
+9.46/10.08/30.50), so under MHA HSA's advantage *grows* with batch instead of
+shrinking, and it wins at every length tested including 8K.
+
+This isolates only the head count (8×); the released 7B adds 2× the layers on
+top, so its curve should be better still. Synthetic config with dummy weights —
+no trained MHA 345M exists.
+
+## HSA saves bandwidth, not KV capacity
+
+HSA stores the full KV cache exactly like dense; it only reads less of it per
+step. So KV *capacity* limits hit both identically, and MHA hits them 8× sooner
+(128 KB/token vs 16 KB/token). At 64K × bs=16 the MHA pair needs 1,048,576
+token slots and cannot get them on one H200:
+
+| mem-fraction | token slots | needed |
+|---|---|---|
+| 0.50 | 552,896 | 1,048,576 |
+| 0.85 | 952,320 | 1,048,576 |
+| 0.92 | 1,032,192 | 1,048,576 |
+| GQA @ 0.50 | 4,430,592 | 1,048,576 |
+
+It misses by 1.6% at mem-fraction 0.92, with nothing left for weights,
+activations and the CUDA graph — a hard wall, not a tuning failure (bs=15 fits,
+bs=16 does not). Extrapolated to the released 7B at 512 KB/token, 64K × bs=16
+would need 512 GB of KV.
+
+So the honest reading of the MHA table is that long context and large batch
+cannot both be had on one GPU: the reachable regimes there are long context
+with small batch (64K, bs=1/4 → 5.13× / 4.28×) and medium context with large
+batch (32K, bs=16 → 5.20×). The 64K × bs=16 cell would need multiple GPUs, KV
+offload or KV quantisation, and that comparison would have to be redone.
 
 ## Still limited to B == 1 / TP == 1
 

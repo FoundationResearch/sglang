@@ -1,0 +1,6 @@
+hsa345m_mha_hd128 L=65536 bs=1 -> 0.00334 s
+dense345m_mha_hd128 L=65536 bs=1 -> 0.01712 s
+hsa345m_mha_hd128 L=65536 bs=4 -> 0.00429 s
+dense345m_mha_hd128 L=65536 bs=4 -> 0.01837 s
+hsa345m_mha_hd128 L=65536 bs=16 -> FAIL
+dense345m_mha_hd128 L=65536 bs=16 -> FAIL
