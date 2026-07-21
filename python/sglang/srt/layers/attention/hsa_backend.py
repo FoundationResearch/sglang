@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 import os
 import re
-from typing import TYPE_CHECKING, Optional, Set
+from typing import TYPE_CHECKING, List, NamedTuple, Optional, Set
 
 import torch
 
@@ -20,7 +20,7 @@ from sglang.srt.layers.attention.hsa.kernels.cuda_graph_buffers import (
     update_hsa_cg_buffers,
 )
 from sglang.srt.layers.attention.hsa.metadata import HSAMetadata
-from sglang.srt.mem_cache.landmark_pool import LandmarkLmkKPool, ReqToChunkPool
+from sglang.srt.mem_cache.landmark_pool import KvPageChunkSlots, LandmarkLmkKPool
 from sglang.srt.layers.attention.hsa.selector import (
     _online_topk_group,
     _online_topk_head_maxpool,
@@ -58,6 +58,15 @@ def _get_compiled_flex_attention():
     # Compiling the base entrypoint (as recommended by PyTorch) avoids the unfused slow path.
     _COMPILED_FLEX_ATTN = torch.compile(flex_attention, dynamic=True)
     return _COMPILED_FLEX_ATTN
+
+
+class ExtendSeqCtx(NamedTuple):
+    """One sequence's slice of a (possibly batched) extend forward."""
+
+    b: int            # row of this sequence in page_table_1
+    prefix_len: int   # tokens already in cache before this extend
+    extend_len: int   # tokens this extend contributes
+    tok_start: int    # offset of this sequence in the packed token axis
 
 
 class HSAAttnBackend(AttentionBackend):
@@ -248,41 +257,41 @@ class HSAAttnBackend(AttentionBackend):
                     )
                 if _ctx_len <= 0:
                     _ctx_len = 131072  # last-ditch fallback
-                # Allow LMK insertion (~+3%) + small slack.
-                max_chunks_per_req = max(
-                    int(_ctx_len * 33 // 32 // int(self.page_size)) + 16, 16
-                )
-                req_pool = getattr(model_runner, "req_to_token_pool", None)
-                req_pool_size = int(getattr(req_pool, "size", 1) or 1)
-                # Each concurrent req can occupy up to max_chunks_per_req slots.
-                # Cap total slots so the lmk_k_pool itself stays bounded: at
-                # 16 heads × 64 D × 2B/elem × 16 layers ≈ 32 KiB per slot;
-                # we want ≤ ~4 GiB → ~128K slots ceiling. Production rarely
-                # has all reqs holding the full context simultaneously, so cap
-                # at min(req_pool_size, 128) × max_chunks_per_req.
-                effective_reqs = min(max(req_pool_size, 1), 128)
-                num_chunk_slots = max(
-                    max_chunks_per_req * effective_reqs + 16, 16
-                )
+                # Landmark slots are keyed by KV page id (see KvPageChunkSlots),
+                # so the pool is sized by the KV cache itself — one slot per
+                # page, shared by every request that shares that page. That is
+                # both smaller and leak-free compared with the old
+                # per-(req, chunk) table, which had to reserve
+                # max_chunks_per_req × concurrent_reqs slots and never released
+                # them.
+                kv_pool = getattr(model_runner, "token_to_kv_pool", None)
+                _kv_tokens = int(getattr(kv_pool, "size", 0) or 0)
+                if _kv_tokens <= 0:
+                    _mr_max = getattr(model_runner, "max_total_num_tokens", 0)
+                    _kv_tokens = int(_mr_max or 0)
+                if _kv_tokens <= 0:
+                    # Offline harnesses (dev/align/compare.py) mock the runner
+                    # without a KV pool; fall back to per-request context.
+                    _kv_tokens = int(_ctx_len * 33 // 32)
+                num_pages = max(_kv_tokens // int(self.page_size) + 1, 16)
                 self.lmk_k_pool = LandmarkLmkKPool(
-                    num_chunk_slots=num_chunk_slots,
+                    num_chunk_slots=num_pages,
                     num_layers=num_layers,
                     h_q=h_q,
                     head_dim=head_dim,
                     dtype=torch.bfloat16,
                     device=self.device,
                 )
-                self.req_to_chunk_pool = ReqToChunkPool(
-                    num_reqs=req_pool_size,
-                    max_chunks_per_req=max_chunks_per_req,
+                self.req_to_chunk_pool = KvPageChunkSlots(
+                    num_pages=num_pages,
+                    page_size=int(self.page_size),
                     device=self.device,
                 )
                 if os.environ.get("SGLANG_HSA_ALIGN_DEBUG", "0") == "1":
                     print(
-                        f"[HSA-align] init lmk_k_pool slots={num_chunk_slots}, "
-                        f"layers={num_layers}, h_q={h_q}, head_dim={head_dim}, "
-                        f"req_pool={req_pool_size}, "
-                        f"max_chunks_per_req={max_chunks_per_req}",
+                        f"[HSA-align] init lmk_k_pool slots={num_pages} "
+                        f"(kv_tokens={_kv_tokens}, page_size={self.page_size}), "
+                        f"layers={num_layers}, h_q={h_q}, head_dim={head_dim}",
                         flush=True,
                     )
             except Exception as e:
@@ -392,6 +401,42 @@ class HSAAttnBackend(AttentionBackend):
         scalars = (req_idx, prefix_len, extend_len)
         forward_batch._hsa_prefill_scalars = scalars
         return scalars
+
+    def _get_extend_seq_ctxs(self, forward_batch) -> List["ExtendSeqCtx"]:
+        """Per-sequence view of an extend batch, cached once per forward.
+
+        The HSA extend path (internal SWA, chunk selection, landmark gather) is
+        written against one ``(prefix_len, page-table row)`` pair at a time, so
+        a batched extend is executed as one call per sequence over its slice of
+        the packed token axis.  This returns those slices.
+        """
+        cached = getattr(forward_batch, "_hsa_extend_seq_ctxs", None)
+        if cached is not None:
+            return cached
+
+        ep_cpu = getattr(forward_batch, "extend_prefix_lens_cpu", None)
+        es_cpu = getattr(forward_batch, "extend_seq_lens_cpu", None)
+        if es_cpu is None or len(es_cpu) == 0:
+            es = forward_batch.extend_seq_lens
+            es_cpu = es.tolist() if es is not None else [int(forward_batch.input_ids.shape[0])]
+        if ep_cpu is None or len(ep_cpu) == 0:
+            ep = forward_batch.extend_prefix_lens
+            ep_cpu = ep.tolist() if ep is not None else [0] * len(es_cpu)
+
+        ctxs = []
+        tok_start = 0
+        for b, (plen, elen) in enumerate(zip(ep_cpu, es_cpu)):
+            ctxs.append(
+                ExtendSeqCtx(
+                    b=b,
+                    prefix_len=int(plen),
+                    extend_len=int(elen),
+                    tok_start=tok_start,
+                )
+            )
+            tok_start += int(elen)
+        forward_batch._hsa_extend_seq_ctxs = ctxs
+        return ctxs
 
     # (removed) _get_effective_window_size: InnerX ultra passes window via kwargs
 
@@ -590,14 +635,19 @@ class HSAAttnBackend(AttentionBackend):
             md.hsa_per_step_hsa_window = hsa_window
 
         if per_qhead_active:
-            # R54a: slots = req_to_chunk_pool.gather_slots(req_pool_indices,
-            # cand_page_ids) is layer-invariant (same req_pool_indices +
-            # same cand_page_ids); cache it too.
+            # R54a: the slot lookup is layer-invariant (same page table + same
+            # cand_page_ids), so cache it too.
             slots = getattr(md, "hsa_per_step_slots", None)
             if is_owner or slots is None or slots.shape != cand_page_ids.shape:
-                slots = self.req_to_chunk_pool.gather_slots(
-                    forward_batch.req_pool_indices, cand_page_ids
-                )
+                # cand_page_ids[b, c] == c for valid entries and -1 otherwise,
+                # so the strided-view form plus a cand_mask multiply is exactly
+                # gather_slots here at a third of the kernel count.  The mask
+                # is load-bearing: an invalid candidate must resolve to the
+                # zero padding row, because its per-q-head score is read (and
+                # only the kv-head score is -inf-masked) by the fusion path.
+                slots = self.req_to_chunk_pool.slots_for_chunk_range(
+                    page_table_1, int(C_max)
+                ) * cand_mask
                 md.hsa_per_step_slots = slots
             # R54c: batch the lmk_k + prior_b gathers across ALL layers in one
             # multi-layer index_select instead of per-layer (saves ~94 launches/
@@ -1442,6 +1492,7 @@ class HSAAttnBackend(AttentionBackend):
         H_hsa: int,
         HQ_hsa: int,
         hsa_window: int,
+        seq_ctx: Optional[ExtendSeqCtx] = None,
     ) -> tuple:
         """Dispatch to batched (production) or reference implementation."""
         if self._USE_EXTEND_REFERENCE or self._USE_SWA_EXTEND_REFERENCE:
@@ -1453,7 +1504,7 @@ class HSAAttnBackend(AttentionBackend):
         return self._compute_internal_swa_extend_batched(
             q_hsa=q_hsa, layer=layer, forward_batch=forward_batch,
             page_table_1=page_table_1, H_swa=H_swa, H_hsa=H_hsa,
-            HQ_hsa=HQ_hsa, hsa_window=hsa_window,
+            HQ_hsa=HQ_hsa, hsa_window=hsa_window, seq_ctx=seq_ctx,
         )
 
     def _compute_internal_swa_extend_batched(
@@ -1467,6 +1518,7 @@ class HSAAttnBackend(AttentionBackend):
         H_hsa: int,
         HQ_hsa: int,
         hsa_window: int,
+        seq_ctx: Optional[ExtendSeqCtx] = None,
     ) -> tuple:
         """Internal SWA on HSA heads for extend via triton extend kernel.
 
@@ -1490,7 +1542,10 @@ class HSAAttnBackend(AttentionBackend):
           * Causal between extend Q and extend K (q_abs >= k_abs):
             (kernel: IS_CAUSAL with prefix_lens passed through)
 
-        Only supports batch=1 (SGLang continuous batching guarantee).
+        Handles ONE sequence per call: the kernel takes a scalar prefix_len and
+        a single flat kv_indices run.  A batched extend calls this once per
+        sequence with the matching ``seq_ctx`` (see ``_get_extend_seq_ctxs``);
+        ``seq_ctx=None`` means "the whole token stream is one sequence".
 
         Returns
         -------
@@ -1513,23 +1568,25 @@ class HSAAttnBackend(AttentionBackend):
         if md is None or pool is None or md.token_positions is None or md.token_to_seq_id is None:
             return swa_o, lse_hq_empty
 
-        # --- batch=1 only ---
         extend_seq_lens = md.extend_seq_lens
         extend_prefix_lens = md.extend_prefix_lens
         assert extend_seq_lens is not None and extend_prefix_lens is not None
-        B = int(extend_seq_lens.shape[0])
-        assert B == 1, (
-            f"_compute_internal_swa_extend_batched 当前只支持 batch=1，"
-            f"但收到 B={B}。"
-        )
 
         assert HQ_hsa % H_hsa == 0
         Gh = HQ_hsa // H_hsa
         page_size = int(self.page_size)
         sm_scale = float(getattr(layer, "scaling", 1.0))
 
-        # R64: shared per-prefill scalar cache (was 2 .item() per layer here).
-        _req_idx_cached, prefix_len, extend_len = self._get_prefill_scalars(forward_batch)
+        if seq_ctx is None:
+            # R64: shared per-prefill scalar cache (was 2 .item() per layer here).
+            _req_idx_cached, prefix_len, extend_len = self._get_prefill_scalars(
+                forward_batch
+            )
+            seq_row = 0
+        else:
+            prefix_len, extend_len, seq_row = (
+                seq_ctx.prefix_len, seq_ctx.extend_len, seq_ctx.b
+            )
         total_kv = prefix_len + extend_len  # full sequence length in cache
 
         if total_kv == 0 or extend_len == 0:
@@ -1539,7 +1596,7 @@ class HSAAttnBackend(AttentionBackend):
         # Each linear position i in kv_indices maps to cache slot for engine pos i.
         # R78: keep page_table_1's int32 — the kernel internally casts each
         # loaded slot to int64 (saves a per-layer dtype copy + halves bw).
-        kv_indices = page_table_1[0, :total_kv].contiguous()
+        kv_indices = page_table_1[seq_row, :total_kv].contiguous()
 
         # HSA heads slice of KV cache.
         pool_k = pool.get_key_buffer(layer.layer_id)[:, H_swa:H_swa + H_hsa, :]
@@ -1688,6 +1745,7 @@ class HSAAttnBackend(AttentionBackend):
         kv_head_count: Optional[int] = None,
         hsa_window: int = 0,
         split_info: Optional[dict] = None,
+        seq_ctx: Optional[ExtendSeqCtx] = None,
     ) -> None:
         """Dispatch to batched (production) or reference implementation."""
         if self._USE_EXTEND_REFERENCE:
@@ -1703,6 +1761,7 @@ class HSAAttnBackend(AttentionBackend):
             kv_head_offset=kv_head_offset, kv_head_count=kv_head_count,
             hsa_window=hsa_window,
             split_info=split_info,
+            seq_ctx=seq_ctx,
         )
 
     def _run_selection_extend_batched(
@@ -1717,15 +1776,20 @@ class HSAAttnBackend(AttentionBackend):
         kv_head_offset: int = 0,
         kv_head_count: Optional[int] = None,
         hsa_window: int = 0,
+        seq_ctx: Optional[ExtendSeqCtx] = None,
     ) -> None:
         """Memory-efficient extend selection via shared LMK + online_topk_group.
 
-        复用 training 的 online_topk_group kernel 调用方式：
-        只 gather 一次共享的 LMK [1, S, H, D]，然后调用
-        online_topk_group(B=1, L=T, is_causal=True, q_offset=prefix_len)，
-        kernel 内部自动处理 causal mask + head group sum。
-        内存从 O(T × C_max × H × D) 降到 O(S × H × D)。
-        当前只支持 batch=1（SGLang continuous batching 保证）。
+        Mirrors training's online_topk_group call convention: gather the shared
+        LMK keys once as [1, S, H, D], then call
+        online_topk_group(B=1, L=T, is_causal=True, q_offset=prefix_len) so the
+        kernel does the causal mask + head-group sum internally.  Memory drops
+        from O(T × C_max × H × D) to O(S × H × D).
+
+        Handles ONE sequence per call — the selection kernels take a scalar
+        q_offset and a single landmark set.  A batched extend calls this once
+        per sequence with the matching ``seq_ctx``; ``seq_ctx=None`` means the
+        whole token stream is one sequence.
         """
         md = self.forward_metadata
         if md is None:
@@ -1739,18 +1803,17 @@ class HSAAttnBackend(AttentionBackend):
         if md.token_positions is None or md.token_to_seq_id is None:
             return
 
-        # --- 只支持 batch=1，多序列直接报错暴露问题 ---
         extend_seq_lens = md.extend_seq_lens
         extend_prefix_lens = md.extend_prefix_lens
         assert extend_seq_lens is not None and extend_prefix_lens is not None, \
             "extend_seq_lens and extend_prefix_lens must be set for extend mode"
-        B = int(extend_seq_lens.shape[0])
-        assert B == 1, (
-            f"_run_selection_extend_batched 当前只支持 batch=1，"
-            f"但收到 B={B}。SGLang continuous batching 应保证 extend 阶段 B=1。"
-        )
 
-        T = int(md.token_positions.shape[0])
+        seq_row = 0 if seq_ctx is None else seq_ctx.b
+        T = (
+            int(md.token_positions.shape[0])
+            if seq_ctx is None
+            else int(seq_ctx.extend_len)
+        )
         H_sel = int(kv_head_count) if kv_head_count is not None else int(layer.tp_k_head_num)
         page_size = int(self.page_size)
         device = q.device
@@ -1766,11 +1829,17 @@ class HSAAttnBackend(AttentionBackend):
             q_sel_3 = q_sel
             HQ_sel = int(q_sel_3.shape[1])
 
-        # --- 计算 prefix_len 和总序列长度 ---
-        # R64: shared per-prefill scalar cache (was 2 .item() + 1 req_idx .item() per layer).
-        _req_idx_cached, prefix_len, _extend_len_cached = self._get_prefill_scalars(forward_batch)
+        # --- prefix_len and total sequence length for THIS sequence ---
+        if seq_ctx is None:
+            # R64: shared per-prefill scalar cache (was 2 .item() + 1 req_idx
+            # .item() per layer).
+            _req_idx_cached, prefix_len, _extend_len_cached = self._get_prefill_scalars(
+                forward_batch
+            )
+        else:
+            prefix_len, _extend_len_cached = seq_ctx.prefix_len, seq_ctx.extend_len
         total_seq_len = prefix_len + _extend_len_cached  # prefix + extend
-        S = total_seq_len // page_size  # 总 LMK chunk 数
+        S = total_seq_len // page_size  # number of complete LMK chunks
 
         if S == 0:
             md.hsa_ext_selected_page_ids = torch.full(
@@ -1801,22 +1870,27 @@ class HSAAttnBackend(AttentionBackend):
         self._per_qhead_G_ext = None
         self._per_qhead_lmk_keys_full = None  # cache for the per-token-aware pytorch path
         if per_qhead_ext_active:
-            # R79: cache (S, slots_i64) once per prefill — slots only depends
-            # on (req_idx, S), both invariant within a prefill. The int64
+            # R79: cache (S, slots_i64) once per prefill — slots only depend on
+            # the page table and S, both invariant within a prefill. The int64
             # cast lets get/get_prior_b take their no-clamp fast path. Saves
-            # per-layer arange + tensor(req_idx) + gather_slots dispatches.
+            # per-layer arange + gather_slots dispatches.
+            # Keyed per sequence: with several sequences in one extend, a
+            # single cache slot would thrash between them and re-gather on
+            # every layer.
             slots_cache = getattr(forward_batch, "_hsa_prefill_chunk_slots_S", None)
-            if slots_cache is None or slots_cache[0] != S:
-                req_idx = _req_idx_cached  # R64 cached
+            if slots_cache is None:
+                slots_cache = {}
+                forward_batch._hsa_prefill_chunk_slots_S = slots_cache
+            slots = slots_cache.get((seq_row, S))
+            if slots is None:
                 chunk_ids = torch.arange(S, device=device, dtype=torch.int32).unsqueeze(0)
-                req_idx_t = torch.tensor([req_idx], dtype=torch.int32, device=device)
                 slots = (
-                    self.req_to_chunk_pool.gather_slots(req_idx_t, chunk_ids)[0]
+                    self.req_to_chunk_pool.gather_slots(
+                        page_table_1[seq_row : seq_row + 1], chunk_ids
+                    )[0]
                     .to(torch.int64)
                 )
-                forward_batch._hsa_prefill_chunk_slots_S = (S, slots)
-            else:
-                slots = slots_cache[1]
+                slots_cache[(seq_row, S)] = slots
             lmk_keys_full = self.lmk_k_pool.get(int(layer.layer_id), slots)  # [S, h_q, D]
             self._per_qhead_lmk_keys_full = lmk_keys_full
             self._per_qhead_prior_b_ext = self.lmk_k_pool.get_prior_b(int(layer.layer_id), slots)  # [S, h_q]
@@ -1831,10 +1905,10 @@ class HSAAttnBackend(AttentionBackend):
             lmk_keys = lmk_keys_full.view(S, h_kv_e, G_e, lmk_keys_full.shape[-1]).mean(dim=2)
             H_sel = h_kv_e
         else:
-            # --- 1. 只 gather 一次共享的 LMK [S, H, D] ---
+            # --- 1. Gather the shared LMK keys once: [S, H, D] ---
             lmk_positions = torch.arange(S, device=device, dtype=torch.int64) * page_size + (page_size - 1)  # [S]
             lmk_positions = lmk_positions.clamp(max=page_table_1.shape[1] - 1)
-            lmk_locs = page_table_1[0, lmk_positions].to(torch.int64)  # [S]
+            lmk_locs = page_table_1[seq_row, lmk_positions].to(torch.int64)  # [S]
             lmk_keys = k_cache[lmk_locs]  # [S, H_total, D]
             if kv_head_count is not None:
                 lmk_keys = lmk_keys[:, int(kv_head_offset):int(kv_head_offset) + int(kv_head_count), :]
@@ -2241,6 +2315,7 @@ class HSAAttnBackend(AttentionBackend):
         sm_scale: Optional[float] = None,
         swa_o_inner: Optional[torch.Tensor] = None,
         swa_w_q: Optional[torch.Tensor] = None,
+        token_to_seq_id: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Dispatch to Triton kernel (production) or reference implementation."""
         if self._USE_EXTEND_REFERENCE:
@@ -2266,7 +2341,10 @@ class HSAAttnBackend(AttentionBackend):
             page_size=int(self.page_size),
             sm_scale=sm_scale,
             mask_last_token=True,
-            token_to_seq_id=md.token_to_seq_id,    # [T] int32
+            # [T] int32; a per-sequence call passes its own constant map.
+            token_to_seq_id=(
+                md.token_to_seq_id if token_to_seq_id is None else token_to_seq_id
+            ),
             block_m=int(_os.environ.get("HSA_SPARSE_BM", 1)),
             num_warps=int(_os.environ.get("HSA_SPARSE_NW", 2)),
             num_stages=int(_os.environ.get("HSA_SPARSE_NS", 2)),
@@ -2491,6 +2569,89 @@ class HSAAttnBackend(AttentionBackend):
 
         page_table_1 = md.page_table_1
 
+        # Steps 3-7 run against a single (prefix_len, page-table row) pair, so
+        # a batched extend executes them once per sequence over its slice of
+        # the packed token axis and concatenates.  At B == 1 the loop body runs
+        # exactly once with the full stream, which is the original code path.
+        # Steps 1-2 (KV write, dense SWA heads) and step 8 stay batched.
+        seq_ctxs = self._get_extend_seq_ctxs(forward_batch)
+        if len(seq_ctxs) > 1:
+            self._max_extend_batch_seen = max(
+                getattr(self, "_max_extend_batch_seen", 1), len(seq_ctxs)
+            )
+            if os.environ.get("SGLANG_HSA_ALIGN_DEBUG", "0") == "1":
+                print(
+                    f"[HSA] batched extend: {len(seq_ctxs)} sequences, T={T}",
+                    flush=True,
+                )
+        if len(seq_ctxs) <= 1:
+            out_hsa = self._extend_hsa_heads(
+                q_hsa=q_hsa, layer=layer, forward_batch=forward_batch,
+                pool=pool, page_table_1=page_table_1, selection_q=selection_q,
+                split_info=split_info, H_swa=H_swa, H_hsa=H_hsa,
+                HQ_hsa=HQ_hsa, hsa_window=hsa_window,
+                seq_ctx=seq_ctxs[0] if seq_ctxs else None,
+                single_seq=True,
+            )
+        else:
+            parts = []
+            for ctx in seq_ctxs:
+                sl = slice(ctx.tok_start, ctx.tok_start + ctx.extend_len)
+                parts.append(
+                    self._extend_hsa_heads(
+                        q_hsa=q_hsa[sl], layer=layer, forward_batch=forward_batch,
+                        pool=pool, page_table_1=page_table_1,
+                        selection_q=(None if selection_q is None else selection_q[sl]),
+                        split_info=split_info, H_swa=H_swa, H_hsa=H_hsa,
+                        HQ_hsa=HQ_hsa, hsa_window=hsa_window, seq_ctx=ctx,
+                        single_seq=False,
+                    )
+                )
+            out_hsa = torch.cat(parts, dim=0)
+
+        if out_hsa is None:
+            # No selection results (e.g. all tokens at early positions).
+            # HSA heads uninitialized; zero them.
+            if dense_out_3 is None:
+                out_hsa_zero = torch.zeros((T, HQ_hsa, D), device=q.device, dtype=q.dtype)
+                return out_hsa_zero.reshape(T, HQ_total * D)
+            dense_out_3[:, HQ_swa:, :] = 0
+            return dense_out_3.reshape(T, HQ_total * D)
+
+        # Step 8: Write HSA heads into the pre-allocated output tensor.
+        # R83: when HQ_swa==0, out_hsa already covers all heads — return
+        # directly without the empty+slice-write.
+        if dense_out_3 is None:
+            return out_hsa.reshape(T, HQ_total * D)
+        dense_out_3[:, HQ_swa:, :] = out_hsa.to(dense_out_3.dtype)
+        return dense_out_3.reshape(T, HQ_total * D)
+
+    def _extend_hsa_heads(
+        self,
+        *,
+        q_hsa: torch.Tensor,
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+        pool,
+        page_table_1: torch.Tensor,
+        selection_q: Optional[torch.Tensor],
+        split_info: dict,
+        H_swa: int,
+        H_hsa: int,
+        HQ_hsa: int,
+        hsa_window: int,
+        seq_ctx: Optional[ExtendSeqCtx],
+        single_seq: bool,
+    ) -> Optional[torch.Tensor]:
+        """Extend steps 3-7 for ONE sequence: internal SWA -> chunk selection
+        -> merged softmax -> sparse attention (+ fused SWA blend).
+
+        Returns ``[t, HQ_hsa, D]`` for this sequence's tokens, or ``None`` when
+        selection produced nothing (caller zeroes the HSA heads).
+        """
+        md = self.forward_metadata
+        T, _, D = q_hsa.shape
+
         # Step 3: Internal SWA on HSA heads.
         # R77: second return is now `lse_raw` [T, HQ_hsa] (per-q-head) — the
         # legacy h_kv branch computes lse_kv on demand below.
@@ -2503,6 +2664,7 @@ class HSAAttnBackend(AttentionBackend):
             H_hsa=H_hsa,
             HQ_hsa=HQ_hsa,
             hsa_window=hsa_window,
+            seq_ctx=None if single_seq else seq_ctx,
         )
 
         # Step 4: TopK selection per token.
@@ -2516,19 +2678,14 @@ class HSAAttnBackend(AttentionBackend):
             kv_head_count=H_hsa,
             hsa_window=hsa_window,
             split_info=split_info,
+            seq_ctx=None if single_seq else seq_ctx,
         )
 
         selected_page_ids = md.hsa_ext_selected_page_ids  # [T, H_hsa, K]
         selected_scores = md.hsa_ext_selected_scores  # [T, H_hsa, K]
 
         if selected_page_ids is None or selected_scores is None:
-            # No selection results (e.g. all tokens at early positions).
-            # HSA heads uninitialized; zero them.
-            if dense_out_3 is None:
-                out_hsa_zero = torch.zeros((T, HQ_hsa, D), device=q.device, dtype=q.dtype)
-                return out_hsa_zero.reshape(T, HQ_total * D)
-            dense_out_3[:, HQ_swa:, :] = 0
-            return dense_out_3.reshape(T, HQ_total * D)
+            return None
 
         # Step 5: Merged softmax.
         assert HQ_hsa % H_hsa == 0
@@ -2668,6 +2825,16 @@ class HSAAttnBackend(AttentionBackend):
             sm_scale=getattr(layer, "scaling", None),
             swa_o_inner=swa_o_inner if blend_swa_in_kernel else None,
             swa_w_q=swa_w_q_for_kernel if blend_swa_in_kernel else None,
+            # md.token_to_seq_id already holds the global sequence index per
+            # packed token, so this sequence's slice of it is exactly the
+            # constant map the kernel needs — no allocation.
+            token_to_seq_id=(
+                None
+                if single_seq
+                else md.token_to_seq_id[
+                    seq_ctx.tok_start : seq_ctx.tok_start + seq_ctx.extend_len
+                ]
+            ),
         )  # [T, HQ_hsa, D] bf16, SWA blend already applied if requested
 
         # S==0 (whole sequence shorter than one page -> zero selectable chunks):
@@ -2677,14 +2844,11 @@ class HSAAttnBackend(AttentionBackend):
         # down-weights SWA by exp(lse)/(exp(lse)+1) (~0.78 at 10 tokens) -> the
         # SHORT-<64-token misalignment. Mirror the official: at S==0 the HSA
         # heads are pure SWA. Guarded on S==0 so the >=1-chunk path is untouched.
-        _, _pl_s0, _el_s0 = self._get_prefill_scalars(forward_batch)
+        if single_seq:
+            _, _pl_s0, _el_s0 = self._get_prefill_scalars(forward_batch)
+        else:
+            _pl_s0, _el_s0 = seq_ctx.prefix_len, seq_ctx.extend_len
         if hsa_window > 0 and (_pl_s0 + _el_s0) // int(self.page_size) == 0:
             out_hsa = swa_o_inner.to(out_hsa.dtype)
 
-        # Step 8: Write HSA heads into the pre-allocated output tensor.
-        # R83: when HQ_swa==0, out_hsa already covers all heads — return
-        # directly without the empty+slice-write.
-        if dense_out_3 is None:
-            return out_hsa.reshape(T, HQ_total * D)
-        dense_out_3[:, HQ_swa:, :] = out_hsa.to(dense_out_3.dtype)
-        return dense_out_3.reshape(T, HQ_total * D)
+        return out_hsa

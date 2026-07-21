@@ -58,9 +58,9 @@ class HSAMetadata:
     # R54a: layer-invariant per-step selector scratch — only built when
     # per_qhead path is active (HSA chunk_attn_pool config). cand_page_ids /
     # cand_mask depend only on cache_seqlens + page_size + hsa_window;
-    # per_qhead_slots depends only on those + req_pool_indices via
-    # req_to_chunk_pool. All identical across HSA layers; this kills ~96
-    # redundant launches per decode step (~6 ops × 16 layers).
+    # per_qhead_slots depends only on those + the page table (slots are KV page
+    # ids). All identical across HSA layers; this kills ~96 redundant launches
+    # per decode step (~6 ops × 16 layers).
     hsa_per_step_cand_page_ids: Optional[torch.Tensor] = None  # [B, C_max] int32
     hsa_per_step_cand_mask: Optional[torch.Tensor] = None  # [B, C_max] bool
     hsa_per_step_slots: Optional[torch.Tensor] = None  # [B, C_max] int32 lmk slot ids

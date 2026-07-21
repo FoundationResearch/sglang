@@ -12,8 +12,8 @@ This module provides the storage that lets sglang match the default mode:
 
     * ``LandmarkLmkKPool``: per-layer, per-chunk tensor ``[num_chunk_slots,
       h_q, head_dim]`` holding the pre-aggregated ``lmk_k``.
-    * ``ReqToChunkPool``: maps ``(req_idx, chunk_idx)`` -> ``chunk_slot``,
-      mirroring the existing ``ReqToTokenPool`` layout.
+    * ``KvPageChunkSlots``: maps a chunk to its slot via the chunk's **KV page
+      id**, so the landmark is addressed by content rather than by owner.
 
 The pool is "A" in the design discussion: at chunk completion (during
 prefill or a decode step that finishes a chunk), the HSA layer computes
@@ -22,9 +22,10 @@ selector at decode just gathers — no inline compute, no recompute across
 decode steps. Storage is identical to caching the raw ``lmk_q``, the
 trade is one-time work at chunk completion vs N×decode-step compute.
 
-Lifecycle is tied to the KV cache: slots are alloc'd as chunks complete
-and freed when the request is freed. The pool is sized for the worst-case
-``max_chunks = max_total_num_tokens // chunk_size``.
+Lifecycle is tied to the KV cache exactly: one slot per KV page, so a
+landmark is valid for as long as the page it describes, is shared by every
+request that shares that page (radix prefix reuse), and needs neither
+allocation nor release.
 """
 from __future__ import annotations
 
@@ -189,8 +190,88 @@ class LandmarkLmkKPool:
         return gathered.view(*out_shape)
 
 
+class KvPageChunkSlots:
+    """Maps a chunk to its ``LandmarkLmkKPool`` slot by **KV page id**.
+
+    HSA requires ``page_size == chunk_size``, so a sequence's chunk ``c``
+    occupies exactly one KV page.  The page id is therefore a
+    request-independent name for that chunk's *content*, which makes it the
+    right key for a landmark:
+
+      * Two requests sharing a radix prefix share the KV pages, so they share
+        the landmarks — a prefix-cache hit no longer needs (and no longer
+        silently misses) a landmark of its own.
+      * A landmark lives exactly as long as the page it describes, so there is
+        no allocator, no free list, nothing to leak, and no stale entry when a
+        ``req_pool_idx`` is recycled.
+      * The pool shrinks to the KV page count instead of
+        ``max_chunks_per_req × concurrent_reqs``.
+
+    Slot id is ``page_id + 1``; slot 0 stays reserved as the padding row that
+    invalid/padded chunk ids resolve to.
+
+    This replaces the older ``ReqToChunkPool``, which keyed on
+    ``(req_pool_idx, chunk_idx)`` and had all three problems above.
+    """
+
+    def __init__(self, num_pages: int, page_size: int, device: torch.device) -> None:
+        self.num_pages = int(num_pages)
+        self.page_size = int(page_size)
+        self.device = device
+        # Highest chunk index a sequence can address; callers clamp with it
+        # before looking a chunk up.
+        self.max_chunks = int(num_pages)
+
+    def slots_for_chunk_range(
+        self, page_table_1: torch.Tensor, num_chunks: int
+    ) -> torch.Tensor:
+        """Slots for chunks ``0..num_chunks-1`` of every sequence.
+
+        This is the decode candidate set, where the chunk ids are a plain
+        range, so a strided *view* of the page table replaces the gather.
+        Decode latency here is kernel count rather than work, so the shape of
+        this computation matters more than its size.
+        """
+        end = num_chunks * self.page_size
+        strided = page_table_1[:, :end : self.page_size]  # [B, num_chunks] view
+        return (
+            strided.to(torch.int64)
+            .div_(self.page_size, rounding_mode="floor")
+            .add_(1)
+            .clamp_(min=0, max=self.num_pages)
+        )
+
+    def gather_slots(
+        self, page_table_1: torch.Tensor, chunk_ids: torch.Tensor
+    ) -> torch.Tensor:
+        """Slot ids for ``chunk_ids``.
+
+        ``page_table_1``: ``[B, T]`` token -> KV slot (page_size=1 semantics).
+        ``chunk_ids``: ``[B, C]`` logical chunk index, ``-1`` for padding.
+        Returns ``[B, C]`` int64 slot ids (0 for padded/invalid entries).
+        """
+        valid = chunk_ids >= 0
+        # The chunk's first token sits at page offset 0, so its KV slot is
+        # exactly page_id * page_size.
+        tok = chunk_ids.clamp(min=0).to(torch.int64) * self.page_size
+        tok = tok.clamp(max=page_table_1.shape[1] - 1)
+        b = torch.arange(
+            page_table_1.shape[0], device=page_table_1.device, dtype=torch.int64
+        ).unsqueeze(1)
+        slots = page_table_1[b, tok].to(torch.int64) // self.page_size + 1
+        # Positions past a sequence's tail can hold uninitialised page-table
+        # entries; clamp so a stray id can never index outside the pool. Such
+        # entries belong to padded chunks and are masked out below anyway.
+        slots = slots.clamp(min=0, max=self.num_pages)
+        return torch.where(valid, slots, torch.zeros_like(slots))
+
+
 class ReqToChunkPool:
     """Maps ``(req_pool_idx, chunk_idx)`` -> ``LandmarkLmkKPool`` slot id.
+
+    .. deprecated::
+        Superseded by :class:`KvPageChunkSlots`.  Kept for the offline
+        harnesses under ``dev/`` that construct it directly.
 
     Mirrors ``ReqToTokenPool``'s layout: a single ``[num_reqs, max_chunks]``
     int32 table, initialised to 0 (= padding slot / "not yet allocated").

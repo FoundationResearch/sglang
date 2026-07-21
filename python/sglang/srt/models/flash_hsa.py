@@ -1301,9 +1301,6 @@ class FlashHSAInnerXHierarchicalSparseAttention(nn.Module):
             # Per-q-head lmk_k under TP would need an all-gather on hsa_k AND
             # storing the full h_q heads (vs sliced).  Not in this POC.
             return
-        if int(forward_batch.batch_size) != 1:
-            return
-
         import math as _math
 
         chunk_size = int(self.chunk_size)
@@ -1314,28 +1311,43 @@ class FlashHSAInnerXHierarchicalSparseAttention(nn.Module):
             return
         G = h_q // h_kv
 
-        # R63: cache (req_idx, prefix_len, extend_len) once per forward to
-        # avoid 3 .item() CUDA syncs × 16 layers = 48 syncs per prefill.
-        # CPU mirrors are populated by ForwardBatch.init_new for extend, so
-        # only req_idx (no _cpu mirror) needs a one-time .item() at layer 0.
-        scalars = getattr(forward_batch, "_hsa_prefill_scalars", None)
-        if scalars is None:
-            req_idx = int(forward_batch.req_pool_indices[0].item())
-            ep_cpu = getattr(forward_batch, "extend_prefix_lens_cpu", None)
-            es_cpu = getattr(forward_batch, "extend_seq_lens_cpu", None)
-            if ep_cpu is not None and len(ep_cpu) > 0:
-                prefix_len = int(ep_cpu[0])
-            elif forward_batch.extend_prefix_lens is not None:
-                prefix_len = int(forward_batch.extend_prefix_lens[0].item())
-            else:
-                prefix_len = 0
-            if es_cpu is not None and len(es_cpu) > 0:
-                extend_len = int(es_cpu[0])
-            else:
-                extend_len = int(forward_batch.extend_seq_lens[0].item())
-            scalars = (req_idx, prefix_len, extend_len)
-            forward_batch._hsa_prefill_scalars = scalars
-        req_idx, prefix_len, extend_len = scalars
+        # A batched extend packs several sequences on the token axis; each has
+        # its own prefix_len and its own chunk boundaries, so write one
+        # sequence at a time over its slice.
+        for _ctx in backend._get_extend_seq_ctxs(forward_batch):
+            self._write_chunk_lmk_k_one_seq(
+                forward_batch=forward_batch,
+                backend=backend,
+                lmk_k_pool=lmk_k_pool,
+                req_to_chunk=req_to_chunk,
+                sel_q=sel_q[_ctx.tok_start : _ctx.tok_start + _ctx.extend_len],
+                hsa_k=hsa_k[_ctx.tok_start : _ctx.tok_start + _ctx.extend_len],
+                seq_ctx=_ctx,
+                chunk_size=chunk_size,
+                h_kv=h_kv,
+                head_dim=head_dim,
+                G=G,
+                sm_scale=1.0 / _math.sqrt(head_dim),
+            )
+
+    def _write_chunk_lmk_k_one_seq(
+        self,
+        *,
+        forward_batch,
+        backend,
+        lmk_k_pool,
+        req_to_chunk,
+        sel_q,
+        hsa_k,
+        seq_ctx,
+        chunk_size: int,
+        h_kv: int,
+        head_dim: int,
+        G: int,
+        sm_scale: float,
+    ) -> None:
+        """Write landmarks for the chunks ONE sequence completes in this extend."""
+        prefix_len, extend_len = seq_ctx.prefix_len, seq_ctx.extend_len
 
         already_done = prefix_len // chunk_size
         total_done_after = (prefix_len + extend_len) // chunk_size
@@ -1404,7 +1416,6 @@ class FlashHSAInnerXHierarchicalSparseAttention(nn.Module):
         # instead of (N, S, h_q) — 8x less memory bandwidth for K read.
         # R70: pass bf16 in — the compiled impl now does the fp32 cast inside
         # its graph, so inductor can fuse it with the einsum input load.
-        sm_scale = 1.0 / _math.sqrt(head_dim)
         fn = _chunk_attn_pool_compiled if _chunk_attn_pool_compiled is not None else _chunk_attn_pool_impl
         try:
             lmk_k, prior_b = fn(mu_q_batch, k_chunk_batch, lmk_k_pool.dtype, sm_scale, G)
@@ -1414,71 +1425,31 @@ class FlashHSAInnerXHierarchicalSparseAttention(nn.Module):
                 mu_q_batch, k_chunk_batch, lmk_k_pool.dtype, sm_scale, G
             )
 
-        # R47+R60: reuse slot across layers per (req, chunk). R60 also caches
-        # the slot tensor on forward_batch — layer 0 allocates, layers 1-15
-        # read the cached slot tensor directly (no gather_slots + .item()
-        # syncs per layer).
-        # R68b: defer the int32 cast and req_idx tensor build to the slot
-        # allocation branch — layers 1-15 take cached_slots and don't need
-        # them. Saves 15 kernel launches per prefill (small ops but ~10us
-        # each = ~0.15ms Python wallclock).
-        slot_cache_key = "_hsa_prefill_chunk_slots"
-        cached_slots = getattr(forward_batch, slot_cache_key, None)
-        if cached_slots is not None and cached_slots.shape[0] == N:
-            slots = cached_slots
-        else:
-            chunk_ids_t = kept_chunk_ids.to(torch.int32)  # [N]
-            req_idx_t = torch.full(
-                (N,), req_idx, dtype=torch.int32, device=lmk_k_pool.device
-            )
-            existing_slots = req_to_chunk.gather_slots(
-                torch.tensor([req_idx], dtype=torch.int32, device=lmk_k_pool.device),
-                chunk_ids_t.unsqueeze(0),
-            )[0]
-            slots = existing_slots.clone()
-            missing = slots == 0
-            # Use device-side any() — still requires a sync but only ONCE for
-            # the whole prefill (layer 0 only).
-            if bool(missing.any().item()):
-                new_slots = lmk_k_pool.alloc(int(missing.sum().item()))
-                if new_slots is None:
-                    return
-                slots[missing] = new_slots
-                req_to_chunk.assign(req_idx_t[missing], chunk_ids_t[missing], new_slots)
-            setattr(forward_batch, slot_cache_key, slots)
+        # R47+R60: the slot for chunk c is just its KV page id (+1), so it is
+        # the same for every layer and needs no allocation. Cache it on the
+        # forward so layers 1..L-1 skip even the gather.
+        # This is also what makes prefix-cache reuse correct: chunks below
+        # prefix_len are skipped above precisely because their pages already
+        # carry the landmark written when those pages were first filled.
+        # Keyed per sequence: with several sequences in one extend, a single
+        # cache slot would thrash between them and re-gather on every layer.
+        cache = getattr(forward_batch, "_hsa_prefill_chunk_slots", None)
+        if cache is None:
+            cache = {}
+            forward_batch._hsa_prefill_chunk_slots = cache
+        cache_id = (seq_ctx.b, N)
+        slots = cache.get(cache_id)
+        if slots is None:
+            page_table_1 = getattr(getattr(backend, "forward_metadata", None),
+                                   "page_table_1", None)
+            if page_table_1 is None:
+                return
+            slots = req_to_chunk.gather_slots(
+                page_table_1[seq_ctx.b : seq_ctx.b + 1],
+                kept_chunk_ids.to(torch.int32).unsqueeze(0),
+            )[0].to(torch.int32)
+            cache[cache_id] = slots
         lmk_k_pool.set(self.layer_id, slots, lmk_k, prior_b=prior_b)
-
-        # R59: pre-allocate slots for future decode chunks so the decode-time
-        # write path can be CUDA-graph-safe (no host-side alloc/sync). Only
-        # done by the first HSA layer of the prefill. Cap at
-        # req_to_chunk_pool.max_chunks - total_done_after to avoid OOB.
-        decode_prealloc_cfg = int(
-            getattr(self.config, "_hsa_decode_chunk_prealloc", 512)
-        )
-        max_chunks_room = int(req_to_chunk.max_chunks) - int(total_done_after)
-        decode_prealloc = max(0, min(decode_prealloc_cfg, max_chunks_room))
-        if decode_prealloc > 0 and self.layer_id == 0:
-            future_chunk_start = total_done_after
-            future_chunk_end = future_chunk_start + decode_prealloc
-            future_ids = torch.arange(
-                future_chunk_start, future_chunk_end,
-                dtype=torch.int32, device=lmk_k_pool.device,
-            )
-            existing_future = req_to_chunk.gather_slots(
-                torch.tensor([req_idx], dtype=torch.int32, device=lmk_k_pool.device),
-                future_ids.unsqueeze(0),
-            )[0]
-            missing_future = existing_future == 0
-            n_future = int(missing_future.sum().item())
-            if n_future > 0:
-                new_future_slots = lmk_k_pool.alloc(n_future)
-                if new_future_slots is not None:
-                    req_to_chunk.assign(
-                        torch.full((n_future,), req_idx, dtype=torch.int32,
-                                   device=lmk_k_pool.device),
-                        future_ids[missing_future],
-                        new_future_slots,
-                    )
 
     def _maybe_write_decode_chunk_lmk_k(
         self, forward_batch, sel_q, hsa_k_current=None
@@ -1507,9 +1478,15 @@ class FlashHSAInnerXHierarchicalSparseAttention(nn.Module):
         md = getattr(backend, "forward_metadata", None)
         if lmk_k_pool is None or req_to_chunk is None or md is None:
             return
-        if get_attention_tp_size() > 1 or int(forward_batch.batch_size) != 1:
-            return  # decode-time write supports BS=1 / TP=1 only for now
-        if sel_q is None or sel_q.shape[0] != 1:
+        if get_attention_tp_size() > 1:
+            return  # decode-time write supports TP=1 only for now
+        B = int(forward_batch.batch_size)
+        if sel_q is None or sel_q.shape[0] != B:
+            if os.environ.get("SGLANG_HSA_ALIGN_DEBUG", "0") == "1":
+                print(
+                    f"[HSA] decode lmk write SKIPPED: sel_q={None if sel_q is None else tuple(sel_q.shape)} B={B}",
+                    flush=True,
+                )
             return
 
         chunk_size = int(self.chunk_size)
@@ -1536,15 +1513,16 @@ class FlashHSAInnerXHierarchicalSparseAttention(nn.Module):
                 lmk_id_py = int(getattr(self.config, "vocab_size", -1))
                 input_ids = getattr(forward_batch, "input_ids", None)
                 if input_ids is None or lmk_id_py < 0:
-                    forward_batch._hsa_lmk_step_cache = (False, 0)
+                    forward_batch._hsa_lmk_step_cache = (False,)
                     return
-                # Single sync for the whole forward (was 16x pre-R55).
-                seq_len = int(forward_batch.seq_lens[0].item())
-                is_lmk = int(input_ids[-1].item()) == lmk_id_py
-                cache = (is_lmk, seq_len)
+                # Single sync for the whole forward (was 16x pre-R55).  At B>1
+                # the requests sit at different sequence lengths, so we fall
+                # through as soon as ANY of them is on a chunk boundary; the
+                # device-side write mask below leaves the others untouched.
+                any_lmk = bool((input_ids[:B] == lmk_id_py).any().item())
+                cache = (any_lmk,)
                 forward_batch._hsa_lmk_step_cache = cache
-            is_lmk_step, _seq_len_cpu = cache
-            if not is_lmk_step:
+            if not cache[0]:
                 return
             # Fall through and run the device-side compute below — same
             # algorithm whether we hit the eager early-return or not. The
@@ -1553,101 +1531,121 @@ class FlashHSAInnerXHierarchicalSparseAttention(nn.Module):
             # mask is purely a safety net.
         # ALL device-side from here on — no .item(), no Python int from CUDA.
 
-        # seq_len_d [1] int64: current sequence length after appending this
-        # step's input. cache_seqlens_int32 is the same buffer the attention
-        # kernels consume so it's always populated (and live under CG).
-        cache_seqlens = md.cache_seqlens_int32  # [B] int32, B==1
-        seq_len_d = cache_seqlens[:1].to(torch.int64)
-        # Chunk boundary check: seq_len is on a chunk boundary when
-        # seq_len % chunk_size == 0 (the LMK token at position chunk_end
-        # got committed and seq_len advanced past it).
-        is_boundary_d = (seq_len_d % chunk_size == 0)  # [1] bool
-        # chunk_idx for the just-completed chunk.  Always non-negative because
-        # is_boundary masks the store; on non-boundary steps the value can be
-        # an in-progress chunk index — that's fine, we won't write.
-        completed_chunk_idx_d = (seq_len_d // chunk_size - 1).clamp(min=0)  # [1] int64
-
-        # Bounds guard: if a long decode runs past the pre-allocated slot
-        # range (decode_prealloc chunks), we silently skip. Use cpu-side
-        # check via req_to_chunk_pool max_chunks to keep this host-only at
-        # capture time.
-        if int(completed_chunk_idx_d.max().item() if not (torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()) else 0) >= req_to_chunk.max_chunks:
-            # Only run the bounds check outside CG capture (inside capture
-            # the seq_len bounds were chosen by the cuda-graph-max-bs flag).
-            return
-
-        # Gather pre-allocated slot for this req+chunk. Returns 0 if slot
-        # wasn't pre-allocated (e.g., decode ran beyond prealloc window) —
-        # in that case writing to slot 0 is masked by is_boundary anyway,
-        # AND we further mask slot==0 below to avoid polluting the padding
-        # row.
-        chunk_ids_d = completed_chunk_idx_d.to(torch.int32).view(1, 1)  # [1, 1] int32
-        req_idx_d = forward_batch.req_pool_indices[:1].to(torch.int32)  # [1] int32
-        slots_d = req_to_chunk.gather_slots(req_idx_d, chunk_ids_d)[0]  # [1] int32
-        # slot==0 means "no allocation"; mask those out too.
-        valid_slot_d = (slots_d > 0)  # [1] bool
-        write_mask_d = is_boundary_d & valid_slot_d  # [1] bool
-
-        # Also check input_ids[-1] == lmk_id for an extra correctness gate.
-        # input_ids is always available during decode; use last position.
-        lmk_id = int(getattr(self.config, "vocab_size", -1))
-        input_ids = getattr(forward_batch, "input_ids", None)
-        if input_ids is not None and lmk_id >= 0:
-            is_lmk_id_d = (input_ids[-1:] == lmk_id).view(1)  # [1] bool
-            write_mask_d = write_mask_d & is_lmk_id_d
-
-        # Build position indices for the just-completed chunk on device.
-        # token_pos[i] = completed_chunk_idx * chunk_size + i, for i in [0, chunk_size-1]
+        # Which requests sit on a chunk boundary, which page that chunk lives
+        # in, and which KV slots hold its tokens all depend on the batch state
+        # only — not on the layer.  Compute them once per step and let the
+        # other HSA layers reuse the result: decode latency here is kernel
+        # count, and this is ~10 kernels that would otherwise run per layer.
         # If hsa_k_current is provided, the LAST position's K is "current K"
-        # (not yet in cache), so we read chunk_size-1 from page_table_1 +
+        # (not yet in cache), so we read chunk_size-1 from page_table_1 and
         # take the current K for the final slot.
-        chunk_offset_d = completed_chunk_idx_d * chunk_size  # [1] int64
-        if hsa_k_current is not None:
-            n_from_cache = chunk_size - 1
-        else:
-            n_from_cache = chunk_size
-        local_range = torch.arange(
-            n_from_cache, device=sel_q.device, dtype=torch.int64
-        )
-        token_pos_d = chunk_offset_d + local_range  # [n_from_cache]
-        # Clip to valid page_table range (avoid OOB on capture-time large bounds)
-        token_pos_clipped_d = token_pos_d.clamp(max=page_table_1.shape[1] - 1)
-        token_locs_d = page_table_1[0, token_pos_clipped_d].to(torch.int64)
+        n_from_cache = chunk_size - 1 if hsa_k_current is not None else chunk_size
+        scratch = getattr(forward_batch, "_hsa_decode_lmk_scratch", None)
+        if scratch is None or scratch[0] != n_from_cache:
+            # seq_len_d [B] int64: current sequence length of each request
+            # after appending this step's input. cache_seqlens_int32 is the
+            # same buffer the attention kernels consume so it is always
+            # populated (and live under CG).  Every quantity stays [B]-shaped:
+            # at B>1 the requests are at different lengths, so each has its own
+            # boundary step, its own completed chunk and its own slot.
+            cache_seqlens = md.cache_seqlens_int32  # [B] int32
+            seq_len_d = cache_seqlens[:B].to(torch.int64)  # [B]
+            # Chunk boundary check: seq_len is on a chunk boundary when
+            # seq_len % chunk_size == 0 (the LMK token at position chunk_end
+            # got committed and seq_len advanced past it).
+            is_boundary_d = (seq_len_d % chunk_size == 0)  # [B] bool
+            # chunk_idx for the just-completed chunk.  Always non-negative
+            # because is_boundary masks the store; on non-boundary steps the
+            # value can be an in-progress chunk index — we won't write.
+            completed_chunk_idx_d = (seq_len_d // chunk_size - 1).clamp(min=0)  # [B]
+
+            # Bounds guard: a chunk index past the page table must not be
+            # looked up (it would alias a *different* chunk's page).  Clamp the
+            # lookup and fold the out-of-range rows into the write mask —
+            # device-side, so it stays valid under CG capture (no host syncs).
+            max_chunks = page_table_1.shape[1] // chunk_size
+            in_range_d = completed_chunk_idx_d < max_chunks  # [B] bool
+            chunk_offset_d = (
+                completed_chunk_idx_d.clamp(max=max(max_chunks - 1, 0)) * chunk_size
+            )  # [B] int64
+
+            # Slot = KV page id of the completed chunk (+1).  No allocation and
+            # no pre-allocation: the page is already resident, which is exactly
+            # why the landmark belongs to it.
+            slots_step = (
+                page_table_1.gather(1, chunk_offset_d.unsqueeze(1))
+                .squeeze(1)
+                .to(torch.int64)
+                .div_(chunk_size, rounding_mode="floor")
+                .add_(1)
+                .clamp_(min=0, max=req_to_chunk.num_pages)
+            )  # [B]
+            write_mask_step = is_boundary_d & in_range_d & (slots_step > 0)
+
+            # Also check input_ids == lmk_id for an extra correctness gate.
+            # input_ids holds exactly one token per request during decode.
+            lmk_id = int(getattr(self.config, "vocab_size", -1))
+            input_ids = getattr(forward_batch, "input_ids", None)
+            if input_ids is not None and lmk_id >= 0:
+                write_mask_step = write_mask_step & (input_ids[:B] == lmk_id)
+
+            # Position indices for the just-completed chunk:
+            #   token_pos[i] = completed_chunk_idx * chunk_size + i
+            local_range = torch.arange(
+                n_from_cache, device=sel_q.device, dtype=torch.int64
+            )
+            token_pos_d = chunk_offset_d[:, None] + local_range[None, :]  # [B, n]
+            # Clip to the page table (avoid OOB on capture-time large bounds)
+            token_pos_clipped_d = token_pos_d.clamp(max=page_table_1.shape[1] - 1)
+            batch_ar = torch.arange(B, device=sel_q.device, dtype=torch.int64)
+            # Each row reads its own request's page table.
+            token_locs_step = page_table_1[batch_ar[:, None], token_pos_clipped_d].to(
+                torch.int64
+            )  # [B, n]
+            scratch = (n_from_cache, slots_step, write_mask_step, token_locs_step)
+            forward_batch._hsa_decode_lmk_scratch = scratch
+
+        _, slots_d, write_mask_d, token_locs_d = scratch
         k_cache = pool.get_key_buffer(self.layer_id)
         k_chunk = k_cache[
             token_locs_d, self.hk_swa : self.hk_swa + self.hk_hsa, :
-        ]
+        ]  # [B, n_from_cache, h_kv, head_dim]
         if hsa_k_current is not None:
-            cur_k = hsa_k_current.view(-1, h_kv, head_dim)[-1:].to(k_chunk.dtype)
-            k_chunk = torch.cat([k_chunk, cur_k], dim=0)
-        # k_chunk shape MUST be [chunk_size, h_kv, head_dim] — guaranteed by
+            cur_k = (
+                hsa_k_current.view(-1, h_kv, head_dim)[:B].unsqueeze(1).to(k_chunk.dtype)
+            )  # [B, 1, h_kv, head_dim]
+            k_chunk = torch.cat([k_chunk, cur_k], dim=1)
+        # k_chunk shape MUST be [B, chunk_size, h_kv, head_dim] — guaranteed by
         # construction now (always read chunk_size positions).
 
         import math as _math
-        mu_f32 = sel_q[0].float()
-        k_f32 = k_chunk.float()
-        k_q = k_f32.repeat_interleave(G, dim=1) if G != 1 else k_f32
-        logits = torch.einsum("hd,shd->sh", mu_f32, k_q) * (1.0 / _math.sqrt(head_dim))
+        mu_f32 = sel_q[:B].float()                             # [B, h_q, D]
+        k_f32 = k_chunk.float()                                # [B, S, h_kv, D]
+        k_q = k_f32.repeat_interleave(G, dim=2) if G != 1 else k_f32  # [B, S, h_q, D]
+        logits = torch.einsum("bhd,bshd->bsh", mu_f32, k_q) * (1.0 / _math.sqrt(head_dim))
         # Mask the LMK position (last) to -inf — it shouldn't contribute to
         # the chunk_attn_pool over chunk content (matches official semantics).
-        # In-place on the last row.
         logits = logits.clone()
-        logits[-1] = float("-inf")
-        p = torch.softmax(logits, dim=0)
-        lmk_k = torch.einsum("sh,shd->hd", p, k_q).to(lmk_k_pool.dtype).unsqueeze(0)
-        log_p = torch.log_softmax(logits, dim=0)
+        logits[:, -1, :] = float("-inf")
+        p = torch.softmax(logits, dim=1)
+        lmk_k = torch.einsum("bsh,bshd->bhd", p, k_q).to(lmk_k_pool.dtype)  # [B, h_q, D]
+        log_p = torch.log_softmax(logits, dim=1)
         log_p_safe = torch.where(torch.isfinite(log_p), log_p, log_p.new_zeros(()))
-        prior_b = (-(p * log_p_safe).sum(dim=0)).unsqueeze(0)
+        prior_b = -(p * log_p_safe).sum(dim=1)  # [B, h_q]
 
         # CG-safe conditional store: read old, blend with write_mask, write back.
+        # Masked-out rows write their own slot's old value back, so they are a
+        # no-op; distinct requests always hold distinct slots, and the only
+        # index that can repeat across rows is the padding slot 0, where every
+        # row writes the same (unchanged) value.
         layer_pool_k = lmk_k_pool.pool[int(self.layer_id)]      # [N+1, h_q, D]
         layer_pool_pb = lmk_k_pool.prior_b_pool[int(self.layer_id)]  # [N+1, h_q]
-        slot_idx_d = slots_d.to(torch.int64)  # [1] int64
+        slot_idx_d = slots_d.to(torch.int64)  # [B] int64
         # Where write_mask is True, write the new value; else keep old.
-        old_k = layer_pool_k.index_select(0, slot_idx_d)  # [1, h_q, D]
+        old_k = layer_pool_k.index_select(0, slot_idx_d)  # [B, h_q, D]
         new_k = torch.where(write_mask_d.view(-1, 1, 1), lmk_k, old_k)
         layer_pool_k.index_copy_(0, slot_idx_d, new_k)
-        old_pb = layer_pool_pb.index_select(0, slot_idx_d)  # [1, h_q]
+        old_pb = layer_pool_pb.index_select(0, slot_idx_d)  # [B, h_q]
         new_pb = torch.where(write_mask_d.view(-1, 1), prior_b, old_pb)
         layer_pool_pb.index_copy_(0, slot_idx_d, new_pb)
 
