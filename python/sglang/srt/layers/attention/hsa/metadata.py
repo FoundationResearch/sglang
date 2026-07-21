@@ -66,11 +66,10 @@ class HSAMetadata:
     hsa_per_step_slots: Optional[torch.Tensor] = None  # [B, C_max] int32 lmk slot ids
     hsa_per_step_hsa_window: Optional[int] = None  # cache for sanity check
 
-    # R54c: per-step pre-gathered lmk_k + prior_b across ALL layers — collapses
-    # 16x (lmk_k_pool.get + get_prior_b) ≈ 96 launches into 2 multi-layer
-    # index_selects. Shapes: [num_layers, B, C, h_q, D] and [num_layers, B, C, h_q].
-    hsa_per_step_all_lmk_k: Optional[torch.Tensor] = None
-    hsa_per_step_all_prior_b: Optional[torch.Tensor] = None
+    # (removed) hsa_per_step_all_lmk_k / all_prior_b: R54c pre-gathered the
+    # candidate landmarks for every layer into [num_layers, B, C, h_q, D]. The
+    # selection kernel now reads the pool directly at `hsa_per_step_slots`, so
+    # that copy — over 1 GB per step at B=16 / 64K context — is gone.
 
     # ---- Extend-specific fields ----
     token_positions: Optional[torch.Tensor] = None  # [total_extend_tokens] global pos

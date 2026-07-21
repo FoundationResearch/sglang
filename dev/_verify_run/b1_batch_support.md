@@ -113,6 +113,49 @@ Per-sequence work inside an HSA layer is identical either way, so the win is
 amortising the rest of the forward and the scheduler step — largest for short
 requests, tapering as a single request gets long enough to saturate the GPU.
 
+## Round 2 — batched decode optimisation
+
+Profiling decode at B=16 / 64K (eager, `bench_one_batch --profile`) against B=1
+showed what actually scales with batch. Two fixes, both alignment-preserving:
+
+1. **Pool-direct candidate scoring.** The selector pre-gathered every
+   candidate's landmark into `[num_layers, B, C_max, h_q, D]` — **1.08 GB per
+   step** at B=16 / 64K — then the score kernel read it back. `_pqh_score_maxpool`
+   now indexes the landmark pool directly at `hsa_per_step_slots`, so the copy
+   is gone; the same bytes are read once instead of written and read.
+   (`hsa_per_step_all_lmk_k` / `all_prior_b` are removed.)
+2. **Split-K heuristic.** `hsa_decode_paged_fwd` holds a `[PAGE_SIZE, D]` K and
+   V tile per program, making it latency-bound rather than occupancy-bound. The
+   old rule bailed to `SPLIT_K=1` as soon as `B*HQ >= num_sms`, which is exactly
+   the batched case. Splitting to one page per program wins at every (B, L)
+   measured, B=1..128 — see the table in `_pick_split_k`.
+
+Decode GPU time at B=16 / 64K: **7.13 ms → 5.42 → 3.87 ms**;
+`hsa_decode_paged_fwd_kernel` 2781 µs → 1152 µs.
+
+### HSA vs dense decode across batch (ms/step, idle H200)
+
+| L | bs=1 | bs=4 | bs=16 | bs=32 |
+|---|---|---|---|---|
+| 8K  | 3.18 / 2.73 → 0.86× | 3.84 / 2.75 → 0.72× | 5.41 / 2.83 → 0.52× | 7.08 / 3.10 → 0.44× |
+| 16K | 3.17 / 4.03 → 1.27× | 3.84 / 4.02 → 1.05× | 5.63 / 4.16 → 0.74× | 7.22 / 4.53 → 0.63× |
+| 32K | 3.27 / 6.82 → 2.09× | 4.03 / 6.57 → 1.63× | 5.77 / 6.76 → 1.17× | 7.56 / 7.57 → 1.00× |
+| 64K | 3.31 / 11.81 → 3.57× | 4.24 / 11.57 → 2.73× | 5.98 / 12.14 → 2.03× | harness OOM |
+
+(HSA / dense → speedup. Round 1 gave 1.32× at 64K/bs=16 and *lost* at
+32K/bs=16; the crossover at bs=16 moved from ~45K down to ~28K.)
+
+Dense decode barely moves with batch (11.8 → 12.1 ms at 64K) because it is
+badly under-occupied at bs=1 and absorbs batch almost for free, so HSA's
+advantage still erodes with batch — just far less than before. Note this 345M
+pair has only 2 KV heads, which understates dense's KV traffic relative to a
+real MHA model; the 7B (32 layers, 32 KV heads) should hold up better, but that
+is reasoning, not measurement.
+
+Alignment after both changes: 12/12 tokens at 512 and 2048 prompt tokens,
+KL 4.22e-4 (unchanged) and 1.06e-4 (was 1.11e-4 — the split-K change reorders
+the partial-sum reduction). Batch-vs-serial equivalence still passes.
+
 ## Still limited to B == 1 / TP == 1
 
 The landmark writers still return early under `get_attention_tp_size() > 1`

@@ -382,29 +382,42 @@ def hsa_decode_reduce_kernel(
 # R87: cached split-K config — picked once per process.  GB200 has 144 SMs;
 # with B=1, HQ=16 (HSA-345M), grid (1, 16, 8) = 128 programs covers most SMs.
 # Heuristic chosen to keep PAGES_PER_SPLIT divisible into TOPK for simplicity.
-def _pick_split_k(B: int, HQ: int, TOPK: int, num_sms: int = 132) -> int:
+def _pick_split_k(
+    B: int, HQ: int, TOPK: int, num_sms: int = 132, D: int = 128
+) -> int:
     """Pick a SPLIT_K that uses the GPU well without over-shooting.
 
-    Aim for B*HQ*SPLIT_K up to ~2x num_sms.  TOPK must be divisible by SPLIT_K
-    for the simple per-split iteration count.  `HSA_DECODE_SPLIT` overrides.
+    Each program holds a [PAGE_SIZE, D] K tile and a V tile in registers, so it
+    is long-running and register-heavy: the kernel turns out to be latency-bound
+    rather than occupancy-bound, and splitting further keeps paying off well
+    past the point where the program count covers the SMs.
+
+    Measured on an idle H200 (345M hd128, TOPK=32, page 64), decode ms:
+
+        B=1   8K:  s1 5.60  s4 3.75  s16 3.19  s32 3.14
+        B=16  8K:  s1 6.96  s4 5.92  s16 5.51  s32 5.40
+        B=16 64K:  s1 7.40  s8 6.08  s16 5.95  s32 5.91
+        B=64  8K:  s1 13.24 s8 10.84 s16 10.93 s32 10.64
+        B=128 8K:  s1 20.54 s8 18.21 s16 18.42 s32 17.93
+
+    Splitting to one page per program wins at every (B, L) tested, including
+    B*HQ far above the SM count — where the previous heuristic bailed out to
+    SPLIT_K=1 and gave up 25% at B=16.  So take the maximum split TOPK allows,
+    bounded only by the fp32 partial buffer (B*HQ*split*D*4 bytes).
+    `HSA_DECODE_SPLIT` overrides.
     """
     import os
     _env = os.getenv("HSA_DECODE_SPLIT")
     if _env is not None:
         s = int(_env)
         return s if (s >= 1 and TOPK % s == 0) else 1
-    if B * HQ >= num_sms:
-        return 1
-    # H200 tuning: allow B*HQ*split up to ~2x num_sms (matches the docstring and
-    # the prior fixed split=16).  At B*HQ=16 on 132 SMs this picks 16, measured
-    # ~3% faster than the 8 the old 1x target gave (16K decode 3.74→3.62ms).
-    target = max(2 * num_sms // (B * HQ), 1)
-    best = 1
-    for s in (16, 8, 4, 2, 1):
-        if TOPK % s == 0 and s <= target:
-            best = s
-            break
-    return best
+    # Keep the partial buffer under ~512 MB.
+    per_split_bytes = max(B * HQ * D * 4, 1)
+    max_by_mem = max(1, (512 << 20) // per_split_bytes)
+    for s in (TOPK, 32, 16, 8, 4, 2, 1):
+        if s <= max_by_mem and TOPK % s == 0:
+            return s
+    return 1
 
 
 def hsa_decode_paged_fwd(
@@ -571,7 +584,7 @@ def hsa_decode_paged_fwd(
         if use_seq_map:
             split_k = 1
         else:
-            split_k = _pick_split_k(N, HQ, TOPK)
+            split_k = _pick_split_k(N, HQ, TOPK, D=D)
     if TOPK % split_k != 0:
         split_k = 1  # fallback if TOPK doesn't divide cleanly
     pages_per_split = TOPK // split_k

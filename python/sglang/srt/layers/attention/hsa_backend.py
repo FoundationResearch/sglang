@@ -634,6 +634,10 @@ class HSAAttnBackend(AttentionBackend):
             md.hsa_per_step_cand_mask = cand_mask
             md.hsa_per_step_hsa_window = hsa_window
 
+        # Pool-direct scoring needs the raw [N+1, h_q, D] landmark layout, so a
+        # unified-retrieval model (which reshapes candidates before scoring)
+        # keeps the materialised gather.
+        pool_direct = per_qhead_active and not unified
         if per_qhead_active:
             # R54a: the slot lookup is layer-invariant (same page table + same
             # cand_page_ids), so cache it too.
@@ -649,42 +653,38 @@ class HSAAttnBackend(AttentionBackend):
                     page_table_1, int(C_max)
                 ) * cand_mask
                 md.hsa_per_step_slots = slots
-            # R54c: batch the lmk_k + prior_b gathers across ALL layers in one
-            # multi-layer index_select instead of per-layer (saves ~94 launches/
-            # step for 16-layer 345M HSA). Lazily on the first per_qhead layer.
-            all_lmk_k = getattr(md, "hsa_per_step_all_lmk_k", None)
-            all_prior_b = getattr(md, "hsa_per_step_all_prior_b", None)
-            if is_owner or all_lmk_k is None or all_prior_b is None:
-                # pool.pool: [L, num_chunk_slots+1, h_q, head_dim]
-                # prior_b_pool: [L, num_chunk_slots+1, h_q]
-                pool_pool = self.lmk_k_pool.pool
-                pb_pool = self.lmk_k_pool.prior_b_pool
-                flat_idx = (
-                    slots.clamp(min=0).to(pool_pool.device, torch.int64).reshape(-1)
+            # The selection kernel reads the landmarks straight out of the pool
+            # at `slots`, so nothing is gathered here. The old code materialised
+            # [L, B*C_max, h_q, D] once per step — over 1 GB at B=16 / 64K
+            # context, written and then read again by the score kernel, for
+            # bytes the kernel has to touch anyway.
+            # pool.pool: [L, num_chunk_slots+1, h_q, head_dim]
+            # prior_b_pool: [L, num_chunk_slots+1, h_q]
+            pool_k = self.lmk_k_pool.pool[int(layer.layer_id)]
+            pool_pb = self.lmk_k_pool.prior_b_pool[int(layer.layer_id)]
+            slots_i64 = slots.to(torch.int64) if slots.dtype != torch.int64 else slots
+            if pool_direct:
+                cand_repr = pool_k
+                self._per_qhead_prior_b = pool_pb
+                cand_slots = slots_i64
+            else:
+                flat = slots_i64.reshape(-1)
+                cand_repr = pool_k.index_select(0, flat).view(
+                    *slots.shape, pool_k.shape[1], pool_k.shape[2]
                 )
-                # [L, B*C, h_q, D] / [L, B*C, h_q]
-                gathered_k = pool_pool.index_select(1, flat_idx)
-                gathered_pb = pb_pool.index_select(1, flat_idx)
-                all_lmk_k = gathered_k.view(
-                    pool_pool.shape[0], *slots.shape,
-                    pool_pool.shape[2], pool_pool.shape[3],
+                self._per_qhead_prior_b = pool_pb.index_select(0, flat).view(
+                    *slots.shape, pool_pb.shape[1]
                 )
-                all_prior_b = gathered_pb.view(
-                    pb_pool.shape[0], *slots.shape, pb_pool.shape[2]
-                )
-                md.hsa_per_step_all_lmk_k = all_lmk_k
-                md.hsa_per_step_all_prior_b = all_prior_b
-            cand_repr = all_lmk_k[int(layer.layer_id)]
-            # prior_b (entropy bias) per chunk per q-head, [B, C_max, h_q]
-            self._per_qhead_prior_b = all_prior_b[int(layer.layer_id)]
-            H_sel = cand_repr.shape[2]
-            D = cand_repr.shape[3]
+                cand_slots = None
+            H_sel = pool_k.shape[1]
+            D = pool_k.shape[2]
             # G for the topk kernel — switches it to per-q-head mode.
             self._per_qhead_G = int(split_info["hq_hsa"]) // int(split_info["h_hsa"])
         else:
             # Existing path: gather last-token K from KV cache (h_kv shape).
             self._per_qhead_G = None
             self._per_qhead_prior_b = None
+            cand_slots = None
             safe_page_ids = cand_page_ids.clamp(min=0).to(torch.int64)
             lmk_token_pos = safe_page_ids * page_size + (page_size - 1)  # [B, C_max]
             lmk_token_pos_safe = lmk_token_pos.clamp(max=page_table_1.shape[1] - 1)
@@ -701,6 +701,8 @@ class HSAAttnBackend(AttentionBackend):
             cand_repr = flat_repr.view(B, C_max, H_sel, D)
 
         # unified_retrieval: group+sum KV heads to match retrieval_dim.
+        # (Never combined with the per-q-head pool path — that branch returns
+        # early above when `unified` is set, so cand_repr is materialised here.)
         unified = split_info is not None and split_info.get("unified_retrieval", False)
         retrieval_dim = split_info.get("retrieval_dim", None) if split_info is not None else None
         if unified and retrieval_dim is not None:
@@ -742,10 +744,17 @@ class HSAAttnBackend(AttentionBackend):
             selection_strategy=str(self.hsa_selection_strategy),
             G=getattr(self, "_per_qhead_G", None),
             per_qhead_prior_b=getattr(self, "_per_qhead_prior_b", None),
+            cand_slots=cand_slots,
             _decode_q_offset=int(md.max_seqlen_k) - 1,
             _decode_hsa_window=int(hsa_window),
         )
         if sel is None:
+            if cand_slots is not None:
+                raise RuntimeError(
+                    "HSA decode selection fell back to the non-fused path, which "
+                    "needs a materialised candidate tensor; pool-direct scoring "
+                    "is active. Check that the fused selector imported."
+                )
             sel = select_topk_pages_decode(
                 q=q_sel,
                 cand_page_ids=cand_page_ids,

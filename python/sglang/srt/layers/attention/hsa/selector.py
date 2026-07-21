@@ -23,9 +23,11 @@ if triton is not None:
     @triton.jit
     def _pqh_score_maxpool_kernel(
         Q_ptr,          # [B, h_q, D]  (q dtype, e.g. bf16)
-        CAND_ptr,       # [B, C, h_q, D]  (bf16)
-        PRIOR_ptr,      # [B, C, h_q]  fp32 (or dummy when not USE_PRIOR)
+        CAND_ptr,       # [B, C, h_q, D] materialised, or the [N+1, h_q, D]
+                        # landmark pool itself when USE_SLOTS
+        PRIOR_ptr,      # [B, C, h_q] / [N+1, h_q]  fp32 (dummy when not USE_PRIOR)
         MASK_ptr,       # [B, C]  bool/int8
+        SLOTS_ptr,      # [B, C] int64 pool row per candidate (when USE_SLOTS)
         SPQH_ptr,       # [B, h_q, C]  fp32  (out: per-q-head scores)
         SKV_ptr,        # [B, h_kv, C] fp32  (out: max-over-G, masked)
         sm_scale: tl.constexpr,
@@ -33,15 +35,23 @@ if triton is not None:
         s_qb: tl.constexpr, s_qh: tl.constexpr,
         s_cb: tl.constexpr, s_cc: tl.constexpr, s_ch: tl.constexpr,
         s_pb: tl.constexpr, s_pc: tl.constexpr,
+        s_sb: tl.constexpr, s_sc: tl.constexpr,
         s_spb: tl.constexpr, s_sph: tl.constexpr,
         s_skb: tl.constexpr, s_skh: tl.constexpr,
-        BLOCK_C: tl.constexpr, USE_PRIOR: tl.constexpr,
+        BLOCK_C: tl.constexpr, USE_PRIOR: tl.constexpr, USE_SLOTS: tl.constexpr,
     ):
         """Fused per-q-head selection score: scores = (q·cand)*scale + prior,
         then max over the G query heads sharing a kv head, masked by cand_mask.
         Loads bf16 cand/q and accumulates in fp32 (identical to upcasting first,
         since the pool stores bf16). Replaces 6 eager ops (2 casts + einsum +
-        permute/add + max + masked_fill) with one launch. Grid (B, h_kv, C-blk)."""
+        permute/add + max + masked_fill) with one launch. Grid (B, h_kv, C-blk).
+
+        With USE_SLOTS the candidate landmarks are read straight out of the
+        LandmarkLmkKPool at the rows named by SLOTS, instead of from a
+        pre-gathered [B, C, h_q, D] copy. That copy is the single largest
+        memory movement in batched decode (B * C_max * h_q * D per layer — over
+        1 GB/step at B=16, 64K context) and it is pure overhead: the same bytes
+        have to be read by this kernel either way."""
         pid_b = tl.program_id(0)
         pid_kv = tl.program_id(1)
         pid_c = tl.program_id(2)
@@ -49,28 +59,49 @@ if triton is not None:
         c_in = offs_c < C
         offs_d = tl.arange(0, D)
         cmask = tl.load(MASK_ptr + pid_b * C + offs_c, mask=c_in, other=0).to(tl.int1)
+        if USE_SLOTS:
+            # Row of the landmark pool holding candidate c's landmark.
+            row = tl.load(SLOTS_ptr + pid_b * s_sb + offs_c * s_sc, mask=c_in, other=0)
+        else:
+            # Materialised layout: row (b, c) is at b * s_cb + c * s_cc.
+            row = pid_b * s_cb + offs_c * s_cc
         running = tl.full((BLOCK_C,), -float("inf"), dtype=tl.float32)
         for g in range(0, G):
             hq = pid_kv * G + g
             q = tl.load(Q_ptr + pid_b * s_qb + hq * s_qh + offs_d).to(tl.float32)  # [D]
-            cptr = (CAND_ptr + pid_b * s_cb + offs_c[:, None] * s_cc
-                    + hq * s_ch + offs_d[None, :])
+            if USE_SLOTS:
+                cptr = (CAND_ptr + row[:, None] * s_cc
+                        + hq * s_ch + offs_d[None, :])
+            else:
+                cptr = CAND_ptr + row[:, None] + hq * s_ch + offs_d[None, :]
             cand = tl.load(cptr, mask=c_in[:, None], other=0.0).to(tl.float32)  # [BLOCK_C, D]
             s = tl.sum(cand * q[None, :], axis=1) * sm_scale  # [BLOCK_C]
             if USE_PRIOR:
-                s += tl.load(PRIOR_ptr + pid_b * s_pb + offs_c * s_pc + hq,
-                             mask=c_in, other=0.0).to(tl.float32)
+                if USE_SLOTS:
+                    pptr = PRIOR_ptr + row * s_pc + hq
+                else:
+                    pptr = PRIOR_ptr + pid_b * s_pb + offs_c * s_pc + hq
+                s += tl.load(pptr, mask=c_in, other=0.0).to(tl.float32)
             tl.store(SPQH_ptr + pid_b * s_spb + hq * s_sph + offs_c, s, mask=c_in)
             running = tl.maximum(running, s)
         running = tl.where(cmask, running, -float("inf"))
         tl.store(SKV_ptr + pid_b * s_skb + pid_kv * s_skh + offs_c, running, mask=c_in)
 
 
-def _pqh_score_maxpool(q_3, cand_repr, per_qhead_prior_b, cand_mask, sm_scale, G, h_kv):
+def _pqh_score_maxpool(
+    q_3, cand_repr, per_qhead_prior_b, cand_mask, sm_scale, G, h_kv, cand_slots=None
+):
     """Driver for _pqh_score_maxpool_kernel. Returns (scores_pqh [B,h_q,C] fp32,
-    scores_kv_sel [B,h_kv,C] fp32 masked)."""
+    scores_kv_sel [B,h_kv,C] fp32 masked).
+
+    ``cand_slots`` [B, C] switches on pool-direct addressing: ``cand_repr`` is
+    then the landmark pool's layer slice [N+1, h_q, D] and ``per_qhead_prior_b``
+    its prior_b slice [N+1, h_q], read at the given rows. That avoids
+    materialising the [B, C, h_q, D] candidate gather entirely.
+    """
     B, h_q, D = q_3.shape
-    C = cand_repr.shape[1]
+    use_slots = cand_slots is not None
+    C = cand_slots.shape[1] if use_slots else cand_repr.shape[1]
     q_c = q_3 if q_3.is_contiguous() else q_3.contiguous()
     cand_c = cand_repr if cand_repr.is_contiguous() else cand_repr.contiguous()
     scores_pqh = torch.empty((B, h_q, C), device=q_3.device, dtype=torch.float32)
@@ -80,6 +111,10 @@ def _pqh_score_maxpool(q_3, cand_repr, per_qhead_prior_b, cand_mask, sm_scale, G
         prior = per_qhead_prior_b if per_qhead_prior_b.is_contiguous() else per_qhead_prior_b.contiguous()
     else:
         prior = scores_pqh  # dummy
+    if use_slots:
+        slots_c = cand_slots if cand_slots.is_contiguous() else cand_slots.contiguous()
+    else:
+        slots_c = scores_pqh  # dummy
     mask_i8 = cand_mask.to(torch.int8)
     # Occupancy-adaptive block: batch-1 decode has only B*h_kv "rows", so the only
     # parallelism is over C. Size BLOCK_C to target ~256 programs (≈2×SM count),
@@ -94,15 +129,26 @@ def _pqh_score_maxpool(q_3, cand_repr, per_qhead_prior_b, cand_mask, sm_scale, G
         BLOCK_C = (C + target_blocks - 1) // target_blocks
         BLOCK_C = max(8, min(64, triton.next_power_of_2(BLOCK_C)))
     grid = (B, h_kv, (C + BLOCK_C - 1) // BLOCK_C)
+    if use_slots:
+        # cand_c is the pool [N+1, h_q, D]: s_cb unused, s_cc = slot stride.
+        s_cb, s_cc, s_ch = 0, cand_c.stride(0), cand_c.stride(1)
+        s_pb, s_pc = (0, prior.stride(0)) if use_prior else (0, 0)
+    else:
+        s_cb, s_cc, s_ch = cand_c.stride(0), cand_c.stride(1), cand_c.stride(2)
+        s_pb, s_pc = (
+            (prior.stride(0), prior.stride(1)) if use_prior else (0, 0)
+        )
     _pqh_score_maxpool_kernel[grid](
-        q_c, cand_c, prior, mask_i8, scores_pqh, scores_kv,
+        q_c, cand_c, prior, mask_i8, slots_c, scores_pqh, scores_kv,
         float(sm_scale), C, D, G, h_q,
         q_c.stride(0), q_c.stride(1),
-        cand_c.stride(0), cand_c.stride(1), cand_c.stride(2),
-        prior.stride(0) if use_prior else 0, prior.stride(1) if use_prior else 0,
+        s_cb, s_cc, s_ch,
+        s_pb, s_pc,
+        slots_c.stride(0) if use_slots else 0,
+        slots_c.stride(1) if use_slots else 0,
         scores_pqh.stride(0), scores_pqh.stride(1),
         scores_kv.stride(0), scores_kv.stride(1),
-        BLOCK_C=BLOCK_C, USE_PRIOR=use_prior, num_warps=4,
+        BLOCK_C=BLOCK_C, USE_PRIOR=use_prior, USE_SLOTS=use_slots, num_warps=4,
     )
     return scores_pqh, scores_kv
 
@@ -361,6 +407,7 @@ def select_topk_pages_decode_fused(
     selection_strategy: str = "group",
     G: Optional[int] = None,
     per_qhead_prior_b: Optional[torch.Tensor] = None,
+    cand_slots: Optional[torch.Tensor] = None,
     _decode_q_offset: Optional[int] = None,
     _decode_hsa_window: Optional[int] = None,
 ) -> Optional[HSASelectionResult]:
@@ -431,7 +478,13 @@ def select_topk_pages_decode_fused(
         # scores are returned separately via _per_qhead_scores so the
         # downstream chunk-weight fusion can use them.
         import math as _m
-        B_c, C_c, h_q_c, D_c = cand_repr.shape
+        if cand_slots is not None:
+            # cand_repr is the landmark pool's layer slice [N+1, h_q, D]; the
+            # candidate set is named by cand_slots and never materialised.
+            B_c, C_c = cand_slots.shape
+            h_q_c, D_c = cand_repr.shape[1], cand_repr.shape[2]
+        else:
+            B_c, C_c, h_q_c, D_c = cand_repr.shape
         h_kv_c = h_q_c // G
         sm_scale_ref = float(sm_scale) if sm_scale is not None else (1.0 / _m.sqrt(D_c))
         # R54d: drop redundant ops. Key invariants for the hot path (large C):
@@ -457,7 +510,11 @@ def select_topk_pages_decode_fused(
         if triton is not None:
             scores_pqh, scores_kv_sel = _pqh_score_maxpool(
                 q_3v, cand_repr, per_qhead_prior_b, cand_mask,
-                sm_scale_ref, G, h_kv_c,
+                sm_scale_ref, G, h_kv_c, cand_slots=cand_slots,
+            )
+        elif cand_slots is not None:  # pragma: no cover
+            raise RuntimeError(
+                "pool-direct candidate scoring needs triton; pre-gather instead"
             )
         else:  # pragma: no cover — torch fallback
             scores_pqh = torch.einsum(
