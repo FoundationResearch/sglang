@@ -191,6 +191,42 @@ Alignment after round 3: 12/12 tokens at both prompt lengths, KL 4.38e-4
 (was 4.22e-4 — the warp count changes the in-block reduction order) and
 1.06e-4. Batch-vs-serial equivalence still passes.
 
+## Methodology notes
+
+**Which runs use which weights.** Every latency number here comes from
+`bench_one_batch --load-format dummy` on `dev/bench_models/*` (random weights),
+matching the methodology of the published batch-1 table. Every correctness
+number — alignment, batch-vs-serial equivalence, prefix-cache reuse — uses the
+real trained checkpoint `dev/align/ckpt_345m_bench_hf`.
+
+Random weights are a fair proxy for dense attention, where the access pattern
+does not depend on the weights, but HSA *selects* which pages to read, so it
+deserved a check. `dev/bench_models/hsa345m_real` and
+`dev/align/ckpt_345m_bench_hf` have identical geometry (16 layers, 16 q-heads,
+2 KV heads, head_dim 64), so they are directly comparable:
+
+| L | bs | dummy | trained |
+|---|---|---|---|
+| 8K  | 1  | 2.98 ms | 2.90 ms |
+| 8K  | 16 | 4.22 ms | 4.21 ms |
+| 32K | 1  | 3.01 ms | 2.96 ms |
+| 32K | 16 | 4.52 ms | 4.51 ms |
+
+Trained weights are marginally *faster* (≈2% at bs=1, indistinguishable at
+bs=16), so the dummy-weight numbers are if anything conservative. Top-k selects
+a fixed 32 pages either way, so only the addresses differ, and at batch the
+concurrency hides that.
+
+**The 345M pair is HSA's worst case.** Both models are GQA with h_q=16,
+h_kv=2 (G=8) over 16 layers, so dense decode reads only 16 KB of KV per token.
+The released 7B is MHA — 32 layers × 32 KV heads × head_dim 128 = 512 KB per
+token, **32× more**. At 64K that is 1 GB/step for the 345M against ~32 GB/step
+for the 7B: the 345M's dense baseline sits ~33× off its bandwidth roofline at
+bs=1 and therefore absorbs batch almost for free, which is precisely why HSA's
+advantage erodes with batch here. A 7B dense baseline would already be
+bandwidth-bound at bs=1 and could not do that. Not measured — the 7B has no
+dense twin config yet.
+
 ## Still limited to B == 1 / TP == 1
 
 The landmark writers still return early under `get_attention_tp_size() > 1`
