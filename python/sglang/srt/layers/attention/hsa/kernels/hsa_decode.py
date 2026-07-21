@@ -382,6 +382,21 @@ def hsa_decode_reduce_kernel(
 # R87: cached split-K config — picked once per process.  GB200 has 144 SMs;
 # with B=1, HQ=16 (HSA-345M), grid (1, 16, 8) = 128 programs covers most SMs.
 # Heuristic chosen to keep PAGES_PER_SPLIT divisible into TOPK for simplicity.
+import os as _os
+
+# Each program holds a [PAGE_SIZE, D] K tile and a V tile, so the warp count
+# decides how many blocks fit per SM. With SPLIT_K at its maximum a program
+# handles a single page, and the work is plentiful and independent, so the
+# smallest possible block wins — more resident blocks beats wider blocks.
+# Measured on an idle H200 (345M hd128, decode ms, warps 1 / 4):
+#     B=1   8K:  3.13 / 3.16      B=16  8K:  5.06 / 5.42
+#     B=1  64K:  3.27 / 3.45      B=16 64K:  5.41 / 5.91
+#     B=64  8K:  8.78 / 10.62
+# num_stages made no measurable difference (5.49 / 5.42 / 5.44 at 1 / 2 / 3).
+_DECODE_NUM_WARPS = int(_os.getenv("HSA_DECODE_WARPS", "1"))
+_DECODE_NUM_STAGES = int(_os.getenv("HSA_DECODE_STAGES", "1"))
+
+
 def _pick_split_k(
     B: int, HQ: int, TOPK: int, num_sms: int = 132, D: int = 128
 ) -> int:
@@ -658,7 +673,8 @@ def hsa_decode_paged_fwd(
         BLOCK_K=BLOCK_K,
         SPLIT_K=split_k,
         PAGES_PER_SPLIT=pages_per_split,
-        num_warps=4,
+        num_warps=_DECODE_NUM_WARPS,
+        num_stages=_DECODE_NUM_STAGES,
     )
 
     if split_k > 1:

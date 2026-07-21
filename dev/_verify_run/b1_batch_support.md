@@ -156,6 +156,41 @@ Alignment after both changes: 12/12 tokens at 512 and 2048 prompt tokens,
 KL 4.22e-4 (unchanged) and 1.06e-4 (was 1.11e-4 — the split-K change reorders
 the partial-sum reduction). Batch-vs-serial equivalence still passes.
 
+## Round 3 — decode kernel launch shape
+
+With SPLIT_K at its maximum a `hsa_decode_paged_fwd` program handles a single
+page, so the block wants to be as small as possible: more resident blocks beats
+wider blocks for work this plentiful and independent. `num_warps` 4 → 1 is a
+one-line change worth 1-17%, growing with batch size (measurements in the
+`_DECODE_NUM_WARPS` comment). `num_stages` made no difference.
+
+**Tried and rejected: G-fusion of the decode kernel.** The Gh q-heads sharing a
+KV head select the same pages, so the kernel reads each page's K/V Gh times —
+an 8× redundancy at G=8, and exactly the trick the extend kernel uses (R38/R39).
+Implemented it (grid over KV heads, two-phase K-then-V to hold register
+pressure, per-g reductions kept bit-identical) and it is a **±2% wash**:
+B=1 −2%, B=16 −1%, B=64 +2%, B=128 +2%. The redundant reads were already
+being served by L2, and fusing costs exactly as much parallelism as it saves
+bandwidth in a kernel that is latency-bound, not bandwidth-bound. Reverted;
+not worth a hand-written kernel variant.
+
+### HSA vs dense decode after three rounds (ms/step, idle H200)
+
+| L | bs=1 | bs=4 | bs=16 | bs=32 |
+|---|---|---|---|---|
+| 8K  | 3.14 / 2.74 → 0.87× | 3.77 / 2.83 → 0.75× | 5.00 / 2.87 → 0.57× | 6.26 / 3.23 → 0.52× |
+| 16K | 3.18 / 4.09 → 1.29× | 3.80 / 4.08 → 1.07× | 5.19 / 4.19 → 0.81× | 6.34 / 4.54 → 0.72× |
+| 32K | 3.22 / 6.69 → 2.08× | 3.98 / 6.49 → 1.63× | 5.25 / 6.88 → 1.31× | 6.48 / 7.52 → 1.16× |
+| 64K | 3.29 / 11.71 → 3.56× | 4.20 / 11.56 → 2.75× | 5.46 / 12.02 → 2.20× | harness OOM |
+
+Batched decode over the three rounds, B=16 / 64K: **9.14 → 5.98 → 5.46 ms**
+(1.67× total), i.e. 1.32× → 2.20× against dense. The bs=16 crossover moved from
+~45K to ~24K, and bs=32 now wins at 32K where it used to lose (0.75× → 1.16×).
+
+Alignment after round 3: 12/12 tokens at both prompt lengths, KL 4.38e-4
+(was 4.22e-4 — the warp count changes the in-block reduction order) and
+1.06e-4. Batch-vs-serial equivalence still passes.
+
 ## Still limited to B == 1 / TP == 1
 
 The landmark writers still return early under `get_attention_tp_size() > 1`
