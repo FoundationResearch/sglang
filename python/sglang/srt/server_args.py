@@ -1828,6 +1828,22 @@ class ServerArgs:
             self.enable_mixed_chunk = False
             self.disable_radix_cache = True
 
+        # HSA (Hierarchical Sparse Attention) runtime constraint. HSA decode
+        # interleaves virtual LMK tokens whose next input must be chosen
+        # synchronously from the current sequence length; the overlap scheduler
+        # launches the next forward before that decision is made, leaving
+        # batch.seq_lens=None in decode result processing. The two are
+        # fundamentally incompatible, so disable overlap for correctness.
+        # (Prefill and decode are both batched, so no request-count cap is
+        # needed — continuous batching runs normally.)
+        if self.attention_backend == "hsa" and not self.disable_overlap_schedule:
+            logger.warning(
+                "Disabling overlap schedule for the HSA attention backend: "
+                "HSA's LMK-token decode interleaving needs synchronous "
+                "per-step scheduling."
+            )
+            self.disable_overlap_schedule = True
+
     def _handle_kv4_compatibility(self):
         """Check FP4 KV cache compatibility with the attention backend"""
         if self.kv_cache_dtype != "fp4_e2m1":
