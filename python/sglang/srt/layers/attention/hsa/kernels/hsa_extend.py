@@ -19,6 +19,7 @@ Output: bf16 [T, HQ, D]. Decode still uses `hsa_decode_paged_fwd_kernel`.
 
 from __future__ import annotations
 
+import os
 from typing import Optional
 
 import torch
@@ -31,6 +32,8 @@ except Exception as e:  # pragma: no cover
     tl = None
     _TRITON_IMPORT_ERROR = e
 
+_EXTEND_KV_UNION = bool(int(os.environ.get("HSA_EXTEND_KV_UNION", "0")))
+
 
 def _require_triton():  # pragma: no cover
     if triton is None or tl is None:
@@ -38,6 +41,135 @@ def _require_triton():  # pragma: no cover
             "Triton is required for HSA kernels. Import error: "
             + repr(globals().get("_TRITON_IMPORT_ERROR"))
         )
+
+
+# ---------------------------------------------------------------------------
+# KV-union preprocessing
+# ---------------------------------------------------------------------------
+
+
+def _build_kv_union(selected_page_ids, hsa_weights, token_to_seq_id,
+                    block_m, HQ, H):
+    """Compute union of selected pages across BLOCK_M adjacent query tokens.
+
+    For each group of block_m consecutive tokens and each kv-head, deduplicates
+    the block_m * TOPK selected page IDs (keyed by (seq_b, page_id) so cross-
+    sequence pages stay distinct).  Produces remapped weights so the union
+    kernel can load each unique page once.
+
+    Returns
+    -------
+    union_page_ids : [num_groups, H, MAX_U]  int32, -1-padded
+    union_seq      : [num_groups, H, MAX_U]  int32  (batch seq index per page)
+    union_weights  : [T, HQ, MAX_U]           float32
+    MAX_U          : int  (padded to next power of 2)
+    """
+    T, H_chk, K = selected_page_ids.shape
+    assert H_chk == H
+    G = HQ // H
+    device = selected_page_ids.device
+    num_groups = (T + block_m - 1) // block_m
+    T_pad = num_groups * block_m
+
+    # Pad T to multiple of block_m
+    if T_pad > T:
+        pad_t = T_pad - T
+        pid_pad = torch.nn.functional.pad(
+            selected_page_ids, (0, 0, 0, 0, 0, pad_t), value=-1
+        )
+        w_pad = torch.nn.functional.pad(
+            hsa_weights, (0, 0, 0, 0, 0, pad_t), value=0.0
+        )
+        seq_pad = torch.nn.functional.pad(
+            token_to_seq_id, (0, pad_t), value=0
+        )
+    else:
+        pid_pad = selected_page_ids
+        w_pad = hsa_weights
+        seq_pad = token_to_seq_id
+
+    # Group by block_m
+    pid_g = pid_pad.view(num_groups, block_m, H, K)
+    w_g = w_pad.float().view(num_groups, block_m, HQ, K)
+    seq_g = seq_pad.view(num_groups, block_m)
+
+    # Composite key = seq_b * STRIDE + page_id (int64) so that the same
+    # page_id from different sequences is NOT deduped.
+    STRIDE = 1 << 20
+    seq_exp = seq_g[:, :, None, None].expand_as(pid_g).long()
+    composite = torch.where(
+        pid_g >= 0,
+        seq_exp * STRIDE + pid_g.long(),
+        torch.tensor(-1, dtype=torch.int64, device=device),
+    )
+
+    # Flatten per (group, kv_head): [ng, H, bm*K], then sort to bring dupes together
+    comp_flat = composite.permute(0, 2, 1, 3).reshape(num_groups, H, block_m * K)
+    comp_sorted, sort_idx = comp_flat.sort(dim=-1)
+
+    # Mark first occurrence of each non-negative value
+    is_new = torch.ones_like(comp_sorted, dtype=torch.bool)
+    is_new[:, :, 1:] = comp_sorted[:, :, 1:] != comp_sorted[:, :, :-1]
+    is_new &= comp_sorted >= 0
+
+    raw_max_u = max(int(is_new.sum(dim=-1).max().item()), 1)
+    MAX_U = 1 << (raw_max_u - 1).bit_length() if raw_max_u > 1 else 1
+
+    # Running union index (cumsum of is_new, -1 for invalids)
+    running = is_new.long().cumsum(dim=-1) - 1
+    running = torch.where(comp_sorted >= 0, running, -1)
+
+    # Scatter into union_page_ids / union_seq
+    union_page_ids = torch.full(
+        (num_groups, H, MAX_U), -1, dtype=torch.int32, device=device
+    )
+    union_seq = torch.zeros(
+        (num_groups, H, MAX_U), dtype=torch.int32, device=device
+    )
+    gi = torch.arange(num_groups, device=device)[:, None, None].expand_as(
+        comp_sorted
+    )
+    hi = torch.arange(H, device=device)[None, :, None].expand_as(comp_sorted)
+    mask_new = is_new
+    vals = comp_sorted[mask_new]
+    union_page_ids[gi[mask_new], hi[mask_new], running[mask_new]] = (
+        (vals % STRIDE).int()
+    )
+    union_seq[gi[mask_new], hi[mask_new], running[mask_new]] = (
+        (vals // STRIDE).int()
+    )
+
+    # Map original flat positions -> union indices
+    orig_to_union = torch.full_like(running, -1)
+    orig_to_union.scatter_(2, sort_idx, running)
+
+    # Reshape [ng, H, bm, K] -> [ng, bm, H, K], expand H -> HQ
+    o2u = orig_to_union.view(num_groups, H, block_m, K).permute(0, 2, 1, 3)
+    o2u_hq = (
+        o2u.unsqueeze(3)
+        .expand(num_groups, block_m, H, G, K)
+        .reshape(num_groups, block_m, HQ, K)
+    )
+
+    # Build union_weights [T_pad, HQ, MAX_U] via scatter_add_
+    u_flat = o2u_hq.reshape(-1, K)
+    w_flat = w_g.reshape(-1, K)
+    valid = u_flat >= 0
+    u_safe = u_flat.clamp(min=0).long()
+    w_safe = torch.where(valid, w_flat, torch.zeros_like(w_flat))
+
+    uw = torch.zeros(
+        num_groups * block_m * HQ, MAX_U, dtype=torch.float32, device=device
+    )
+    uw.scatter_add_(1, u_safe, w_safe)
+    uw = uw.view(T_pad, HQ, MAX_U)[:T].contiguous()
+
+    return union_page_ids.contiguous(), union_seq.contiguous(), uw, MAX_U
+
+
+# ---------------------------------------------------------------------------
+# Base extend kernel (unchanged)
+# ---------------------------------------------------------------------------
 
 
 @triton.jit
@@ -262,6 +394,185 @@ def hsa_extend_paged_fwd_kernel(
     )
 
 
+# ---------------------------------------------------------------------------
+# KV-union extend kernel
+# ---------------------------------------------------------------------------
+
+
+@triton.jit
+def hsa_extend_paged_fwd_union_kernel(
+    Q_ptr,
+    K_ptr,
+    V_ptr,
+    PAGE_TABLE_ptr,
+    UNION_PID_ptr,
+    UNION_SEQ_ptr,
+    UNION_W_ptr,
+    OUT_ptr,
+    SWA_O_ptr,
+    SWA_W_ptr,
+    stride_qb: tl.constexpr,
+    stride_qh: tl.constexpr,
+    stride_qd: tl.constexpr,
+    stride_k_loc: tl.constexpr,
+    stride_kh: tl.constexpr,
+    stride_kd: tl.constexpr,
+    stride_v_loc: tl.constexpr,
+    stride_vh: tl.constexpr,
+    stride_vd: tl.constexpr,
+    stride_pt_b: tl.constexpr,
+    stride_pt_t: tl.constexpr,
+    stride_out_b: tl.constexpr,
+    stride_out_hq: tl.constexpr,
+    stride_out_d: tl.constexpr,
+    sm_scale: tl.constexpr,
+    T,
+    HQ: tl.constexpr,
+    H: tl.constexpr,
+    D: tl.constexpr,
+    MAX_U: tl.constexpr,
+    PAGE_SIZE: tl.constexpr,
+    MAX_T,
+    mask_last_token: tl.constexpr,
+    BLEND_SWA: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+):
+    """Union variant: loads each unique page once for all BLOCK_M queries."""
+    pid_m = tl.program_id(0)
+    pid_h = tl.program_id(1)
+
+    G: tl.constexpr = HQ // H
+    kv_h = pid_h
+    hq_start = kv_h * G
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    mask_m = offs_m < T
+    offs_d = tl.arange(0, D)
+    offs_s = tl.arange(0, PAGE_SIZE)
+
+    # Row mapping [BLOCK_M*G] (identical to base kernel)
+    offs_r = tl.arange(0, BLOCK_M * G)
+    row_to_m = offs_r // G
+    row_to_g = offs_r % G
+    row_eq_m = (row_to_m[:, None] == tl.arange(0, BLOCK_M)[None, :])
+    row_eq_m_i = row_eq_m.to(tl.int64)
+    row_tok_flat = tl.sum(
+        row_eq_m_i * offs_m[None, :].to(tl.int64), axis=1
+    )
+    row_mask_flat = (
+        tl.sum(row_eq_m_i * mask_m[None, :].to(tl.int64), axis=1) > 0
+    )
+    row_hq_flat = hq_start.to(tl.int64) + row_to_g.to(tl.int64)
+
+    # Load Q [BLOCK_M*G, D]
+    q_offsets = (
+        row_tok_flat[:, None] * stride_qb
+        + row_hq_flat[:, None] * stride_qh
+        + offs_d[None, :].to(tl.int64) * stride_qd
+    )
+    q = tl.load(Q_ptr + q_offsets, mask=row_mask_flat[:, None], other=0.0)
+
+    acc = tl.zeros((BLOCK_M * G, D), dtype=tl.float32)
+    ln2_inv = 1.4426950408889634
+
+    # Base pointer into union tensors for this (group, kv_head)
+    u_base = pid_m.to(tl.int64) * (H * MAX_U) + kv_h.to(tl.int64) * MAX_U
+
+    for u_i in range(MAX_U):
+        # One union page ID (shared by all tokens in the group)
+        page_id = tl.load(UNION_PID_ptr + u_base + u_i).to(tl.int32)
+        page_valid = page_id >= 0
+        page_id_safe = tl.maximum(page_id, 0).to(tl.int64)
+
+        seq_b = tl.load(UNION_SEQ_ptr + u_base + u_i).to(tl.int64)
+
+        # Union weights [BLOCK_M*G]: zero means this token didn't select the page
+        w_offsets = (
+            row_tok_flat * (HQ * MAX_U) + row_hq_flat * MAX_U + u_i
+        )
+        weights = tl.load(
+            UNION_W_ptr + w_offsets, mask=row_mask_flat, other=0.0
+        ).to(tl.float32)
+
+        # K for this ONE page: [PAGE_SIZE, D]
+        tok = page_id_safe * PAGE_SIZE + offs_s.to(tl.int64)
+        tok_in_range = (tok < MAX_T) & page_valid
+
+        pt_offsets = seq_b * stride_pt_b + tok * stride_pt_t
+        token_loc = tl.load(
+            PAGE_TABLE_ptr + pt_offsets, mask=tok_in_range, other=0
+        ).to(tl.int64)
+
+        k_offsets = (
+            token_loc[:, None] * stride_k_loc
+            + kv_h.to(tl.int64) * stride_kh
+            + offs_d[None, :].to(tl.int64) * stride_kd
+        )
+        k = tl.load(K_ptr + k_offsets, mask=tok_in_range[:, None], other=0.0)
+
+        # QK: [BLOCK_M*G, PAGE_SIZE]
+        logits = tl.dot(q, k.trans()) * sm_scale
+
+        col_mask = tok_in_range
+        if mask_last_token:
+            col_mask = col_mask & (offs_s != (PAGE_SIZE - 1))
+        row_active = (weights != 0.0) & row_mask_flat
+        valid_mask = row_active[:, None] & col_mask[None, :]
+        logits = tl.where(valid_mask, logits, -float("inf"))
+
+        # Per-row stable softmax
+        m_row = tl.max(logits, axis=1)
+        m_row_safe = tl.where(m_row == -float("inf"), 0.0, m_row)
+        p = tl.exp2((logits - m_row_safe[:, None]) * ln2_inv)
+        p = tl.where(valid_mask, p, 0.0)
+        denom = tl.sum(p, axis=1)
+        denom_safe = tl.where(denom == 0.0, 1.0, denom)
+        p = p / denom_safe[:, None]
+
+        # V for this ONE page: [PAGE_SIZE, D]
+        v_offsets = (
+            token_loc[:, None] * stride_v_loc
+            + kv_h.to(tl.int64) * stride_vh
+            + offs_d[None, :].to(tl.int64) * stride_vd
+        )
+        v = tl.load(V_ptr + v_offsets, mask=tok_in_range[:, None], other=0.0)
+
+        out_page = tl.dot(p.to(v.dtype), v)
+        acc = acc + weights[:, None] * out_page.to(tl.float32)
+
+    # SWA blend epilogue (identical to base kernel)
+    if BLEND_SWA:
+        swa_o_offsets = (
+            row_tok_flat[:, None].to(tl.int64) * (HQ * D)
+            + row_hq_flat[:, None].to(tl.int64) * D
+            + offs_d[None, :].to(tl.int64)
+        )
+        swa_o = tl.load(
+            SWA_O_ptr + swa_o_offsets,
+            mask=row_mask_flat[:, None],
+            other=0.0,
+        ).to(tl.float32)
+        swa_w_offsets = row_tok_flat.to(tl.int64) * HQ + row_hq_flat.to(tl.int64)
+        swa_w = tl.load(
+            SWA_W_ptr + swa_w_offsets, mask=row_mask_flat, other=0.0
+        ).to(tl.float32)
+        acc = acc + swa_o * swa_w[:, None]
+
+    out_offsets = (
+        row_tok_flat[:, None] * stride_out_b
+        + row_hq_flat[:, None] * stride_out_hq
+        + offs_d[None, :].to(tl.int64) * stride_out_d
+    )
+    tl.store(
+        OUT_ptr + out_offsets, acc.to(tl.bfloat16), mask=row_mask_flat[:, None]
+    )
+
+
+# ---------------------------------------------------------------------------
+# Driver
+# ---------------------------------------------------------------------------
+
+
 def hsa_extend_paged_fwd(
     *,
     q: torch.Tensor,
@@ -283,6 +594,7 @@ def hsa_extend_paged_fwd(
     # kernel — saves the standalone addcmul launch in forward_extend.
     swa_o_inner: Optional[torch.Tensor] = None,
     swa_w_q: Optional[torch.Tensor] = None,
+    kv_union: Optional[bool] = None,
 ) -> torch.Tensor:
     """Q-batched paged sparse-attention for extend (G-fused, block-diagonal TC).
 
@@ -360,6 +672,36 @@ def hsa_extend_paged_fwd(
         swa_o_ = q_  # dummy pointer (unused under BLEND_SWA=False)
         swa_w_ = q_
 
+    # --- KV-union path (default OFF, gate: HSA_EXTEND_KV_UNION=1) ----------
+    _use_union = kv_union if kv_union is not None else _EXTEND_KV_UNION
+    if _use_union and block_m > 1:
+        upids, useq, uw, max_u = _build_kv_union(
+            page_ids_, w_, seq_map_, block_m, HQ, H,
+        )
+        grid = (triton.cdiv(T, block_m), H)
+        hsa_extend_paged_fwd_union_kernel[grid](
+            q_, k_, v_, pt_,
+            upids, useq, uw,
+            out, swa_o_, swa_w_,
+            q_.stride(0), q_.stride(1), q_.stride(2),
+            k_.stride(0), k_.stride(1), k_.stride(2),
+            v_.stride(0), v_.stride(1), v_.stride(2),
+            pt_.stride(0), pt_.stride(1),
+            out.stride(0), out.stride(1), out.stride(2),
+            sm_scale=float(sm_scale),
+            T=T, HQ=HQ, H=H, D=D,
+            MAX_U=max_u,
+            PAGE_SIZE=int(page_size),
+            MAX_T=MAX_T,
+            mask_last_token=bool(mask_last_token),
+            BLEND_SWA=bool(blend_swa),
+            BLOCK_M=int(block_m),
+            num_warps=int(num_warps),
+            num_stages=int(num_stages),
+        )
+        return out
+
+    # --- Base path (block-diagonal, per-token page loads) ------------------
     # Grid: (T/BLOCK_M, H_kv) — each program handles BLOCK_M tokens, all G q-heads
     grid = (triton.cdiv(T, block_m), H)
     hsa_extend_paged_fwd_kernel[grid](
